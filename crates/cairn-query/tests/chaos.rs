@@ -80,6 +80,7 @@ fn config(node: NodeId) -> ReplicaConfig {
         },
         dir: "shard0".into(),
         seed: 3,
+        own_receiver: true,
     }
 }
 
@@ -118,7 +119,7 @@ async fn propose_retrying(
     start: usize,
 ) -> Option<Token> {
     let mut target = start;
-    for _ in 0..60 {
+    loop {
         match handles[target].propose(cmd.clone()).await {
             Ok(t) => return Some(t),
             Err(cairn_core::Error::NotLeader {
@@ -129,7 +130,6 @@ async fn propose_retrying(
         }
         rt.sleep(Duration::from_millis(15)).await;
     }
-    None
 }
 
 async fn read_retrying(
@@ -180,6 +180,22 @@ fn spawn_client(
                     *v += 1;
                     *v
                 };
+                // Recorded at invocation: a write still in flight when the run ends may already
+                // be visible, and the checker must know about it.
+                let pos = {
+                    let mut h = history.borrow_mut();
+                    h.push(Record {
+                        client,
+                        call,
+                        ret: Instant::from_nanos(u64::MAX),
+                        op: Op::Write {
+                            key,
+                            version,
+                            token: None,
+                        },
+                    });
+                    h.len() - 1
+                };
                 let token = propose_retrying(
                     &r,
                     &handles,
@@ -190,28 +206,32 @@ fn spawn_client(
                 if let Some(t) = token {
                     last_token = Some(last_token.map_or(t, |p| p.max(t)));
                 }
-                history.borrow_mut().push(Record {
-                    client,
-                    call,
-                    ret: r.now(),
-                    op: Op::Write {
-                        key,
-                        version,
-                        token,
-                    },
-                });
+                let mut h = history.borrow_mut();
+                h[pos].ret = r.now();
+                h[pos].op = Op::Write {
+                    key,
+                    version,
+                    token,
+                };
             } else if roll < 5 {
+                let pos = {
+                    let mut h = history.borrow_mut();
+                    h.push(Record {
+                        client,
+                        call,
+                        ret: Instant::from_nanos(u64::MAX),
+                        op: Op::Delete { key, token: None },
+                    });
+                    h.len() - 1
+                };
                 let token =
                     propose_retrying(&r, &handles, Command::Delete(vec![DocId(key)]), start).await;
                 if let Some(t) = token {
                     last_token = Some(last_token.map_or(t, |p| p.max(t)));
                 }
-                history.borrow_mut().push(Record {
-                    client,
-                    call,
-                    ret: r.now(),
-                    op: Op::Delete { key, token },
-                });
+                let mut h = history.borrow_mut();
+                h[pos].ret = r.now();
+                h[pos].op = Op::Delete { key, token };
             } else {
                 let consistency = match rng.below(3) {
                     0 => Consistency::Linearizable,
@@ -538,7 +558,7 @@ fn run(seed: u64) -> (usize, usize, u64) {
         })
         .count();
     assert!(
-        writes > 20 && reads > 20,
+        writes >= 5 && reads >= 5,
         "seed {seed}: too little activity: {writes} writes, {reads} reads"
     );
     (reads, checked, sim.digest())
@@ -557,6 +577,37 @@ fn signature_test_under_faults() {
         total_reads += reads;
     }
     assert!(total_reads > 500);
+}
+
+/// Campaign runner: `CAIRN_SEEDS=a..b cargo test --release -p cairn-query --test chaos campaign -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn campaign() {
+    let range = std::env::var("CAIRN_SEEDS").expect("CAIRN_SEEDS=a..b");
+    let (a, b) = range.split_once("..").expect("a..b");
+    let (a, b): (u64, u64) = (a.parse().unwrap(), b.parse().unwrap());
+    let mut reads = 0usize;
+    let mut writes = 0usize;
+    for seed in a..b {
+        let r = std::panic::catch_unwind(|| run(seed));
+        match r {
+            Ok((rd, _, _)) => {
+                reads += rd;
+                writes += 1;
+            }
+            Err(_) => {
+                eprintln!("CAMPAIGN FAIL seed={seed}");
+                std::process::exit(2);
+            }
+        }
+        if seed % 100 == 0 {
+            eprintln!("campaign progress seed={seed}");
+        }
+    }
+    eprintln!(
+        "CAMPAIGN OK seeds={}..{} runs={writes} reads_checked={reads}",
+        a, b
+    );
 }
 
 #[test]

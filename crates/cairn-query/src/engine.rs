@@ -1,6 +1,7 @@
 //! The per-shard engine: store + loaded indexes + query execution.
 
-use crate::fusion::{LegList, fuse};
+pub use crate::fusion::LegList;
+use crate::fusion::fuse;
 use crate::query::{Hit, Query};
 use cairn_core::{
     DocId, Document, Error, FieldKind, HashMap, LogIndex, Result, Runtime, Schema, SegmentId, Value,
@@ -213,6 +214,32 @@ impl<R: Runtime> ShardEngine<R> {
 
     /// Executes a hybrid query.
     pub async fn query(&mut self, q: &Query) -> Result<Vec<Hit>> {
+        let lists = self.query_legs(q).await?;
+        let fused = if q.leg_count() == 0 {
+            self.filter_only(q).await?
+        } else {
+            fuse(&q.fusion, &lists, q.k)
+        };
+        let mut out = Vec::with_capacity(fused.len());
+        for (doc_id, score, legs) in fused {
+            let document = if q.with_documents {
+                self.store.get(doc_id).await?
+            } else {
+                None
+            };
+            out.push(Hit {
+                doc_id,
+                score,
+                legs,
+                document,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Runs every leg of `q` over this shard and returns the per-leg candidate lists (each of
+    /// size `q.per_leg()`), unfused, for a coordinator that merges several shards (ADR 0007).
+    pub async fn query_legs(&mut self, q: &Query) -> Result<Vec<LegList>> {
         let schema = self.store.schema().clone();
         q.filter.validate(&schema)?;
         for leg in &q.vectors {
@@ -241,8 +268,6 @@ impl<R: Runtime> ShardEngine<R> {
         let per_leg = q.per_leg();
         let n_legs = q.leg_count();
         let mut legs: Vec<Vec<(DocId, f32)>> = vec![Vec::new(); n_legs];
-
-        // Segments.
         let seg_ids: Vec<SegmentId> = self.store.segments().map(|m| m.id).collect();
         for id in seg_ids {
             let Some(view) = self.store.segment(id) else {
@@ -266,7 +291,6 @@ impl<R: Runtime> ShardEngine<R> {
                 &mut legs,
             )?;
         }
-        // Memtable (tombstones are already absent from its docs).
         {
             let m = self.memtable_indexes();
             if !m.docs.is_empty() {
@@ -277,7 +301,6 @@ impl<R: Runtime> ShardEngine<R> {
                 }
             }
         }
-        // Merge each leg (a doc appears in exactly one place: memtable or one segment).
         let mut lists = Vec::with_capacity(n_legs);
         for (li, mut hits) in legs.into_iter().enumerate() {
             let higher_is_better = li >= q.vectors.len();
@@ -292,27 +315,18 @@ impl<R: Runtime> ShardEngine<R> {
                 higher_is_better,
             });
         }
-        let fused = if n_legs == 0 {
-            // Filter-only query: documents in id order.
-            self.filter_only(q).await?
-        } else {
-            fuse(&q.fusion, &lists, q.k)
-        };
-        let mut out = Vec::with_capacity(fused.len());
-        for (doc_id, score, legs) in fused {
-            let document = if q.with_documents {
-                self.store.get(doc_id).await?
-            } else {
-                None
-            };
-            out.push(Hit {
-                doc_id,
-                score,
-                legs,
-                document,
-            });
-        }
-        Ok(out)
+        Ok(lists)
+    }
+
+    /// Documents matching the filter only (no legs), in id order, up to `q.k`.
+    pub async fn filter_only_ids(&mut self, q: &Query) -> Result<Vec<DocId>> {
+        self.refresh().await?;
+        Ok(self
+            .filter_only(q)
+            .await?
+            .into_iter()
+            .map(|x| x.0)
+            .collect())
     }
 
     #[allow(clippy::type_complexity)]

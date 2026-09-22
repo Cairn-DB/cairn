@@ -61,6 +61,9 @@ pub struct ReplicaConfig {
     pub dir: String,
     /// Seed for Raft's election randomness.
     pub seed: u64,
+    /// Spawn a task that reads the runtime's network inbox and delivers frames to this replica.
+    /// A multi-shard node sets this to `false` and delivers through [`ReplicaHandle::deliver`].
+    pub own_receiver: bool,
 }
 
 /// Snapshot of a replica's state for diagnostics and checkers.
@@ -89,6 +92,11 @@ enum Event {
     Net(NodeId, Bytes),
     Propose(Command, Sender<Result<Token>>),
     Query(Query, Consistency, Sender<Result<Vec<Hit>>>),
+    QueryLegs(
+        Query,
+        Consistency,
+        Sender<Result<Vec<crate::fusion::LegList>>>,
+    ),
     Get(DocId, Consistency, Sender<Result<Option<Document>>>),
     Status(Sender<ReplicaStatus>),
 }
@@ -115,6 +123,7 @@ impl Drop for AliveGuard {
             match ev {
                 Event::Propose(_, done) => done.send(closed()),
                 Event::Query(_, _, done) => done.send(closed()),
+                Event::QueryLegs(_, _, done) => done.send(closed()),
                 Event::Get(_, _, done) => done.send(closed()),
                 Event::Status(_) | Event::Tick | Event::Net(..) => {}
             }
@@ -160,6 +169,27 @@ impl ReplicaHandle {
         rx.await.unwrap_or_else(closed)
     }
 
+    /// Runs the legs of a query at the given consistency, unfused (multi-shard coordinators).
+    pub async fn query_legs(
+        &self,
+        q: Query,
+        consistency: Consistency,
+    ) -> Result<Vec<crate::fusion::LegList>> {
+        if !self.alive.get() {
+            return closed();
+        }
+        let (tx, rx) = oneshot();
+        self.inbox.push(Event::QueryLegs(q, consistency, tx));
+        rx.await.unwrap_or_else(closed)
+    }
+
+    /// Delivers a node-to-node frame (used by a node-level dispatcher that owns the socket).
+    pub fn deliver(&self, from: NodeId, bytes: Bytes) {
+        if self.alive.get() {
+            self.inbox.push(Event::Net(from, bytes));
+        }
+    }
+
     /// Point read at the given consistency.
     pub async fn get(&self, id: DocId, consistency: Consistency) -> Result<Option<Document>> {
         if !self.alive.get() {
@@ -178,10 +208,6 @@ impl ReplicaHandle {
         let (tx, rx) = oneshot();
         self.inbox.push(Event::Status(tx));
         rx.await
-    }
-
-    fn deliver(&self, from: NodeId, bytes: Bytes) {
-        self.inbox.push(Event::Net(from, bytes));
     }
 }
 
@@ -338,14 +364,16 @@ impl<R: Runtime> Replica<R> {
             }
         });
         // Network receiver.
-        let (h, r2) = (handle.clone(), rt.clone());
-        rt.spawn(async move {
-            while h.alive.get()
-                && let Ok((from, bytes)) = r2.network().recv().await
-            {
-                h.deliver(from, bytes);
-            }
-        });
+        if cfg.own_receiver {
+            let (h, r2) = (handle.clone(), rt.clone());
+            rt.spawn(async move {
+                while h.alive.get()
+                    && let Ok((from, bytes)) = r2.network().recv().await
+                {
+                    h.deliver(from, bytes);
+                }
+            });
+        }
         // The actor.
         let guard = AliveGuard {
             inbox: inbox.clone(),
@@ -361,6 +389,7 @@ impl<R: Runtime> Replica<R> {
                     match ev {
                         Event::Propose(_, done) => done.send(closed()),
                         Event::Query(_, _, done) => done.send(closed()),
+                        Event::QueryLegs(_, _, done) => done.send(closed()),
                         Event::Get(_, _, done) => done.send(closed()),
                         Event::Status(_) | Event::Tick | Event::Net(..) => {}
                     }
@@ -399,6 +428,7 @@ impl<R: Runtime> Replica<R> {
                 Err(e) => done.send(Err(e)),
             },
             Event::Query(q, c, done) => self.read(Event::Query(q, c, done)).await?,
+            Event::QueryLegs(q, c, done) => self.read(Event::QueryLegs(q, c, done)).await?,
             Event::Get(id, c, done) => self.read(Event::Get(id, c, done)).await?,
             Event::Status(done) => {
                 let st = self.engine.store();
@@ -419,7 +449,7 @@ impl<R: Runtime> Replica<R> {
 
     fn consistency_of(ev: &Event) -> Consistency {
         match ev {
-            Event::Query(_, c, _) | Event::Get(_, c, _) => *c,
+            Event::Query(_, c, _) | Event::QueryLegs(_, c, _) | Event::Get(_, c, _) => *c,
             _ => Consistency::Stale,
         }
     }
@@ -427,6 +457,7 @@ impl<R: Runtime> Replica<R> {
     fn fail(ev: Event, e: Error) {
         match ev {
             Event::Query(_, _, done) => done.send(Err(e)),
+            Event::QueryLegs(_, _, done) => done.send(Err(e)),
             Event::Get(_, _, done) => done.send(Err(e)),
             _ => {}
         }
@@ -476,6 +507,10 @@ impl<R: Runtime> Replica<R> {
         match ev {
             Event::Query(q, _, done) => {
                 let r = self.engine.query(&q).await;
+                done.send(r);
+            }
+            Event::QueryLegs(q, _, done) => {
+                let r = self.engine.query_legs(&q).await;
                 done.send(r);
             }
             Event::Get(id, _, done) => {

@@ -5,8 +5,14 @@
 //! [`cairn_core::Runtime`] trait only.
 
 pub mod blocking;
+pub mod cross;
 pub mod executor;
+pub mod pool;
 pub mod reactor;
+pub mod tcp;
 
+pub use cross::{CrossQueue, CrossReceiver, CrossSender, cross_oneshot};
 pub use executor::{Executor, Handle, RunOutcome};
+pub use pool::{PoolDisk, PoolRuntime, ThreadReactor};
 pub use reactor::Reactor;
+pub use tcp::{TcpNetwork, TcpNetworkConfig};

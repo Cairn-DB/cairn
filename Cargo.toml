@@ -4,6 +4,8 @@ members = [
   "crates/cairn-core",
   "crates/cairn-storage",
   "crates/cairn-index",
+  "crates/cairn-proto",
+  "crates/cairn-client",
   "crates/cairn-query",
   "crates/cairn-raft",
   "crates/cairn-runtime",
@@ -67,6 +69,7 @@ hdrhistogram = "7.6"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 missing_docs = "warn"
 
 [workspace.lints.clippy]

@@ -25,6 +25,7 @@ impl Default for Fusion {
 }
 
 /// A leg's ranked list: `(doc, score)` best first; `higher_is_better` says how to read `score`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LegList {
     /// Ranked hits.
     pub hits: Vec<(DocId, f32)>,

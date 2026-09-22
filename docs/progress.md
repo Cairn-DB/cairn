@@ -77,7 +77,23 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - M3.4 DONE (first version): tests/chaos.rs signature test: 3 clients, partitions, drops,
     crashes/restarts, per-key model with real-time bounds, read-your-takedown rule, convergence,
     determinism (same digest). 12 seeds in CI-speed test.
-  - M3.5 TODO: campaign runner (thousands of seeds), Phase 3 report.
+  - M3.5 IN PROGRESS: tools/scripts/campaign.sh (20k seeds, 8 processes). First runs found
+    checker gaps (unacked writes; writes in flight at the end) -> clients retry until acked and
+    writes are recorded at invocation. Result file: bench-results/phase3-campaign.md.
+- Phase 4: IN PROGRESS.
+  - M4.1 DONE: cairn-proto (client Request/Response with Cairn's codec; ADR 0009 revised:
+    no protobuf), cairn-client (blocking, follows leader hints, keeps per-shard tokens).
+  - M4.2 DONE (deviation): cairn-runtime ThreadReactor + PoolDisk (helper threads, completion
+    channel) and TcpNetwork (reader thread per connection, writer thread per peer, framed;
+    client connections multiplexed by request id); CrossQueue/cross_oneshot for cross-core
+    traffic with a loom model (tests/loom_cross.rs). io_uring reactor NOT done.
+  - M4.3 DONE: cairn-server Node: one executor per core, shard s on core s % cores, dispatcher
+    routes frames by shard, coordinator fans out per shard (per-leg merge then fusion) and
+    forwards sub-requests to shard leaders (Request::Forwarded/ShardLegs).
+  - M4.4 DONE: crates/cairn-server/tests/cluster.rs: 3 processes, 4 shards x 2 cores, writes,
+    RYW reads, hybrid query, takedown, kill + restart + convergence.
+  - M4.5 TODO: end-to-end benchmark through the cluster (ingest, query p50/p99, takedown
+    visibility latency); Phase 4 report; final docs.
 
 ## Next step
 M3.5 campaign (ignored long test + script, results committed), Phase 3 report, then Phase 4:

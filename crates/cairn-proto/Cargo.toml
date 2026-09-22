@@ -1,6 +1,6 @@
 [package]
-name = "cairn-runtime"
-description = "Per-core executor with pluggable reactors, and the real (OS-backed) Clock/Disk/Network implementations."
+name = "cairn-proto"
+description = "Client API messages and their encoding (ADR 0009, revised in ADR 0012: Cairn's own codec)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,11 +12,9 @@ workspace = true
 
 [dependencies]
 cairn-core = { path = "../cairn-core" }
+cairn-query = { path = "../cairn-query" }
+cairn-raft = { path = "../cairn-raft" }
 bytes.workspace = true
-slab.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-loom.workspace = true

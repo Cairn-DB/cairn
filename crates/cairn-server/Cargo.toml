@@ -10,14 +10,28 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cairn-server"
+path = "src/main.rs"
+
 [dependencies]
 cairn-core = { path = "../cairn-core" }
 cairn-storage = { path = "../cairn-storage" }
 cairn-index = { path = "../cairn-index" }
 cairn-query = { path = "../cairn-query" }
 cairn-raft = { path = "../cairn-raft" }
+cairn-runtime = { path = "../cairn-runtime" }
+cairn-proto = { path = "../cairn-proto" }
 anyhow.workspace = true
+bytes.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# I/O runtime (glommio | monoio) is an open decision: add it here after ADR.
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+cairn-client = { path = "../cairn-client" }

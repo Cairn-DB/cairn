@@ -76,6 +76,7 @@ fn config(node: NodeId, memtable_max_bytes: usize) -> ReplicaConfig {
         },
         dir: "shard0".into(),
         seed: 7,
+        own_receiver: true,
     }
 }
 
