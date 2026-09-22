@@ -10,12 +10,13 @@ members = [
   "crates/cairn-sim",
   "crates/cairn-server",
   "tools/cairn-bench-gen",
+  "tools/cairn-bench",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"  # AVX-512 intrinsics (ADR 0006); toolchain is 1.98
 license = "Apache-2.0"
 repository = "https://github.com/CHANGE-ME/cairn"
 
@@ -71,6 +72,8 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "deny"
+chunks_exact_to_as_chunks = "allow"  # style only
+manual_is_multiple_of = "allow"      # style only
 
 [profile.release]
 opt-level = 3

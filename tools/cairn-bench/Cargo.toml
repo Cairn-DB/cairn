@@ -1,0 +1,21 @@
+[package]
+name = "cairn-bench"
+description = "Benchmark runner: dataset loaders, ground truth, recall/latency sweeps; writes bench-results/."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../../crates/cairn-core" }
+cairn-index = { path = "../../crates/cairn-index" }
+cairn-bench-gen = { path = "../cairn-bench-gen" }
+anyhow.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

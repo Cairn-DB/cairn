@@ -21,3 +21,9 @@ tracing.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 hdrhistogram.workspace = true
+cairn-runtime = { path = "../cairn-runtime" }
+cairn-sim = { path = "../cairn-sim" }
+
+[[bench]]
+name = "kernels"
+harness = false
