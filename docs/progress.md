@@ -93,13 +93,16 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     RYW reads, hybrid query, takedown, kill + restart + convergence.
   - Background segment builds (frozen memtable + Runtime::offload) DONE after the first
     cluster runs showed a synchronous HNSW build would stall Raft heartbeats.
-  - M4.5 IN PROGRESS: tools/scripts/cluster.sh + `cairn-bench cluster` (SIFT1M through 3
-    processes: ingest rate, query p50/p99, takedown visibility); Phase 4 report.
+  - M4.5 DONE 2026-09-22: bench-results/phase4-cluster-sift1m.md (4.6k docs/s ingest,
+    filtered p99 6.5 ms, takedown visible on all nodes p99 41 ms). Report:
+    docs/reports/phase-4.md.
+- Phase 4: DONE 2026-09-22. PROTOTYPE DELIVERED.
 
 ## Next step
-M3.5 campaign (ignored long test + script, results committed), Phase 3 report, then Phase 4:
-cairn-proto framing over real TCP (blocking reactor first), cairn-server multi-shard node,
-cairn-client, 3-process cluster test, io_uring reactor spike, end-to-end benchmark.
+Delivered. Candidate follow-ups, by value: (1) move segment publication and compaction input
+reads off the actor (ingest p99); (2) group commit across proposals; (3) io_uring reactor;
+(4) BM25 scoring loop (term-at-a-time accumulators or block-max WAND); (5) membership changes;
+(6) fuzz targets + Miri on the scalar kernel paths; (7) 10M-row end-to-end ingest run.
 
 ## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
@@ -123,6 +126,9 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
 (none yet)
 
 ## Log
+- 2026-09-22 (end): Phases 3 and 4 closed. Real-cluster bugs: cross-thread wake did not
+  unpark the reactor (50 ms hops); client rewrote explicit RYW tokens; synchronous builds in
+  the actor. Campaign re-validated after every Raft/sim change.
 - 2026-09-22: Phase 1 closed (40 tests). Bench lesson: consumer NVMe fsync jitter makes
   batch-1 vs batch-16 comparisons meaningless; only report group-commit throughput.
 - 2026-09-22: M1.2 done. Lesson: edition 2024 reserves `gen`; `truncate_suffix` below the

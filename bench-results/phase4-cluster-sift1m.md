@@ -6,9 +6,9 @@
 
 | metric | value |
 |---|---|
-| ingest throughput | 4100 docs/s (243.9 s total) |
-| upsert batch latency p50 / p99 | 378.5 / 1792.0 ms |
-| unfiltered k=10 query p50 / p99 (stale, 8 threads) | 16.56 / 27.79 ms, 475 QPS |
-| filtered (≈1%) k=10 query p50 / p99 (stale) | 3.68 / 6.16 ms, 2121 QPS |
-| filtered k=10 query p50 / p99 (linearizable) | 5.26 / 7.34 ms, 1466 QPS |
-| takedown visible on all nodes (RYW) p50 / p99 / max | 98.6 / 106.0 / 108.1 ms (200 takedowns) |
+| ingest throughput | 4576 docs/s (218.5 s total) |
+| upsert batch latency p50 / p99 | 348.4 / 995.6 ms |
+| unfiltered k=10 query p50 / p99 (stale, 8 threads) | 17.45 / 544.21 ms, 229 QPS |
+| filtered (≈1%) k=10 query p50 / p99 (stale) | 4.05 / 6.53 ms, 1934 QPS |
+| filtered k=10 query p50 / p99 (linearizable) | 5.69 / 7.66 ms, 1354 QPS |
+| takedown visible on all nodes (RYW) p50 / p99 / max | 30.9 / 40.7 / 124.5 ms (200 takedowns) |
