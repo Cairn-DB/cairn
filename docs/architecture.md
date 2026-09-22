@@ -183,3 +183,21 @@ recovered state equals the committed prefix.
 
 Resharding, cross-shard transactions, partial updates, phrase queries, learned fusion, PQ, geo
 replication, model inference, any HTTP or gRPC endpoint (a gateway comes later, ADR 0009).
+
+## 10. As built (2026-09-22)
+
+Deviations from the sketch above, all recorded in the ADR outcomes:
+
+- **Reactor**: thread-pool reactor and helper-thread disk/socket work instead of io_uring
+  (ADR 0002 outcome). One executor per core as planned; cross-core traffic goes through
+  `CrossQueue` (loom-modelled).
+- **Node layout**: every node hosts every shard (static membership); shard `s` lives on core
+  `s mod cores`; a node-level dispatcher routes frames by shard; the client coordinator on core 0
+  fans requests out per shard, merges per-leg lists and fuses once, and forwards a shard's
+  sub-request to that shard's leader when the local replica is not it.
+- **Segment builds** run off the actor: the store freezes the memtable, the build goes through
+  `Runtime::offload`, and the actor publishes the result; compaction follows the same shape.
+  Writes that arrive during a build are masked in the new segment.
+- **Replica resilience**: a replica that hits a fatal error reopens itself from disk (the
+  in-memory equivalent of a restart); a stale snapshot install self-heals that way.
+- **Wire protocol**: the workspace codec, not protobuf (ADR 0009 outcome).

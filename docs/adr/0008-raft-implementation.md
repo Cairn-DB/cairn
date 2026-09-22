@@ -74,3 +74,9 @@ Phase 3, M3.2: differential simulation against `raft-rs` over 10,000 seeded runs
 and crashes; zero divergences in safety properties (election safety, log matching, leader
 completeness, state machine safety). Phase 3, M3.5: the million-run campaign with the checkers in
 docs/verification.md.
+
+## Outcome (2026-09-22)
+
+Own Raft shipped (`cairn-raft`, ~900 lines plus harness). The in-crate seeded harness and the
+simulator campaign found four real bugs before any real network existed (docs/reports/phase-3.md).
+`raft-rs` was never needed; the differential test was not done. Static membership only.

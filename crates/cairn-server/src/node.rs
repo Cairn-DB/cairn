@@ -439,7 +439,17 @@ impl Node {
                 leader_hint: Some(l),
                 ..
             })) if may_forward && l != cfg.id => {
-                Self::forward(rt, cfg, l, Request::Get { id, consistency }).await
+                Self::forward(
+                    rt,
+                    cfg,
+                    l,
+                    Request::Get {
+                        id,
+                        consistency,
+                        tokens: Vec::new(),
+                    },
+                )
+                .await
             }
             Some(Err(e)) => Response::from_error(&e),
             None => Response::Error {
@@ -531,9 +541,13 @@ impl Node {
                 tokens.sort();
                 Response::Ack(tokens)
             }
-            Request::Get { id, consistency } => {
+            Request::Get {
+                id,
+                consistency,
+                tokens,
+            } => {
                 let shard = shard_of(id, cfg.shards);
-                let consistency = Self::per_shard(consistency, &[], shard);
+                let consistency = Self::per_shard(consistency, &tokens, shard);
                 Self::get_routed(rt, queues, cfg, shard, id, consistency, may_forward).await
             }
             Request::Query {

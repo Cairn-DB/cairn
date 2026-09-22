@@ -14,4 +14,10 @@ pub trait Reactor {
     /// Whether an outstanding operation exists that will eventually wake a task. When this is
     /// `false` and no timer is pending, blocked tasks are stalled forever.
     fn has_pending(&self) -> bool;
+
+    /// A hook the executor calls from `Waker::wake` (possibly on another thread) so a wake-up
+    /// interrupts [`Reactor::park`]. Reactors that block in real time must provide one.
+    fn unpark_hook(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
 }

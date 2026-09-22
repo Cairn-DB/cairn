@@ -114,6 +114,11 @@ impl Reactor for ThreadReactor {
     fn has_pending(&self) -> bool {
         self.completer.pending.load(Ordering::SeqCst) > 0
     }
+
+    fn unpark_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let c = self.completer.clone();
+        Some(Arc::new(move || c.notify(Box::new(|| {}))))
+    }
 }
 
 struct SlotInner<T> {

@@ -25,6 +25,8 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()>>>;
 #[derive(Default)]
 struct ReadyQueue {
     queue: Mutex<VecDeque<usize>>,
+    /// Interrupts the reactor's park when a wake arrives from another thread.
+    unpark: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl ReadyQueue {
@@ -33,6 +35,9 @@ impl ReadyQueue {
             .lock()
             .expect("ready queue poisoned")
             .push_back(id);
+        if let Some(u) = self.unpark.lock().expect("unpark poisoned").as_ref() {
+            u();
+        }
     }
 
     fn take_all(&self, into: &mut VecDeque<usize>) {
@@ -211,7 +216,8 @@ pub struct Executor<R: Reactor> {
 impl<R: Reactor> Executor<R> {
     /// Creates an executor starting at `Instant::ZERO`.
     pub fn new(reactor: R) -> Self {
-        Executor {
+        let hook = reactor.unpark_hook();
+        let ex = Executor {
             shared: Rc::new(Shared {
                 now: Cell::new(Instant::ZERO),
                 ready: Arc::new(ReadyQueue::default()),
@@ -225,7 +231,9 @@ impl<R: Reactor> Executor<R> {
             reactor,
             scheduler_rng: None,
             polls: 0,
-        }
+        };
+        *ex.shared.ready.unpark.lock().expect("unpark poisoned") = hook;
+        ex
     }
 
     /// Installs a seeded generator that picks the next runnable task; without one, scheduling is

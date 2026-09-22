@@ -79,3 +79,11 @@ Phase 1, milestone M1.5: WAL append (4 KiB records, fsync per batch) and segment
 64 KiB pages) on the same NVMe device, three backends: sync `pwrite`/`fsync`, own io_uring reactor,
 `glommio` on a throwaway branch. Report throughput and p50/p99/p999 with `hdrhistogram`. Budget:
 two days.
+
+## Outcome (2026-09-22)
+
+The executor is shared by simulation and production as planned. The production reactor is a
+**thread-pool reactor** (`cairn-runtime::pool`): blocking disk and socket work on helper threads,
+completions through a channel the executor parks on. The io_uring reactor was not built; the
+`Disk` trait is completion-shaped so it remains a drop-in. The "engine never touches the OS"
+rule held (clippy bans), and `Runtime::offload` was added for CPU-heavy segment builds.

@@ -46,3 +46,11 @@ a system `protoc`. `prost` runtime is light. No `tonic` in v1.
 ## Experiment that confirms or refutes
 
 None needed beyond fuzzing and a throughput benchmark of the frame codec (Phase 4, M4.1).
+
+## Outcome (2026-09-22)
+
+Revised under ADR 0012: no protobuf. `cairn-proto` encodes requests and responses with the
+workspace codec; `cairn-runtime::tcp` frames them (`u32 length | u8 kind | u64 request id`).
+Node-to-node frames carry Raft messages and segment-file chunks; client connections multiplex
+requests by id. `Request::Forwarded` lets a node forward a shard's sub-request to that shard's
+leader, so any node is a valid entry point. A gRPC gateway remains future work.

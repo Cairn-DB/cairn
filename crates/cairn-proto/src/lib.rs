@@ -24,6 +24,8 @@ pub enum Request {
         id: DocId,
         /// Consistency level.
         consistency: Consistency,
+        /// Per-shard read-your-writes tokens (the one matching the document's shard is used).
+        tokens: Vec<Token>,
     },
     /// Hybrid query over every shard.
     Query {
@@ -326,9 +328,17 @@ impl Request {
                     w.u64(id.get());
                 }
             }
-            Request::Get { id, consistency } => {
+            Request::Get {
+                id,
+                consistency,
+                tokens,
+            } => {
                 w.u8(3).u64(id.get());
                 enc_consistency(&mut w, consistency);
+                w.u32(tokens.len() as u32);
+                for t in tokens {
+                    enc_token(&mut w, t);
+                }
             }
             Request::Query {
                 query,
@@ -388,10 +398,20 @@ impl Request {
                 }
                 Request::Delete(ids)
             }
-            3 => Request::Get {
-                id: DocId(r.u64()?),
-                consistency: dec_consistency(&mut r)?,
-            },
+            3 => {
+                let id = DocId(r.u64()?);
+                let consistency = dec_consistency(&mut r)?;
+                let n = r.u32()? as usize;
+                let mut tokens = Vec::with_capacity(n.min(1 << 12));
+                for _ in 0..n {
+                    tokens.push(dec_token(&mut r)?);
+                }
+                Request::Get {
+                    id,
+                    consistency,
+                    tokens,
+                }
+            }
             4 => {
                 let query = dec_query(&mut r)?;
                 let consistency = dec_consistency(&mut r)?;
@@ -598,6 +618,7 @@ mod tests {
             Request::Get {
                 id: DocId(9),
                 consistency: Consistency::ReadYourWrites(token),
+                tokens: vec![token],
             },
             Request::Query {
                 query: q.clone(),

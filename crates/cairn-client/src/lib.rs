@@ -143,10 +143,19 @@ impl Client {
         self.expect_ack(r)
     }
 
-    /// Point read.
+    /// Point read. `read_your_writes()` expands to every token this client has seen; an explicit
+    /// `ReadYourWrites(token)` is sent as is.
     pub fn get(&mut self, id: DocId, consistency: Consistency) -> Result<Option<Document>> {
-        let consistency = self.resolve(consistency, cairn_proto::shard_of(id, self.shard_count()));
-        match self.call(&Request::Get { id, consistency })? {
+        let tokens = if consistency == self.read_your_writes() {
+            self.tokens()
+        } else {
+            Vec::new()
+        };
+        match self.call(&Request::Get {
+            id,
+            consistency,
+            tokens,
+        })? {
             Response::Doc(d) => Ok(d),
             Response::Error { message, .. } => Err(Error::Internal(message)),
             other => Err(Error::Internal(format!("unexpected response {other:?}"))),
@@ -180,26 +189,12 @@ impl Client {
         }
     }
 
-    /// Read-your-writes consistency using the tokens this client has seen.
+    /// Sentinel meaning "read-your-writes with every token this client has seen"; expanded by
+    /// `get` and `query` into the per-shard token list.
     pub fn read_your_writes(&self) -> Consistency {
         Consistency::ReadYourWrites(Token {
             shard: cairn_core::ShardId(0),
             index: cairn_core::LogIndex(0),
         })
-    }
-
-    fn shard_count(&self) -> u32 {
-        self.tokens.keys().max().map_or(1, |m| m + 1)
-    }
-
-    /// For a single-shard read, substitute the token of that shard (if any) into RYW.
-    fn resolve(&self, c: Consistency, shard: cairn_core::ShardId) -> Consistency {
-        match c {
-            Consistency::ReadYourWrites(_) => match self.tokens.get(&shard.get()) {
-                Some(t) => Consistency::ReadYourWrites(*t),
-                None => Consistency::Stale,
-            },
-            other => other,
-        }
     }
 }

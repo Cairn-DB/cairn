@@ -45,3 +45,9 @@ waiting on every replica.
   batches them.
 - The simulator can check all three promises mechanically, since tokens are ordinary values in the
   recorded history.
+
+## Outcome (2026-09-22)
+
+Implemented as specified in `cairn-query::replica` and enforced by the chaos signature test.
+Multi-shard reads take one token per shard (`Request::Query.tokens`); the client keeps the
+highest token per shard it has seen.

@@ -77,9 +77,8 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - M3.4 DONE (first version): tests/chaos.rs signature test: 3 clients, partitions, drops,
     crashes/restarts, per-key model with real-time bounds, read-your-takedown rule, convergence,
     determinism (same digest). 12 seeds in CI-speed test.
-  - M3.5 IN PROGRESS: tools/scripts/campaign.sh (20k seeds, 8 processes). First runs found
-    checker gaps (unacked writes; writes in flight at the end) -> clients retry until acked and
-    writes are recorded at invocation. Result file: bench-results/phase3-campaign.md.
+  - M3.5 DONE: campaign 20k seeds zero violations (bench-results/phase3-campaign.md; rerun
+    after the background-build change is in progress). Report: docs/reports/phase-3.md.
 - Phase 4: IN PROGRESS.
   - M4.1 DONE: cairn-proto (client Request/Response with Cairn's codec; ADR 0009 revised:
     no protobuf), cairn-client (blocking, follows leader hints, keeps per-shard tokens).
@@ -92,8 +91,10 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     forwards sub-requests to shard leaders (Request::Forwarded/ShardLegs).
   - M4.4 DONE: crates/cairn-server/tests/cluster.rs: 3 processes, 4 shards x 2 cores, writes,
     RYW reads, hybrid query, takedown, kill + restart + convergence.
-  - M4.5 TODO: end-to-end benchmark through the cluster (ingest, query p50/p99, takedown
-    visibility latency); Phase 4 report; final docs.
+  - Background segment builds (frozen memtable + Runtime::offload) DONE after the first
+    cluster runs showed a synchronous HNSW build would stall Raft heartbeats.
+  - M4.5 IN PROGRESS: tools/scripts/cluster.sh + `cairn-bench cluster` (SIFT1M through 3
+    processes: ingest rate, query p50/p99, takedown visibility); Phase 4 report.
 
 ## Next step
 M3.5 campaign (ignored long test + script, results committed), Phase 3 report, then Phase 4:
