@@ -6,6 +6,7 @@ members = [
   "crates/cairn-index",
   "crates/cairn-query",
   "crates/cairn-raft",
+  "crates/cairn-runtime",
   "crates/cairn-sim",
   "crates/cairn-server",
   "tools/cairn-bench-gen",
@@ -34,6 +35,8 @@ serde = { version = "1.0", features = ["derive"] }
 bytes = "1.12"
 crc32fast = "1.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rustc-hash = "2.1"
+slab = "0.4"
 memmap2 = "0.9"
 
 # --- consensus (DECIDED: pure state machine, no I/O; see docs/adr/0001) ---

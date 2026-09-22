@@ -1,6 +1,6 @@
 [package]
-name = "cairn-sim"
-description = "Deterministic simulation harness: seeded network, disk, clock, fault injection, linearizability checker."
+name = "cairn-runtime"
+description = "Per-core executor with pluggable reactors, and the real (OS-backed) Clock/Disk/Network implementations."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,11 +12,10 @@ workspace = true
 
 [dependencies]
 cairn-core = { path = "../cairn-core" }
-cairn-runtime = { path = "../cairn-runtime" }
 bytes.workspace = true
-tracing.workspace = true
+slab.workspace = true
 thiserror.workspace = true
-xxhash-rust.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

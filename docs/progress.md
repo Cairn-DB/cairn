@@ -23,19 +23,32 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
 
 ## State
 - Phase 0: DONE 2026-09-22 (commit "Phase 0: ...").
-- Phase 1: NOT STARTED. Next: M1.1 (traits, executor, blocking reactor, sim clock/disk/rng with
-  trace hashing, SPSC queue with loom).
+- Phase 1: IN PROGRESS.
+  - M1.1 DONE 2026-09-22: cairn-core (ids, time, error, hash aliases, SeededRng, Runtime/Disk/
+    Network traits), cairn-runtime (executor with pluggable Reactor, tags, seeded scheduler;
+    blocking OS disk; RealRuntime), cairn-sim (Simulation, SimReactor, SimDisk with unsynced-loss
+    and torn writes, SimNetwork with delay/drop/partition, Trace digest). 20 tests. The SPSC
+    queue + loom item is deferred to M4.2 (no cross-core traffic before real networking).
+  - M1.2 IN PROGRESS: log + codec + manifest + crash-recovery tests.
 
 ## Next step
-M1.1. Create `crates/cairn-runtime`; define in `cairn-core`: `Instant`/`Duration` newtypes,
-`Clock`, `Rng`, `Disk`, `Network`, `Spawn` traits, `HashMap`/`HashSet` aliases (rustc-hash),
-error types, ids. Executor: single-threaded, slab of tasks, `Rc<RefCell>`-free waker design,
-timer wheel or BTreeMap of deadlines. Sim reactor in `cairn-sim`: discrete-event clock, disk
-model with unsynced-write loss and torn pages, trace with hash; run each seed twice.
+M1.2: `cairn-storage::log` (segmented files named by first index, header with magic/version,
+records `[len][crc32][term][index][payload]`, recovery truncates at the first bad record,
+suffix truncation for Raft, prefix truncation by whole files), `codec` (bounds-checked
+reader/writer, fuzzable), `manifest` (tmp + sync + rename). Tests: sim-driven crash/recovery
+property test, byte-level truncation/corruption proptest, real-fs smoke test.
+
+## Design notes that are not in the code
+- Engine code is generic over `R: Runtime`; the runtime is cloned into every component.
+- Sim: one executor for all nodes; tasks tagged by node id; `Simulation::crash` cancels tasks,
+  drops the node's events and inbox, and applies disk crash semantics.
+- Disk trait: data ops take effect at completion (after latency); directory ops at issue.
 
 ## Open problems
 (none yet)
 
 ## Log
+- 2026-09-22: M1.1 done (executor, blocking runtime, simulator core). Lesson: with a seeded
+  scheduler, two tasks' issue order is not their spawn order; per-file ordering is per task.
 - 2026-09-22: Phase 0 delivered; mandate changed to autonomous delivery; ADR 0012 written;
   raft-rs removed from cairn-raft; tool installs started.

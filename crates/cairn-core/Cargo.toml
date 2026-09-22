@@ -15,3 +15,10 @@ thiserror.workspace = true
 bytes.workspace = true
 serde.workspace = true
 tracing.workspace = true
+rustc-hash.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
