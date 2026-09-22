@@ -58,3 +58,10 @@ Phase 2, M2.4: MS MARCO passage dev set, BM25 MRR@10 compared with the published
 BM25 baseline (look up the exact figure when running; do not quote from memory). Target: within
 0.01 of the baseline with the same k1/b. Throughput: queries/s on the same set, single core,
 reported with p50/p99.
+
+## Outcome of the Phase 2 experiment (2026-09-22)
+
+`bench-results/phase2-msmarco.md`: MRR@10 0.204 on dev small over 8.84M passages in nine
+segments with per-segment statistics (corpus with titles, so above the usual title-less
+baseline). Quality is adequate; query throughput (24/s single thread) needs the scoring loop
+rewritten before Phase 4's end-to-end numbers.

@@ -148,7 +148,9 @@ dependencies = [
  "cairn-core",
  "cairn-index",
  "clap",
+ "flate2",
  "hdrhistogram",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -202,14 +204,17 @@ dependencies = [
 name = "cairn-query"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "cairn-core",
  "cairn-index",
+ "cairn-raft",
  "cairn-runtime",
  "cairn-sim",
  "cairn-storage",
  "proptest",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -218,7 +223,10 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "cairn-core",
+ "cairn-runtime",
+ "cairn-sim",
  "cairn-storage",
+ "proptest",
  "thiserror",
  "tracing",
 ]

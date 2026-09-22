@@ -60,9 +60,31 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - M2.5 DONE 2026-09-22: SegmentIndexer hook in Store, DefaultIndexer, cairn-query (Query,
     fusion RRF/weighted, ShardEngine with per-segment indexes + lazily rebuilt memtable
     indexes), end-to-end tests vs reference incl. takedown visibility across memtable/segments.
-  - M2.6 IN PROGRESS: YFCC-10M sweep (download running), phase report.
+  - M2.6 DONE 2026-09-22: YFCC-10M (recall 0.9994, p99 16.5 ms, 258 QPS/thread) and MS MARCO
+    (MRR@10 0.204, corpus with titles) in bench-results/. Report: docs/reports/phase-2.md.
+- Phase 2: DONE 2026-09-22.
+- Phase 3: IN PROGRESS (built while Phase 2 benchmarks downloaded/ran).
+  - M3.2 DONE: cairn-raft pure state machine (pre-vote, replication, ReadIndex, snapshots as
+    opaque bytes, in-memory log suffix) + seeded chaos harness (3 and 5 nodes, crashes,
+    partitions, drops; every step checks election safety, log matching, leader completeness,
+    state-machine safety; convergence after healing). Bugs it caught: followers acked stale
+    entries beyond the leader's batch; harness completeness check must skip stale leaders.
+  - M3.3 DONE: cairn-query::replica actor (persist -> send -> apply -> advance; flush compacts to
+    the manifest snapshot; FetchFile/FileChunk segment shipping; consistency levels), wire
+    frames, cluster tests (replication, RYW/linearizable/stale, takedown, leader crash,
+    re-election, snapshot catch-up). Bugs: snapshot accepted before files fetched -> log reset
+    ordering; store replay must stop at the persisted commit index (uncommitted tail).
+  - M3.4 DONE (first version): tests/chaos.rs signature test: 3 clients, partitions, drops,
+    crashes/restarts, per-key model with real-time bounds, read-your-takedown rule, convergence,
+    determinism (same digest). 12 seeds in CI-speed test.
+  - M3.5 TODO: campaign runner (thousands of seeds), Phase 3 report.
 
 ## Next step
+M3.5 campaign (ignored long test + script, results committed), Phase 3 report, then Phase 4:
+cairn-proto framing over real TCP (blocking reactor first), cairn-server multi-shard node,
+cairn-client, 3-process cluster test, io_uring reactor spike, end-to-end benchmark.
+
+## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
 level from hash of doc id), exact scan, filter bitmaps, selectivity-adaptive dispatch, SQ8 +
 rerank; SIFT1M loader in a new `tools/cairn-bench` crate; selectivity x correlation sweep.

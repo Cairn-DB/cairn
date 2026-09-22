@@ -1,7 +1,7 @@
 //! MS MARCO passage ranking (dev small): BM25 MRR@10 of the Cairn text index, built as
 //! 1M-passage segments with per-segment statistics (ADR 0005), merged like the engine does.
 
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use cairn_core::HashMap;
 use cairn_index::text::{Bm25Params, TextIndex, TextQuery};
 use std::fmt::Write as _;
@@ -30,32 +30,73 @@ pub fn msmarco(
     out: &Path,
 ) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    // collection.tsv: pid \t passage (pids are 0..N-1 in order).
-    let f = std::fs::File::open(dir.join("collection.tsv")).context("collection.tsv")?;
+    // Corpus: `corpus.jsonl.gz` (Tevatron mirror: {"docid", "title", "text"} per line) or
+    // `collection.tsv` (pid \t passage).
     let mut texts: Vec<String> = Vec::new();
     let mut pids: Vec<u32> = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        let mut it = line.splitn(2, '\t');
-        let pid: u32 = it.next().unwrap_or("0").parse().context("pid")?;
-        pids.push(pid);
-        texts.push(it.next().unwrap_or("").to_owned());
-        if limit.is_some_and(|l| texts.len() >= l) {
-            break;
+    let jsonl = dir.join("corpus.jsonl.gz");
+    if jsonl.exists() {
+        let f = std::fs::File::open(&jsonl).context("corpus.jsonl.gz")?;
+        let reader = BufReader::new(flate2::read::GzDecoder::new(f));
+        for line in reader.lines() {
+            let line = line?;
+            let v: serde_json::Value = serde_json::from_str(&line).context("corpus json line")?;
+            let id = v
+                .get("docid")
+                .or_else(|| v.get("_id"))
+                .and_then(|x| x.as_str())
+                .context("docid")?;
+            pids.push(id.parse().context("numeric docid")?);
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            texts.push(if title.is_empty() {
+                text.to_owned()
+            } else {
+                format!("{title} {text}")
+            });
+            if limit.is_some_and(|l| texts.len() >= l) {
+                break;
+            }
+        }
+    } else {
+        let f = std::fs::File::open(dir.join("collection.tsv")).context("collection.tsv")?;
+        for line in BufReader::new(f).lines() {
+            let line = line?;
+            let mut it = line.splitn(2, '\t');
+            let pid: u32 = it.next().unwrap_or("0").parse().context("pid")?;
+            pids.push(pid);
+            texts.push(it.next().unwrap_or("").to_owned());
+            if limit.is_some_and(|l| texts.len() >= l) {
+                break;
+            }
         }
     }
     let n = texts.len();
     eprintln!("read {n} passages in {:.1?}", t0.elapsed());
-    let queries = read_tsv2(&dir.join("queries.dev.small.tsv"))?;
+    let qpath = ["queries.dev.small.tsv", "queries.dev.tsv"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+        .context("no dev queries file")?;
+    let queries = read_tsv2(&qpath)?;
     let mut qrels: HashMap<String, Vec<u32>> = HashMap::default();
-    for line in BufReader::new(std::fs::File::open(dir.join("qrels.dev.small.tsv"))?).lines() {
+    let qrels_path = ["qrels.dev.small.tsv", "qrels.dev.tsv"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+        .context("no dev qrels file")?;
+    for line in BufReader::new(std::fs::File::open(&qrels_path)?).lines() {
         let line = line?;
         let cols: Vec<&str> = line.split_whitespace().collect();
-        ensure!(cols.len() >= 4, "qrels line");
+        if cols.len() < 3 || cols[0] == "query-id" {
+            continue;
+        }
+        // TREC format: qid 0 pid rel; BeIR format: qid pid score.
+        let pid = if cols.len() >= 4 { cols[2] } else { cols[1] };
         qrels
             .entry(cols[0].to_owned())
             .or_default()
-            .push(cols[2].parse()?);
+            .push(pid.parse()?);
     }
     // Build segments in parallel.
     let t = Instant::now();
