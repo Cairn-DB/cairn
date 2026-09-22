@@ -279,11 +279,16 @@ fn sift_sweep(
                 "{correlation:?} {name}: {passing} rows, ground truth in {:.1?}",
                 t.elapsed()
             );
-            for (label, force) in [
-                ("adaptive", None),
-                ("scan", Some(Strategy::Scan)),
-                ("hnsw", Some(Strategy::Hnsw)),
-                ("hnsw+2hop", Some(Strategy::HnswTwoHop)),
+            for (label, force, max_visits) in [
+                ("adaptive", None, 8192u32),
+                ("scan", Some(Strategy::Scan), u32::MAX),
+                ("hnsw (capped 8192 visits)", Some(Strategy::Hnsw), 8192),
+                (
+                    "hnsw+2hop (capped 8192 visits)",
+                    Some(Strategy::HnswTwoHop),
+                    8192,
+                ),
+                ("hnsw (unlimited)", Some(Strategy::Hnsw), u32::MAX),
             ] {
                 let mut lat = Lat::new();
                 let mut rec = 0.0;
@@ -297,6 +302,7 @@ fn sift_sweep(
                             VectorQuery {
                                 ef: 128,
                                 force,
+                                max_visits,
                                 ..VectorQuery::new(k)
                             },
                         )

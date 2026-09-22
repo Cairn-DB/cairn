@@ -58,6 +58,10 @@ pub struct VectorQuery {
     pub force: Option<Strategy>,
     /// Candidates re-scored exactly after SQ8 scoring.
     pub rerank: usize,
+    /// Use f32 everywhere (no SQ8 candidate scoring); the reference for recall measurements.
+    pub exact: bool,
+    /// Upper bound on distance computations for graph paths (`u32::MAX` = unlimited).
+    pub max_visits: u32,
 }
 
 impl VectorQuery {
@@ -68,6 +72,8 @@ impl VectorQuery {
             ef: (4 * k as u32).max(64),
             force: None,
             rerank: 4 * k,
+            exact: false,
+            max_visits: u32::MAX,
         }
     }
 }
@@ -242,13 +248,14 @@ impl VectorIndex {
         let count = eff.map_or(self.vectors.len(), Bitmap::count);
         let strategy = q.force.unwrap_or_else(|| self.choose(count));
         let res = match strategy {
-            Strategy::Scan => exact_scan(&self.vectors, &qv, q.k, eff, false, q.rerank),
+            Strategy::Scan => exact_scan(&self.vectors, &qv, q.k, eff, q.exact, q.rerank),
             Strategy::Hnsw | Strategy::HnswTwoHop => {
                 let h = self.hnsw.as_ref().expect("strategy needs a graph");
                 let opts = SearchOptions {
                     ef: q.ef.max(q.rerank as u32),
                     two_hop: strategy == Strategy::HnswTwoHop,
-                    max_visits: u32::MAX,
+                    max_visits: q.max_visits,
+                    exact: q.exact,
                 };
                 let mut scratch = self.scratch.borrow_mut();
                 let cands = h.search(
@@ -259,7 +266,7 @@ impl VectorIndex {
                     opts,
                     &mut scratch,
                 );
-                if self.vectors.has_sq8() {
+                if self.vectors.has_sq8() && !q.exact {
                     let rows: Vec<u32> = cands.iter().map(|c| c.1).collect();
                     let mut d = vec![0f32; rows.len()];
                     let (mut g8, mut g32) = (Vec::new(), Vec::new());

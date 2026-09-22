@@ -46,6 +46,8 @@ pub struct SearchOptions {
     pub two_hop: bool,
     /// Upper bound on distance computations (safety valve for hostile filters).
     pub max_visits: u32,
+    /// Score with f32 instead of SQ8.
+    pub exact: bool,
 }
 
 impl Default for SearchOptions {
@@ -54,6 +56,7 @@ impl Default for SearchOptions {
             ef: 64,
             two_hop: false,
             max_visits: u32::MAX,
+            exact: false,
         }
     }
 }
@@ -384,7 +387,7 @@ impl Hnsw {
             &accept_all
         };
         let mut dbuf = Vec::new();
-        Self::dists(vectors, q, &[self.entry], false, scratch, &mut dbuf);
+        Self::dists(vectors, q, &[self.entry], opts.exact, scratch, &mut dbuf);
         let mut ep = vec![Cand {
             dist: dbuf[0],
             row: self.entry,
@@ -399,7 +402,7 @@ impl Hnsw {
                 &accept_all,
                 false,
                 u32::MAX,
-                false,
+                opts.exact,
                 scratch,
             );
             if let Some(&c) = r.first() {
@@ -416,7 +419,7 @@ impl Hnsw {
             accept,
             opts.two_hop,
             opts.max_visits,
-            false,
+            opts.exact,
             scratch,
         );
         r.into_iter().take(k).map(|c| (c.dist, c.row)).collect()

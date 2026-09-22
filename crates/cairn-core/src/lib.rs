@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod doc;
 pub mod error;
+pub mod filter;
 pub mod hash;
 pub mod ids;
 pub mod rng;
@@ -17,6 +18,7 @@ pub mod time;
 
 pub use doc::{Document, Value};
 pub use error::{Error, Result};
+pub use filter::Predicate;
 pub use hash::{HashMap, HashSet};
 pub use ids::{DocId, LogIndex, NodeId, SegmentId, ShardId, Term};
 pub use rng::SeededRng;

@@ -46,7 +46,15 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     cluster-correlated; realistic attrs; takedown schedule).
 - Phase 1: DONE 2026-09-22. Report: `docs/reports/phase-1.md`.
 - Phase 2: IN PROGRESS.
-  - M2.1 IN PROGRESS: kernels (scalar/AVX2/AVX-512, SQ8), proptest vs scalar, criterion bench.
+  - M2.1 DONE 2026-09-22: kernels (scalar/AVX2/AVX-512, f32 + SQ8), proptests vs scalar on all
+    levels, `bench-results/phase2-kernels.md`. MSRV 1.89.
+  - M2.2 DONE 2026-09-22 (code): bitmap, deterministic incremental HNSW, exact scan, VectorIndex
+    (adaptive scan/graph/two-hop, SQ8 + rerank, exact mode, visit cap), segment sections, tests
+    vs brute force. 100k smoke sweep: scan wins below ~10%; uncapped filtered graph search is
+    catastrophic at 0.1% (22 ms); 1M sweep pending -> `bench-results/phase2-sift1m.md`.
+  - M2.3 DONE 2026-09-22: Predicate AST (cairn-core::filter), StructuredIndex (term lists,
+    ordered keys, IsNull via nulls), proptest vs document semantics, segment round-trip.
+  - M2.4 IN PROGRESS: BM25.
 
 ## Next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
