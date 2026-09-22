@@ -880,6 +880,13 @@ impl Raft {
         if n > self.commit && self.term_at(n) == Some(self.term) {
             self.commit = n;
             self.hs_dirty = true;
+            // Tell followers right away instead of at the next heartbeat: this is what bounds
+            // takedown visibility on replicas (ADR 0010).
+            for &p in &self.cfg.peers.clone() {
+                if p != self.cfg.id {
+                    self.send_append(p);
+                }
+            }
         }
     }
 
