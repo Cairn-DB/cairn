@@ -29,9 +29,17 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     blocking OS disk; RealRuntime), cairn-sim (Simulation, SimReactor, SimDisk with unsynced-loss
     and torn writes, SimNetwork with delay/drop/partition, Trace digest). 20 tests. The SPSC
     queue + loom item is deferred to M4.2 (no cross-core traffic before real networking).
-  - M1.2 IN PROGRESS: log + codec + manifest + crash-recovery tests.
+  - M1.2 DONE 2026-09-22: cairn-storage log (segmented files, crc32 records, recovery truncates
+    at first bad record, suffix/prefix truncation), codec, manifest store (tmp+sync+rename).
+    Tests: 150-seed sim crash/recovery with torn writes, 400-case damaged-image proptest,
+    manifest crash-at-any-point, real-fs roundtrip. 29 tests total.
+  - M1.3 IN PROGRESS: schema/document/command types, segment container, columns, memtable,
+    deletion sets, shard store with recovery.
 
 ## Next step
+M1.3 (see State). Then M1.4 compaction, M1.5 runtime spike + storage benchmarks, M1.6 bench-gen.
+
+## Previous step (kept for context)
 M1.2: `cairn-storage::log` (segmented files named by first index, header with magic/version,
 records `[len][crc32][term][index][payload]`, recovery truncates at the first bad record,
 suffix truncation for Raft, prefix truncation by whole files), `codec` (bounds-checked
@@ -48,6 +56,8 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
 (none yet)
 
 ## Log
+- 2026-09-22: M1.2 done. Lesson: edition 2024 reserves `gen`; `truncate_suffix` below the
+  first file's start must empty the file.
 - 2026-09-22: M1.1 done (executor, blocking runtime, simulator core). Lesson: with a seeded
   scheduler, two tasks' issue order is not their spawn order; per-file ordering is per task.
 - 2026-09-22: Phase 0 delivered; mandate changed to autonomous delivery; ADR 0012 written;

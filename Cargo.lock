@@ -249,6 +249,8 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "cairn-core",
+ "cairn-runtime",
+ "cairn-sim",
  "crc32fast",
  "criterion",
  "loom",

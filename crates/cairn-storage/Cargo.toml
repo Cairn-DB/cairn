@@ -20,6 +20,8 @@ memmap2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+cairn-runtime = { path = "../cairn-runtime" }
+cairn-sim = { path = "../cairn-sim" }
 proptest.workspace = true
 criterion.workspace = true
 loom.workspace = true

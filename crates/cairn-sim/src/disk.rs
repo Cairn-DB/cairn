@@ -223,7 +223,8 @@ impl DiskState {
         }
     }
 
-    fn list(&self, dir: &str) -> Result<Vec<String>> {
+    /// Names of the entries directly under `dir`, sorted.
+    pub fn list(&self, dir: &str) -> Result<Vec<String>> {
         if !self.dir_exists(dir) {
             return Err(Error::io(
                 IoErrorKind::NotFound,
@@ -254,6 +255,29 @@ impl DiskState {
             .get(path)
             .and_then(|id| self.inodes.get(id))
             .map(|i| i.durable.as_slice())
+    }
+
+    /// Replaces `path` with durable `bytes`, creating parent directories (test fixtures).
+    pub fn set_durable_file(&mut self, path: &str, bytes: &[u8]) {
+        let parent = parent_of(path).to_owned();
+        self.create_dir_all(&parent);
+        let id = match self.paths.get(path) {
+            Some(id) => *id,
+            None => {
+                let id = self.next_inode;
+                self.next_inode += 1;
+                self.paths.insert(path.to_owned(), id);
+                id
+            }
+        };
+        self.inodes.insert(
+            id,
+            Inode {
+                content: bytes.to_vec(),
+                durable: bytes.to_vec(),
+                pending: Vec::new(),
+            },
+        );
     }
 
     /// Current (possibly unsynced) bytes of `path`.
@@ -288,6 +312,11 @@ impl SimDisk {
     pub fn inspect<T>(&self, f: impl FnOnce(&DiskState) -> T) -> T {
         let mut disks = self.sim.inner.disks.borrow_mut();
         f(disks.entry(self.node).or_default())
+    }
+
+    /// Runs `f` with mutable access to the disk state (test fixtures).
+    pub fn modify<T>(&self, f: impl FnOnce(&mut DiskState) -> T) -> T {
+        self.with_state(f)
     }
 
     /// `(writes, syncs, reads)` completed so far.
