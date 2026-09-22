@@ -8,6 +8,7 @@
 
 mod datasets;
 mod kmeans;
+mod msmarco;
 mod yfcc;
 
 use anyhow::Context;
@@ -55,6 +56,27 @@ enum Cmd {
         /// Number of k-means clusters for the correlated attributes.
         #[arg(long, default_value_t = 1000)]
         clusters: usize,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// BM25 MRR@10 on MS MARCO passage dev (small).
+    Msmarco {
+        /// Directory holding collection.tsv, queries.dev.small.tsv, qrels.dev.small.tsv.
+        #[arg(long, default_value = "data/msmarco")]
+        dir: PathBuf,
+        /// Passages to index (prefix); default all.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Rows per segment.
+        #[arg(long, default_value_t = 1_000_000)]
+        segment_rows: usize,
+        /// BM25 k1.
+        #[arg(long, default_value_t = 0.9)]
+        k1: f32,
+        /// BM25 b.
+        #[arg(long, default_value_t = 0.4)]
+        b: f32,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -386,6 +408,14 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Result<Vec<_>, _>>()?;
             sift_sweep(dir, n, queries, k, m, ef_construction, efs, clusters, out)
         }
+        Cmd::Msmarco {
+            dir,
+            limit,
+            segment_rows,
+            k1,
+            b,
+            out,
+        } => msmarco::msmarco(&dir, limit, segment_rows, k1, b, &out),
         Cmd::YfccSweep {
             dir,
             n,

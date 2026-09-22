@@ -72,36 +72,78 @@ pub struct TextQuery {
 impl TextIndex {
     /// Builds the index for `field` over `docs` (row = position).
     pub fn build(field: usize, docs: &[&Document]) -> Self {
-        let rows = docs.len() as u32;
-        let mut lengths = vec![0u32; docs.len()];
-        // (term, row, tf)
-        let mut triples: Vec<(String, u32, u32)> = Vec::new();
-        for (row, d) in docs.iter().enumerate() {
-            if let Some(Value::Text(t)) = &d.values[field] {
-                let mut toks = tokenize(t);
-                lengths[row] = toks.len() as u32;
-                toks.sort();
-                let mut i = 0;
-                while i < toks.len() {
-                    let mut j = i;
-                    while j < toks.len() && toks[j] == toks[i] {
-                        j += 1;
+        Self::build_from_texts(
+            field,
+            docs.iter().map(|d| match &d.values[field] {
+                Some(Value::Text(t)) => Some(t.as_str()),
+                _ => None,
+            }),
+        )
+    }
+
+    /// Builds from one optional text per row. Terms are interned to ids while tokenizing so the
+    /// intermediate state is three `u32`s per (row, term) pair, not a `String`.
+    pub fn build_from_texts<'a>(
+        field: usize,
+        texts: impl Iterator<Item = Option<&'a str>>,
+    ) -> Self {
+        let mut intern: cairn_core::HashMap<String, u32> = cairn_core::HashMap::default();
+        let mut names: Vec<String> = Vec::new();
+        let mut lengths: Vec<u32> = Vec::new();
+        // (term id, row, tf)
+        let mut triples: Vec<(u32, u32, u32)> = Vec::new();
+        let mut toks: Vec<u32> = Vec::new();
+        for (row, text) in texts.enumerate() {
+            let Some(text) = text else {
+                lengths.push(0);
+                continue;
+            };
+            toks.clear();
+            for t in tokenize(text) {
+                let id = match intern.get(&t) {
+                    Some(&id) => id,
+                    None => {
+                        let id = names.len() as u32;
+                        names.push(t.clone());
+                        intern.insert(t, id);
+                        id
                     }
-                    triples.push((std::mem::take(&mut toks[i]), row as u32, (j - i) as u32));
-                    i = j;
+                };
+                toks.push(id);
+            }
+            lengths.push(toks.len() as u32);
+            toks.sort_unstable();
+            let mut i = 0;
+            while i < toks.len() {
+                let mut j = i;
+                while j < toks.len() && toks[j] == toks[i] {
+                    j += 1;
                 }
+                triples.push((toks[i], row as u32, (j - i) as u32));
+                i = j;
             }
         }
-        triples.sort();
-        let mut terms = Vec::new();
-        let mut postings: Vec<Vec<(u32, u32)>> = Vec::new();
+        drop(intern);
+        // Sort terms lexicographically and remap ids to sorted positions.
+        let mut order: Vec<u32> = (0..names.len() as u32).collect();
+        order.sort_by(|a, b| names[*a as usize].cmp(&names[*b as usize]));
+        let mut rank = vec![0u32; names.len()];
+        for (r, &id) in order.iter().enumerate() {
+            rank[id as usize] = r as u32;
+        }
+        for t in &mut triples {
+            t.0 = rank[t.0 as usize];
+        }
+        triples.sort_unstable();
+        let terms: Vec<String> = order
+            .iter()
+            .map(|&id| std::mem::take(&mut names[id as usize]))
+            .collect();
+        let mut postings: Vec<Vec<(u32, u32)>> = vec![Vec::new(); terms.len()];
         for (t, row, tf) in triples {
-            if terms.last() != Some(&t) {
-                terms.push(t);
-                postings.push(Vec::new());
-            }
-            postings.last_mut().expect("pushed").push((row, tf));
+            postings[t as usize].push((row, tf));
         }
+        let rows = lengths.len() as u32;
         let total: u64 = lengths.iter().map(|&l| u64::from(l)).sum();
         let non_empty = lengths.iter().filter(|&&l| l > 0).count().max(1);
         TextIndex {
