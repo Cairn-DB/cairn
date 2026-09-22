@@ -373,6 +373,13 @@ impl<N: cairn_core::Network + Clone + 'static> Runtime for PoolRuntime<N> {
         self.handle.yield_now()
     }
 
+    fn offload<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        offload(&self.disk.completer, work)
+    }
+
     fn disk(&self) -> &Self::Disk {
         &self.disk
     }

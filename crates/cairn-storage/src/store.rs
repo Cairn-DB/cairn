@@ -125,6 +125,28 @@ impl SegmentIndexer for NoIndexer {
     }
 }
 
+/// A flush in progress: the frozen documents to turn into a segment.
+pub struct FlushJob {
+    /// Live documents of the frozen memtable, sorted by id.
+    pub docs: Vec<Document>,
+    /// Last log index folded into the segment.
+    pub last: LogIndex,
+    /// Id of the segment to create.
+    pub id: SegmentId,
+}
+
+/// A compaction in progress.
+pub struct CompactJob {
+    /// Segments being merged (adjacent, in order).
+    pub inputs: Vec<SegmentId>,
+    /// Their live rows, sorted by id.
+    pub docs: Vec<Document>,
+    /// Max log index of the inputs.
+    pub log_last: LogIndex,
+    /// Id of the merged segment.
+    pub id: SegmentId,
+}
+
 /// Read-only view of one open segment for the query layer.
 pub struct SegmentView<'a, R: Runtime> {
     /// Manifest entry.
@@ -157,14 +179,17 @@ pub struct Store<R: Runtime> {
     memtable: Memtable,
     applied: LogIndex,
     indexer: Box<dyn SegmentIndexer>,
+    /// Memtable frozen for a flush in progress (still readable).
+    frozen: Option<Memtable>,
+    /// Ids deleted or replaced while a flush or compaction job was building; masked in the
+    /// new segment at finish time.
+    masked_during_build: cairn_core::HashSet<DocId>,
+    /// Whether a flush or compaction job is in progress.
+    job_active: bool,
     /// Bumped whenever the memtable changes.
     memtable_version: u64,
     /// Bumped whenever the segment list changes.
     segments_version: u64,
-}
-
-fn refs_len(docs: &[Document]) -> u32 {
-    docs.len() as u32
 }
 
 fn seg_path(dir: &str, id: SegmentId) -> String {
@@ -281,6 +306,9 @@ impl<R: Runtime> Store<R> {
             memtable: Memtable::new(),
             applied: LogIndex(0),
             indexer: Box::new(NoIndexer),
+            frozen: None,
+            masked_during_build: cairn_core::HashSet::default(),
+            job_active: false,
             memtable_version: 0,
             segments_version: 0,
         };
@@ -413,6 +441,12 @@ impl<R: Runtime> Store<R> {
     }
 
     fn mask_in_segments(&mut self, id: DocId) {
+        if self.job_active {
+            self.masked_during_build.insert(id);
+        }
+        if let Some(f) = &mut self.frozen {
+            f.delete(id, self.applied);
+        }
         for s in &mut self.segments {
             if let Some(row) = s.docs.row_of(id)
                 && s.deletions.set(row)
@@ -446,6 +480,13 @@ impl<R: Runtime> Store<R> {
             Some(None) => return Ok(None),
             None => {}
         }
+        if let Some(f) = &self.frozen {
+            match f.get(id) {
+                Some(Some(d)) => return Ok(Some(d.clone())),
+                Some(None) => return Ok(None),
+                None => {}
+            }
+        }
         for s in self.segments.iter().rev() {
             if let Some(row) = s.docs.row_of(id) {
                 if s.deletions.contains(row) {
@@ -469,96 +510,173 @@ impl<R: Runtime> Store<R> {
         Ok(())
     }
 
-    /// Turns the memtable into a segment and publishes it. No-op when nothing is pending.
-    pub async fn flush(&mut self) -> Result<()> {
-        let Some((_, last)) = self.memtable.log_range() else {
-            return Ok(());
-        };
+    /// Documents visible in memory for queries: the active memtable plus the frozen one.
+    pub fn memtable_docs(&self) -> Vec<Document> {
+        let mut v: Vec<Document> = self.memtable.docs().cloned().collect();
+        if let Some(f) = &self.frozen {
+            v.extend(
+                f.docs()
+                    .filter(|d| self.memtable.get(d.id).is_none())
+                    .cloned(),
+            );
+        }
+        v
+    }
+
+    /// Whether a flush or compaction job is in progress.
+    pub fn job_active(&self) -> bool {
+        self.job_active
+    }
+
+    /// Freezes the memtable and returns the build job, or `None` if nothing is pending or a job
+    /// is already active. The frozen documents stay readable until [`Store::finish_flush`].
+    pub fn begin_flush(&mut self) -> Option<FlushJob> {
+        if self.job_active {
+            return None;
+        }
+        let (_, last) = self.memtable.log_range()?;
+        let frozen = std::mem::take(&mut self.memtable);
+        let docs: Vec<Document> = frozen.sorted_docs().into_iter().cloned().collect();
+        self.frozen = Some(frozen);
+        self.job_active = true;
+        self.masked_during_build.clear();
+        self.memtable_version += 1;
+        Some(FlushJob {
+            docs,
+            last,
+            id: SegmentId(self.manifest.next_segment_id),
+        })
+    }
+
+    /// Builds the index sections for `docs` (pure CPU; run through `Runtime::offload`).
+    pub fn build_sections(
+        schema: &Schema,
+        docs: &[Document],
+        indexer: &dyn SegmentIndexer,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let refs: Vec<&Document> = docs.iter().collect();
+        indexer.sections(schema, &refs)
+    }
+
+    /// Writes and publishes the segment of a flush job.
+    pub async fn finish_flush(
+        &mut self,
+        job: FlushJob,
+        docs: Vec<Document>,
+        sections: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
         self.persist_dirty_deletions().await?;
-        let docs = self.memtable.sorted_docs();
         let mut new_manifest = self.manifest.clone();
         let mut new_segment = None;
         if !docs.is_empty() {
-            let id = SegmentId(self.manifest.next_segment_id);
-            let path = seg_path(&self.dir, id);
+            let refs: Vec<&Document> = docs.iter().collect();
+            let path = seg_path(&self.dir, job.id);
             let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
-            write_columns(&mut w, &self.manifest.schema, &docs).await?;
-            for (name, bytes) in self.indexer.sections(&self.manifest.schema, &docs)? {
-                w.add_section(&name, &bytes).await?;
+            write_columns(&mut w, &self.manifest.schema, &refs).await?;
+            for (name, bytes) in &sections {
+                w.add_section(name, bytes).await?;
             }
             let (file_len, file_hash) = w.finish().await?;
             let meta = SegmentMeta {
-                id,
-                doc_count: docs.len() as u32,
-                log_last: last,
+                id: job.id,
+                doc_count: refs.len() as u32,
+                log_last: job.last,
                 file_len,
                 file_hash,
             };
             let reader = SegmentReader::open(self.rt.clone(), &path).await?;
             let docstore = DocStore::open(&reader).await?;
+            let mut deletions = DeletionSet::new(meta.doc_count);
+            // Documents deleted or replaced while the job was building are masked in the new segment.
+            let mut dirty = false;
+            for id in &self.masked_during_build {
+                if let Some(row) = docstore.row_of(*id) {
+                    deletions.set(row);
+                    dirty = true;
+                }
+            }
+            if dirty {
+                ManifestStore::new(self.rt.clone(), del_path(&self.dir, job.id))
+                    .store(&deletions)
+                    .await?;
+            }
             new_manifest.segments.push(meta.clone());
-            new_manifest.next_segment_id += 1;
+            new_manifest.next_segment_id = job.id.get() + 1;
             new_segment = Some(OpenSegment {
-                meta: meta.clone(),
+                meta,
                 reader,
                 docs: docstore,
-                deletions: DeletionSet::new(meta.doc_count),
+                deletions,
                 deletions_dirty: false,
             });
         }
-        new_manifest.applied_index = last;
+        new_manifest.applied_index = job.last.max(new_manifest.applied_index);
         self.manifest_store.store(&new_manifest).await?;
         self.manifest = new_manifest;
-        if let Some(s) = new_segment {
-            self.segments.push(s);
+        if let Some(seg) = new_segment {
+            self.segments.push(seg);
         }
-        self.memtable.clear();
+        self.frozen = None;
+        self.job_active = false;
+        self.masked_during_build.clear();
         self.memtable_version += 1;
         self.segments_version += 1;
-        self.log.truncate_prefix(last.next()).await?;
-        self.maybe_compact().await
+        self.log.truncate_prefix(job.last.next()).await?;
+        Ok(())
     }
 
-    /// Applies the compaction policy until it is satisfied.
-    pub async fn maybe_compact(&mut self) -> Result<()> {
-        loop {
-            let n = self.segments.len();
-            // 1. A segment with too many deleted rows is rewritten alone.
-            let stale = self.segments.iter().position(|s| {
-                s.meta.doc_count > 0
-                    && f64::from(s.deletions.count()) / f64::from(s.meta.doc_count)
-                        > self.cfg.max_deleted_fraction
-            });
-            if let Some(i) = stale {
-                let id = self.segments[i].meta.id;
-                self.compact(&[id]).await?;
-                continue;
-            }
-            // 2. Too many segments: merge the adjacent pair with the fewest live rows.
-            if n > self.cfg.max_segments {
-                let live = |s: &OpenSegment<R>| s.meta.doc_count - s.deletions.count();
-                let (i, _) = (0..n - 1)
-                    .map(|i| {
-                        (
-                            i,
-                            live(&self.segments[i]) as u64 + live(&self.segments[i + 1]) as u64,
-                        )
-                    })
-                    .min_by_key(|(_, rows)| *rows)
-                    .expect("n > 1");
-                let ids = [self.segments[i].meta.id, self.segments[i + 1].meta.id];
-                self.compact(&ids).await?;
-                continue;
-            }
-            return Ok(());
+    /// Synchronous convenience: flush and compact inline with the installed indexer.
+    pub async fn flush(&mut self) -> Result<()> {
+        if let Some(job) = self.begin_flush() {
+            let docs = job.docs.clone();
+            let sections =
+                Self::build_sections(&self.manifest.schema, &docs, self.indexer.as_ref())?;
+            self.finish_flush(job, docs, sections).await?;
         }
+        while let Some(job) = self.begin_compact().await? {
+            let sections =
+                Self::build_sections(&self.manifest.schema, &job.docs, self.indexer.as_ref())?;
+            self.finish_compact(job, sections).await?;
+        }
+        Ok(())
     }
 
-    /// Merges the given segments (which must be adjacent in manifest order) into one new segment
-    /// without their deleted rows, publishes it, and removes the inputs.
-    pub async fn compact(&mut self, ids: &[SegmentId]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
+    /// Picks the next compaction per policy and reads its inputs. `None` when nothing to do or a
+    /// job is active.
+    pub async fn begin_compact(&mut self) -> Result<Option<CompactJob>> {
+        if self.job_active {
+            return Ok(None);
+        }
+        let n = self.segments.len();
+        let stale = self.segments.iter().position(|s| {
+            s.meta.doc_count > 0
+                && f64::from(s.deletions.count()) / f64::from(s.meta.doc_count)
+                    > self.cfg.max_deleted_fraction
+        });
+        let ids: Vec<SegmentId> = if let Some(i) = stale {
+            vec![self.segments[i].meta.id]
+        } else if n > self.cfg.max_segments {
+            let live = |s: &OpenSegment<R>| s.meta.doc_count - s.deletions.count();
+            let (i, _) = (0..n - 1)
+                .map(|i| {
+                    (
+                        i,
+                        live(&self.segments[i]) as u64 + live(&self.segments[i + 1]) as u64,
+                    )
+                })
+                .min_by_key(|(_, rows)| *rows)
+                .expect("n > 1");
+            vec![self.segments[i].meta.id, self.segments[i + 1].meta.id]
+        } else {
+            return Ok(None);
+        };
+        self.begin_compact_ids(&ids).await.map(Some)
+    }
+
+    /// Reads the live rows of the given adjacent segments into a compaction job.
+    pub async fn begin_compact_ids(&mut self, ids: &[SegmentId]) -> Result<CompactJob> {
+        if self.job_active {
+            return Err(Error::Internal("a build job is already active".into()));
         }
         let first = self
             .segments
@@ -572,39 +690,69 @@ impl<R: Runtime> Store<R> {
                 ));
             }
         }
-        let range = first..first + ids.len();
         let mut docs: Vec<Document> = Vec::new();
         let mut log_last = LogIndex(0);
-        for s in &self.segments[range.clone()] {
+        for s in &self.segments[first..first + ids.len()] {
             let dels = &s.deletions;
             docs.extend(s.docs.read_all(&s.reader, |row| dels.contains(row)).await?);
             log_last = log_last.max(s.meta.log_last);
         }
-        // Live ids are unique across segments (an upsert masks older rows), so a sort suffices.
         docs.sort_by_key(|d| d.id);
-        debug_assert!(docs.windows(2).all(|p| p[0].id < p[1].id));
-        let refs: Vec<&Document> = docs.iter().collect();
-        let id = SegmentId(self.manifest.next_segment_id);
-        let path = seg_path(&self.dir, id);
+        self.job_active = true;
+        self.masked_during_build.clear();
+        Ok(CompactJob {
+            inputs: ids.to_vec(),
+            docs,
+            log_last,
+            id: SegmentId(self.manifest.next_segment_id),
+        })
+    }
+
+    /// Publishes the merged segment and removes the inputs.
+    pub async fn finish_compact(
+        &mut self,
+        job: CompactJob,
+        sections: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        let first = self
+            .segments
+            .iter()
+            .position(|s| s.meta.id == job.inputs[0])
+            .ok_or_else(|| Error::Internal("compaction inputs vanished".into()))?;
+        let range = first..first + job.inputs.len();
+        let refs: Vec<&Document> = job.docs.iter().collect();
+        let path = seg_path(&self.dir, job.id);
         let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
         write_columns(&mut w, &self.manifest.schema, &refs).await?;
-        for (name, bytes) in self.indexer.sections(&self.manifest.schema, &refs)? {
-            w.add_section(&name, &bytes).await?;
+        for (name, bytes) in &sections {
+            w.add_section(name, bytes).await?;
         }
         let (file_len, file_hash) = w.finish().await?;
         let meta = SegmentMeta {
-            id,
+            id: job.id,
             doc_count: refs.len() as u32,
-            log_last,
+            log_last: job.log_last,
             file_len,
             file_hash,
         };
         let reader = SegmentReader::open(self.rt.clone(), &path).await?;
         let docstore = DocStore::open(&reader).await?;
-        drop(refs);
+        let mut deletions = DeletionSet::new(meta.doc_count);
+        let mut dirty = false;
+        for id in &self.masked_during_build {
+            if let Some(row) = docstore.row_of(*id) {
+                deletions.set(row);
+                dirty = true;
+            }
+        }
+        if dirty {
+            ManifestStore::new(self.rt.clone(), del_path(&self.dir, job.id))
+                .store(&deletions)
+                .await?;
+        }
         let mut new_manifest = self.manifest.clone();
         new_manifest.segments.splice(range.clone(), [meta.clone()]);
-        new_manifest.next_segment_id += 1;
+        new_manifest.next_segment_id = job.id.get() + 1;
         self.manifest_store.store(&new_manifest).await?;
         self.manifest = new_manifest;
         self.segments_version += 1;
@@ -616,11 +764,13 @@ impl<R: Runtime> Store<R> {
                     meta,
                     reader,
                     docs: docstore,
-                    deletions: DeletionSet::new(refs_len(&docs)),
+                    deletions,
                     deletions_dirty: false,
                 }],
             )
             .collect();
+        self.job_active = false;
+        self.masked_during_build.clear();
         for s in removed {
             let disk = self.rt.disk();
             let _ = disk.remove(&seg_path(&self.dir, s.meta.id)).await;
@@ -629,6 +779,17 @@ impl<R: Runtime> Store<R> {
             }
         }
         Ok(())
+    }
+
+    /// Synchronous convenience: compacts the given segments inline.
+    pub async fn compact(&mut self, ids: &[SegmentId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let job = self.begin_compact_ids(ids).await?;
+        let sections =
+            Self::build_sections(&self.manifest.schema, &job.docs, self.indexer.as_ref())?;
+        self.finish_compact(job, sections).await
     }
 
     /// The current manifest (a snapshot of everything up to `applied_index` of the manifest).
@@ -665,7 +826,8 @@ impl<R: Runtime> Store<R> {
 
     /// Replaces the whole shard state with a snapshot: `files` are `(relative path, bytes)`
     /// listed by [`Store::snapshot_files`] (missing deletion files are skipped), `manifest`
-    /// the encoded manifest. The log is reset to start after the manifest's applied index.
+    /// the encoded manifest. The log is reset to start after the manifest's applied index
+    /// unless it already does.
     pub async fn install_snapshot(
         &mut self,
         manifest: &[u8],
@@ -687,7 +849,6 @@ impl<R: Runtime> Store<R> {
             disk.rename(&tmp, &path).await?;
         }
         self.manifest_store.store(&m).await?;
-        // Reopen segments from the new manifest.
         self.segments.clear();
         for meta in &m.segments {
             let reader =
@@ -708,6 +869,9 @@ impl<R: Runtime> Store<R> {
         }
         self.manifest = m;
         self.memtable.clear();
+        self.frozen = None;
+        self.job_active = false;
+        self.masked_during_build.clear();
         self.applied = self.manifest.applied_index;
         if self.log.first_index() != self.applied.next()
             || self.log.last_index().is_some_and(|l| l <= self.applied)
@@ -716,7 +880,6 @@ impl<R: Runtime> Store<R> {
         }
         self.memtable_version += 1;
         self.segments_version += 1;
-        // Drop orphan files not referenced by the new manifest.
         let referenced: Vec<String> = self
             .manifest
             .segments
@@ -743,7 +906,12 @@ impl<R: Runtime> Store<R> {
             .iter()
             .map(|s| (s.meta.doc_count - s.deletions.count()) as u64)
             .sum();
-        seg + self.memtable.len() as u64
+        let frozen = self.frozen.as_ref().map_or(0, |f| {
+            f.docs()
+                .filter(|d| self.memtable.get(d.id).is_none())
+                .count() as u64
+        });
+        seg + self.memtable.len() as u64 + frozen
     }
 
     /// Runtime handle.

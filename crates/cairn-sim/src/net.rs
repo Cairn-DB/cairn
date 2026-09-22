@@ -33,6 +33,8 @@ pub(crate) struct NetState {
     waiters: HashMap<NodeId, Vec<std::task::Waker>>,
     /// Directed pairs `(from, to)` that cannot communicate.
     blocked: HashSet<(NodeId, NodeId)>,
+    /// Nodes that are down: deliveries to them are dropped (a real socket would refuse).
+    pub(crate) down: HashSet<NodeId>,
     sent: u64,
     delivered: u64,
     dropped: u64,
@@ -106,7 +108,7 @@ impl Network for SimNetwork {
         {
             let mut n = self.sim.inner.net.borrow_mut();
             n.sent += 1;
-            if n.blocked.contains(&(from, to)) {
+            if n.blocked.contains(&(from, to)) || n.down.contains(&to) {
                 n.dropped += 1;
                 drop(n);
                 self.sim.trace(
@@ -137,7 +139,10 @@ impl Network for SimNetwork {
             at,
             Box::new(move || {
                 // A partition raised after sending still drops the message in flight.
-                let blocked = sim.inner.net.borrow().blocked.contains(&(from, to));
+                let blocked = {
+                    let n = sim.inner.net.borrow();
+                    n.blocked.contains(&(from, to)) || n.down.contains(&to)
+                };
                 if blocked {
                     sim.inner.net.borrow_mut().dropped += 1;
                     sim.trace("net.drop", &format!("{from}->{to} in-flight"));

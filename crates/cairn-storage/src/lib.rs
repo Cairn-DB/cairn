@@ -21,5 +21,6 @@ pub use manifest::{Manifest, ManifestStore};
 pub use memtable::Memtable;
 pub use segment::{SectionMeta, SegmentReader, SegmentWriter};
 pub use store::{
-    NoIndexer, SegmentIndexer, SegmentMeta, SegmentView, ShardManifest, Store, StoreConfig,
+    CompactJob, FlushJob, NoIndexer, SegmentIndexer, SegmentMeta, SegmentView, ShardManifest,
+    Store, StoreConfig,
 };

@@ -144,9 +144,12 @@ name = "cairn-bench"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "cairn-bench-gen",
+ "cairn-client",
  "cairn-core",
  "cairn-index",
+ "cairn-query",
  "clap",
  "flate2",
  "hdrhistogram",

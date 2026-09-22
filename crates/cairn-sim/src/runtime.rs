@@ -65,6 +65,15 @@ impl Runtime for SimRuntime {
         self.handle.yield_now()
     }
 
+    fn offload<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        // Inline: deterministic, and the only option without threads.
+        let v = work();
+        async move { v }
+    }
+
     fn disk(&self) -> &Self::Disk {
         &self.disk
     }

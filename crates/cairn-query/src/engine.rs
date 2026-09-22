@@ -168,7 +168,7 @@ impl<R: Runtime> ShardEngine<R> {
         let version = self.store.memtable_version();
         if self.memtable.as_ref().is_none_or(|m| m.version != version) {
             let schema = self.store.schema().clone();
-            let mut docs: Vec<Document> = self.store.memtable().docs().cloned().collect();
+            let mut docs: Vec<Document> = self.store.memtable_docs();
             docs.sort_by_key(|d| d.id);
             let refs: Vec<&Document> = docs.iter().collect();
             let structured = StructuredIndex::build(&schema, &refs);

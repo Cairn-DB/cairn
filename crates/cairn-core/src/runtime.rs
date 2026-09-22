@@ -114,6 +114,13 @@ pub trait Runtime: Clone + 'static {
     /// Lets other tasks on this core run before continuing.
     fn yield_now(&self) -> impl Future<Output = ()>;
 
+    /// Runs CPU-heavy, self-contained work (a segment build) off the core when the runtime can
+    /// (a helper thread in production) or inline (the simulator, which must stay deterministic).
+    fn offload<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T>;
+
     /// The disk.
     fn disk(&self) -> &Self::Disk;
 

@@ -16,9 +16,10 @@ use cairn_core::{
     DocId, Document, Duration, Error, HashMap, LogIndex, Network, NodeId, Result, Runtime, Schema,
     ShardId, Term,
 };
+use cairn_index::DefaultIndexer;
 use cairn_raft::{Entry, HardState, InitialState, Raft, Ready, Role, Snapshot};
 use cairn_storage::manifest::{Manifest, ManifestStore};
-use cairn_storage::{Command, LogEntry, Store};
+use cairn_storage::{Command, CompactJob, FlushJob, LogEntry, Store};
 
 /// Consistency level of a read (ADR 0010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,8 @@ enum Event {
     ),
     Get(DocId, Consistency, Sender<Result<Option<Document>>>),
     Status(Sender<ReplicaStatus>),
+    FlushBuilt(FlushJob, Vec<Document>, Result<Vec<(String, Vec<u8>)>>),
+    CompactBuilt(CompactJob, Result<Vec<(String, Vec<u8>)>>),
 }
 
 /// Handle to a running replica (cheap to clone).
@@ -125,7 +128,11 @@ impl Drop for AliveGuard {
                 Event::Query(_, _, done) => done.send(closed()),
                 Event::QueryLegs(_, _, done) => done.send(closed()),
                 Event::Get(_, _, done) => done.send(closed()),
-                Event::Status(_) | Event::Tick | Event::Net(..) => {}
+                Event::Status(_)
+                | Event::Tick
+                | Event::Net(..)
+                | Event::FlushBuilt(..)
+                | Event::CompactBuilt(..) => {}
             }
         }
     }
@@ -257,6 +264,7 @@ const CHUNK: usize = 256 * 1024;
 pub struct Replica<R: Runtime> {
     rt: R,
     cfg: ReplicaConfig,
+    schema: Schema,
     engine: ShardEngine<R>,
     raft: Raft,
     state_store: ManifestStore<R>,
@@ -271,22 +279,23 @@ pub struct Replica<R: Runtime> {
 }
 
 impl<R: Runtime> Replica<R> {
-    /// Opens the shard (recovering) and spawns the actor, its ticker and its network receiver.
-    /// The network receiver dispatches frames for this shard; `frames` receives frames for
-    /// other shards (Phase 4 multiplexes several shards per node).
-    pub async fn spawn(rt: R, cfg: ReplicaConfig, schema: Schema) -> Result<ReplicaHandle> {
+    /// Opens the engine and Raft state from disk.
+    async fn open_state(
+        rt: &R,
+        cfg: &ReplicaConfig,
+        schema: &Schema,
+    ) -> Result<(ShardEngine<R>, Raft, RaftState, ManifestStore<R>)> {
         // Raft state first: only entries up to the persisted commit index may be replayed.
         let state_store = ManifestStore::new(rt.clone(), format!("{}/RAFT", cfg.dir));
         let state = state_store.load::<RaftState>().await?.unwrap_or_default();
         let engine = ShardEngine::open_with_limit(
             rt.clone(),
             &cfg.dir,
-            schema,
+            schema.clone(),
             cfg.engine.clone(),
             Some(state.hs.commit),
         )
         .await?;
-        // Entries after the manifest's applied index are the Raft log suffix in memory.
         let applied = engine.store().applied_index();
         let snapshot_index = engine.store().manifest().applied_index;
         let log = engine.store().log();
@@ -333,6 +342,48 @@ impl<R: Runtime> Replica<R> {
                 data: engine.store().manifest_bytes(),
             });
         }
+        Ok((engine, raft, state, state_store))
+    }
+
+    /// Reopens everything from disk after a fatal error (the in-memory equivalent of a crash and
+    /// restart); pending requests are failed.
+    async fn reopen(&mut self) -> Result<()> {
+        let (engine, raft, state, state_store) =
+            Self::open_state(&self.rt, &self.cfg, &self.schema).await?;
+        self.engine = engine;
+        self.raft = raft;
+        self.state = state;
+        self.state_store = state_store;
+        self.fetch = None;
+        for (_, (_, done)) in self.waiting_commit.drain() {
+            done.send(closed());
+        }
+        for (_, ev) in self.waiting_reads.drain() {
+            Self::fail(
+                ev,
+                Error::io(
+                    cairn_core::error::IoErrorKind::Shutdown,
+                    "replica restarted",
+                ),
+            );
+        }
+        for (_, ev) in self.waiting_applied.drain(..) {
+            Self::fail(
+                ev,
+                Error::io(
+                    cairn_core::error::IoErrorKind::Shutdown,
+                    "replica restarted",
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Opens the shard (recovering) and spawns the actor, its ticker and its network receiver.
+    /// The network receiver dispatches frames for this shard; `frames` receives frames for
+    /// other shards (Phase 4 multiplexes several shards per node).
+    pub async fn spawn(rt: R, cfg: ReplicaConfig, schema: Schema) -> Result<ReplicaHandle> {
+        let (engine, raft, state, state_store) = Self::open_state(&rt, &cfg, &schema).await?;
         let inbox = LocalQueue::new();
         let alive = std::rc::Rc::new(std::cell::Cell::new(true));
         let handle = ReplicaHandle {
@@ -343,6 +394,7 @@ impl<R: Runtime> Replica<R> {
         let mut replica = Replica {
             rt: rt.clone(),
             cfg: cfg.clone(),
+            schema: schema.clone(),
             engine,
             raft,
             state_store,
@@ -391,7 +443,11 @@ impl<R: Runtime> Replica<R> {
                         Event::Query(_, _, done) => done.send(closed()),
                         Event::QueryLegs(_, _, done) => done.send(closed()),
                         Event::Get(_, _, done) => done.send(closed()),
-                        Event::Status(_) | Event::Tick | Event::Net(..) => {}
+                        Event::Status(_)
+                        | Event::Tick
+                        | Event::Net(..)
+                        | Event::FlushBuilt(..)
+                        | Event::CompactBuilt(..) => {}
                     }
                 }
             }
@@ -400,13 +456,20 @@ impl<R: Runtime> Replica<R> {
     }
 
     async fn run(&mut self) -> Result<()> {
-        // Drain anything Raft wants right away (nothing on a fresh start).
         self.drain_ready().await?;
         loop {
             let ev = self.inbox.pop().await;
-            self.handle_event(ev).await?;
-            self.drain_ready().await?;
-            self.serve_waiting().await?;
+            let step = async {
+                self.handle_event(ev).await?;
+                self.drain_ready().await?;
+                self.serve_waiting().await
+            }
+            .await;
+            if let Err(e) = step {
+                tracing::error!(node = %self.cfg.id, shard = %self.cfg.shard, "replica error, reopening from disk: {e}");
+                self.reopen().await?;
+                self.drain_ready().await?;
+            }
         }
     }
 
@@ -430,6 +493,37 @@ impl<R: Runtime> Replica<R> {
             Event::Query(q, c, done) => self.read(Event::Query(q, c, done)).await?,
             Event::QueryLegs(q, c, done) => self.read(Event::QueryLegs(q, c, done)).await?,
             Event::Get(id, c, done) => self.read(Event::Get(id, c, done)).await?,
+            Event::FlushBuilt(job, docs, sections) => {
+                let sections = sections?;
+                self.engine
+                    .store_mut()
+                    .finish_flush(job, docs, sections)
+                    .await?;
+                self.after_publish().await?;
+            }
+            Event::CompactBuilt(job, sections) => {
+                let sections = sections?;
+                self.engine
+                    .store_mut()
+                    .finish_compact(job, sections)
+                    .await?;
+                self.engine.refresh().await?;
+                // Lagging followers must fetch the merged files, not the removed ones: refresh
+                // the snapshot Raft offers them.
+                let up_to = self.engine.store().manifest().applied_index;
+                if up_to > LogIndex(0) {
+                    let term = self
+                        .raft
+                        .term_at(up_to)
+                        .unwrap_or(self.raft.snapshot_term());
+                    self.raft.compact(Snapshot {
+                        last_index: up_to,
+                        last_term: term,
+                        data: self.engine.store().manifest_bytes(),
+                    });
+                }
+                self.maybe_compact_job().await?;
+            }
             Event::Status(done) => {
                 let st = self.engine.store();
                 done.send(ReplicaStatus {
@@ -691,14 +785,43 @@ impl<R: Runtime> Replica<R> {
         if self.engine.store().memtable_bytes() < self.cfg.engine.store.memtable_max_bytes {
             return Ok(());
         }
-        self.flush().await
+        self.start_flush_job()
     }
 
-    /// Flushes the memtable to a segment and compacts the Raft log to the new manifest.
-    pub async fn flush(&mut self) -> Result<()> {
-        self.engine.flush().await?;
-        tracing::info!(node = %self.cfg.id, applied = %self.engine.store().manifest().applied_index, segments = ?self.engine.store().segments().map(|s| s.id.get()).collect::<Vec<_>>(), "flushed");
+    /// Freezes the memtable and builds its indexes off the actor (`Runtime::offload`); the
+    /// result comes back as an event. No-op when a job is already running.
+    fn start_flush_job(&mut self) -> Result<()> {
+        if self.engine.store().job_active() {
+            return Ok(());
+        }
+        let Some(job) = self.engine.store_mut().begin_flush() else {
+            return Ok(());
+        };
+        let docs = job.docs.clone();
+        let schema = self.engine.schema().clone();
+        let indexer = DefaultIndexer {
+            vector: self.cfg.engine.vector,
+        };
+        let inbox = self.inbox.clone();
+        let rt = self.rt.clone();
+        self.rt.spawn(async move {
+            let (docs, sections) = rt
+                .offload(move || {
+                    let sections = Store::<R>::build_sections(&schema, &docs, &indexer);
+                    (docs, sections)
+                })
+                .await;
+            inbox.push(Event::FlushBuilt(job, docs, sections));
+        });
+        Ok(())
+    }
+
+    /// After a segment was published: reload indexes, compact the Raft log to the manifest,
+    /// and start a compaction if the policy asks for one.
+    async fn after_publish(&mut self) -> Result<()> {
+        self.engine.refresh().await?;
         let up_to = self.engine.store().manifest().applied_index;
+        tracing::info!(node = %self.cfg.id, applied = %up_to, segments = ?self.engine.store().segments().map(|s| s.id.get()).collect::<Vec<_>>(), "flushed");
         if up_to > LogIndex(0)
             && let Some(term) = self.raft.term_at(up_to)
         {
@@ -711,13 +834,48 @@ impl<R: Runtime> Replica<R> {
             self.state.snapshot_term = term;
             self.state_store.store(&self.state).await?;
         }
+        self.maybe_compact_job().await
+    }
+
+    async fn maybe_compact_job(&mut self) -> Result<()> {
+        if self.engine.store().job_active() {
+            return Ok(());
+        }
+        let Some(job) = self.engine.store_mut().begin_compact().await? else {
+            return Ok(());
+        };
+        let schema = self.engine.schema().clone();
+        let indexer = DefaultIndexer {
+            vector: self.cfg.engine.vector,
+        };
+        let inbox = self.inbox.clone();
+        let rt = self.rt.clone();
+        self.rt.spawn(async move {
+            let (job, sections) = rt
+                .offload(move || {
+                    let sections = Store::<R>::build_sections(&schema, &job.docs, &indexer);
+                    (job, sections)
+                })
+                .await;
+            inbox.push(Event::CompactBuilt(job, sections));
+        });
         Ok(())
+    }
+
+    /// Flushes synchronously (tests): builds inline and publishes.
+    pub async fn flush(&mut self) -> Result<()> {
+        if self.engine.store().job_active() {
+            return Ok(());
+        }
+        self.engine.flush().await?;
+        self.after_publish().await
     }
 
     async fn start_fetch(&mut self, s: Snapshot) -> Result<()> {
         let m: cairn_storage::ShardManifest = ManifestStore::<R>::decode(&s.data)?;
         let needed = Store::<R>::snapshot_files(&m);
         let from = self.raft.leader().unwrap_or(self.cfg.id);
+        tracing::info!(node = %self.cfg.id, %from, last_index = %s.last_index, segments = ?m.segments.iter().map(|x| x.id.get()).collect::<Vec<_>>(), "fetching snapshot");
         let req = self.next_read;
         self.next_read += 1;
         let mut fetch = SnapshotFetch {
@@ -768,7 +926,14 @@ impl<R: Runtime> Replica<R> {
             return Ok(());
         };
         if total == u64::MAX {
-            // Missing on the leader (deletion checkpoints are optional).
+            if path.ends_with(".seg") {
+                // The leader compacted that segment away: this snapshot is stale. Reopening from
+                // disk makes the leader ship a fresh one.
+                return Err(Error::Internal(format!(
+                    "snapshot file {path} vanished on the leader"
+                )));
+            }
+            // Missing deletion checkpoint: optional.
             f.partial.remove(&path);
             f.needed.retain(|p| *p != path);
         } else if offset == *have {

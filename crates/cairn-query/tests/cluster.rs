@@ -114,7 +114,7 @@ async fn wait_leader(rt: &SimRuntime, handles: &[ReplicaHandle]) -> usize {
 }
 
 async fn wait_converged(rt: &SimRuntime, handles: &[ReplicaHandle], expect_docs: u64) {
-    for _ in 0..1000 {
+    for iter in 0..1000 {
         let mut ok = true;
         let mut applied = None;
         for h in handles {
@@ -133,6 +133,17 @@ async fn wait_converged(rt: &SimRuntime, handles: &[ReplicaHandle], expect_docs:
         }
         if ok {
             return;
+        }
+        if iter % 200 == 0 {
+            let mut v = Vec::new();
+            for h in handles {
+                v.push(
+                    h.status()
+                        .await
+                        .map(|s| (s.id.get(), s.applied.get(), s.live_docs, s.segments.len())),
+                );
+            }
+            eprintln!("wait_converged iter {iter} at {:?}: {v:?}", rt.now());
         }
         rt.sleep(Duration::from_millis(10)).await;
     }

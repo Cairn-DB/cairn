@@ -1,0 +1,29 @@
+{
+ "fields": [
+  {
+   "name": "img",
+   "kind": {
+    "Vector": {
+     "dims": 128,
+     "metric": "L2"
+    }
+   }
+  },
+  {
+   "name": "rights",
+   "kind": "Enum"
+  },
+  {
+   "name": "date",
+   "kind": "I64"
+  },
+  {
+   "name": "flag_1",
+   "kind": "Bool"
+  },
+  {
+   "name": "payload",
+   "kind": "Blob"
+  }
+ ]
+}

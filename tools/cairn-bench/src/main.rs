@@ -6,6 +6,7 @@
     clippy::needless_range_loop
 )]
 
+mod cluster;
 mod datasets;
 mod kmeans;
 mod msmarco;
@@ -56,6 +57,36 @@ enum Cmd {
         /// Number of k-means clusters for the correlated attributes.
         #[arg(long, default_value_t = 1000)]
         clusters: usize,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// End-to-end benchmark against a running cluster.
+    Cluster {
+        /// SIFT directory.
+        #[arg(long, default_value = "data/sift")]
+        dir: PathBuf,
+        /// Nodes as `id=addr` (repeatable).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Vectors to ingest (prefix).
+        #[arg(long, default_value_t = 1_000_000)]
+        n: usize,
+        /// Documents per upsert batch.
+        #[arg(long, default_value_t = 200)]
+        batch: usize,
+        /// Writer threads.
+        #[arg(long, default_value_t = 8)]
+        writers: usize,
+        /// Queries to run per configuration.
+        #[arg(long, default_value_t = 2000)]
+        queries: usize,
+        /// Query threads.
+        #[arg(long, default_value_t = 8)]
+        query_threads: usize,
+        /// Takedowns to time.
+        #[arg(long, default_value_t = 200)]
+        takedowns: usize,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -407,6 +438,36 @@ fn main() -> anyhow::Result<()> {
                 .map(|s| s.trim().parse::<u32>())
                 .collect::<Result<Vec<_>, _>>()?;
             sift_sweep(dir, n, queries, k, m, ef_construction, efs, clusters, out)
+        }
+        Cmd::Cluster {
+            dir,
+            nodes,
+            n,
+            batch,
+            writers,
+            queries,
+            query_threads,
+            takedowns,
+            out,
+        } => {
+            let nodes: Vec<(u32, std::net::SocketAddr)> = nodes
+                .iter()
+                .map(|s| {
+                    let (i, a) = s.split_once('=').expect("node must be id=addr");
+                    (i.parse().expect("node id"), a.parse().expect("addr"))
+                })
+                .collect();
+            cluster::cluster_bench(
+                &dir,
+                &nodes,
+                n,
+                batch,
+                writers,
+                queries,
+                query_threads,
+                takedowns,
+                &out,
+            )
         }
         Cmd::Msmarco {
             dir,

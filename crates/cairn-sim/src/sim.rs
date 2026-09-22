@@ -139,7 +139,11 @@ impl Simulation {
     /// Ensures `node` has a disk and returns a runtime for it bound to `handle`.
     pub fn runtime(&self, node: NodeId, handle: &Handle) -> SimRuntime {
         self.inner.disks.borrow_mut().entry(node).or_default();
-        self.inner.net.borrow_mut().ensure_node(node);
+        {
+            let mut net = self.inner.net.borrow_mut();
+            net.ensure_node(node);
+            net.down.remove(&node);
+        }
         SimRuntime::new(self.clone(), node, handle.clone())
     }
 
@@ -171,7 +175,11 @@ impl Simulation {
             events.retain(|_, (n, _)| *n != node);
             before - events.len()
         };
-        self.inner.net.borrow_mut().clear_inbox(node);
+        {
+            let mut net = self.inner.net.borrow_mut();
+            net.clear_inbox(node);
+            net.down.insert(node);
+        }
         let mut rng = self
             .rng("crash")
             .fork(&format!("{node}-{}", self.now().as_nanos()));
