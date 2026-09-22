@@ -32,7 +32,8 @@ impl Memtable {
         Memtable::default()
     }
 
-    fn note_index(&mut self, index: LogIndex) {
+    /// Records that log `index` was applied (used for no-ops).
+    pub fn note_index(&mut self, index: LogIndex) {
         if self.first_index.is_none() {
             self.first_index = Some(index);
         }

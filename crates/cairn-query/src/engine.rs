@@ -49,7 +49,20 @@ pub struct ShardEngine<R: Runtime> {
 impl<R: Runtime> ShardEngine<R> {
     /// Opens the shard in `dir`.
     pub async fn open(rt: R, dir: &str, schema: Schema, cfg: EngineConfig) -> Result<Self> {
-        let mut store = Store::open(rt, dir, schema, cfg.store.clone()).await?;
+        Self::open_with_limit(rt, dir, schema, cfg, None).await
+    }
+
+    /// Opens the shard, replaying the log only up to `replay_limit` (see
+    /// [`Store::open_with_limit`]).
+    pub async fn open_with_limit(
+        rt: R,
+        dir: &str,
+        schema: Schema,
+        cfg: EngineConfig,
+        replay_limit: Option<LogIndex>,
+    ) -> Result<Self> {
+        let mut store =
+            Store::open_with_limit(rt, dir, schema, cfg.store.clone(), replay_limit).await?;
         store.set_indexer(Box::new(DefaultIndexer { vector: cfg.vector }));
         let mut engine = ShardEngine {
             store,

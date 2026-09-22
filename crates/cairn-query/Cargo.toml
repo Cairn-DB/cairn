@@ -14,10 +14,13 @@ workspace = true
 cairn-core = { path = "../cairn-core" }
 cairn-storage = { path = "../cairn-storage" }
 cairn-index = { path = "../cairn-index" }
+cairn-raft = { path = "../cairn-raft" }
+bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 proptest.workspace = true
 cairn-runtime = { path = "../cairn-runtime" }
 cairn-sim = { path = "../cairn-sim" }

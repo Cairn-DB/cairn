@@ -6,6 +6,8 @@ use cairn_core::{DocId, Document, Error, Result};
 /// One replicated command (a log entry payload).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// No operation (a leader's term marker); advances the applied index only.
+    Noop,
     /// Insert or replace whole documents.
     Upsert(Vec<Document>),
     /// Remove documents by id (a takedown).
@@ -16,6 +18,7 @@ impl Command {
     /// Encodes the command.
     pub fn encode(&self, w: &mut Writer) {
         match self {
+            Command::Noop => {}
             Command::Upsert(docs) => {
                 w.u8(1).u32(docs.len() as u32);
                 for d in docs {
@@ -40,6 +43,9 @@ impl Command {
 
     /// Decodes a command.
     pub fn decode(r: &mut Reader<'_>) -> Result<Command> {
+        if r.remaining() == 0 {
+            return Ok(Command::Noop);
+        }
         match r.u8()? {
             1 => {
                 let n = r.u32()? as usize;

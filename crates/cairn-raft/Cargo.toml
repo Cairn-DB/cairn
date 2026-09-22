@@ -16,3 +16,8 @@ cairn-storage = { path = "../cairn-storage" }
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+cairn-runtime = { path = "../cairn-runtime" }
+cairn-sim = { path = "../cairn-sim" }

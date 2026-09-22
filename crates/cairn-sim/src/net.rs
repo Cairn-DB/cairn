@@ -1,6 +1,5 @@
 //! Simulated network: per-node inboxes, seeded delay, drops, partitions.
 
-use crate::completion::{Completer, completion};
 use crate::sim::Simulation;
 use bytes::Bytes;
 use cairn_core::error::IoErrorKind;
@@ -31,7 +30,7 @@ impl Default for NetConfig {
 #[derive(Default)]
 pub(crate) struct NetState {
     inboxes: HashMap<NodeId, VecDeque<(NodeId, Bytes)>>,
-    waiters: HashMap<NodeId, VecDeque<Completer<(NodeId, Bytes)>>>,
+    waiters: HashMap<NodeId, Vec<std::task::Waker>>,
     /// Directed pairs `(from, to)` that cannot communicate.
     blocked: HashSet<(NodeId, NodeId)>,
     sent: u64,
@@ -57,10 +56,11 @@ impl NetState {
 
     fn deliver(&mut self, from: NodeId, to: NodeId, msg: Bytes) {
         self.delivered += 1;
-        if let Some(c) = self.waiters.get_mut(&to).and_then(VecDeque::pop_front) {
-            c.complete((from, msg));
-        } else {
-            self.inboxes.entry(to).or_default().push_back((from, msg));
+        self.inboxes.entry(to).or_default().push_back((from, msg));
+        if let Some(ws) = self.waiters.get_mut(&to) {
+            for w in ws.drain(..) {
+                w.wake();
+            }
         }
     }
 }
@@ -150,28 +150,18 @@ impl Network for SimNetwork {
         Ok(())
     }
 
-    async fn recv(&self) -> Result<(NodeId, Bytes)> {
-        let queued = self
-            .sim
-            .inner
-            .net
-            .borrow_mut()
-            .inboxes
-            .get_mut(&self.node)
-            .and_then(VecDeque::pop_front);
-        if let Some(m) = queued {
-            return Ok(m);
-        }
-        let (c, completer) = completion();
-        self.sim
-            .inner
-            .net
-            .borrow_mut()
-            .waiters
-            .entry(self.node)
-            .or_default()
-            .push_back(completer);
-        Ok(c.await)
+    fn recv(&self) -> impl std::future::Future<Output = Result<(NodeId, Bytes)>> {
+        // Cancel-safe: a dropped receive leaves the message in the inbox.
+        let sim = self.sim.clone();
+        let node = self.node;
+        std::future::poll_fn(move |cx| {
+            let mut n = sim.inner.net.borrow_mut();
+            if let Some(m) = n.inboxes.get_mut(&node).and_then(VecDeque::pop_front) {
+                return std::task::Poll::Ready(Ok(m));
+            }
+            n.waiters.entry(node).or_default().push(cx.waker().clone());
+            std::task::Poll::Pending
+        })
     }
 
     fn local_id(&self) -> NodeId {

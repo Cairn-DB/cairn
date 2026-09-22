@@ -14,6 +14,7 @@ pub mod ids;
 pub mod rng;
 pub mod runtime;
 pub mod schema;
+pub mod sync;
 pub mod time;
 
 pub use doc::{Document, Value};

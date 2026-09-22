@@ -466,6 +466,19 @@ impl<R: Runtime> Log<R> {
         Ok(())
     }
 
+    /// Discards every entry and restarts the log at `first_index` (snapshot installation).
+    pub async fn reset(&mut self, first_index: LogIndex) -> Result<()> {
+        let disk = self.rt.disk();
+        for f in self.files.drain(..) {
+            disk.remove(&format!("{}/{}", self.dir, f.name)).await?;
+        }
+        let lf = self.create_file(first_index.get()).await?;
+        self.files.push(lf);
+        self.dirty = false;
+        self.synced = None;
+        Ok(())
+    }
+
     /// Number of files currently backing the log.
     pub fn file_count(&self) -> usize {
         self.files.len()

@@ -179,6 +179,19 @@ impl<R: Runtime> Store<R> {
     /// Opens or creates the shard store in `dir`. `schema` is used only when creating; an
     /// existing store's schema must match.
     pub async fn open(rt: R, dir: &str, schema: Schema, cfg: StoreConfig) -> Result<Self> {
+        Self::open_with_limit(rt, dir, schema, cfg, None).await
+    }
+
+    /// Like [`Store::open`], but replays the log only up to `replay_limit` (inclusive). A
+    /// replicated shard passes its persisted commit index: entries beyond it may be uncommitted
+    /// and get truncated later, so they must not reach the state machine.
+    pub async fn open_with_limit(
+        rt: R,
+        dir: &str,
+        schema: Schema,
+        cfg: StoreConfig,
+        replay_limit: Option<LogIndex>,
+    ) -> Result<Self> {
         let disk = rt.disk();
         disk.create_dir_all(&format!("{dir}/segs")).await?;
         let manifest_store = ManifestStore::new(rt.clone(), format!("{dir}/MANIFEST"));
@@ -273,11 +286,21 @@ impl<R: Runtime> Store<R> {
         };
         store.applied = store.manifest.applied_index;
         // Replay the log after the manifest's applied index.
-        if let Some(last) = store.log.last_index()
+        if let Some(mut last) = store.log.last_index()
             && last > store.applied
+            && store.log.first_index() <= store.applied.next()
         {
+            if let Some(limit) = replay_limit {
+                last = last.min(limit);
+            }
+            // A log starting beyond applied + 1 (crash during a snapshot install) is ignored; the
+            // leader will ship the snapshot again.
             let from = store.applied.next().max(store.log.first_index());
-            let entries = store.log.read_range(from, last).await?;
+            let entries = if last >= from {
+                store.log.read_range(from, last).await?
+            } else {
+                Vec::new()
+            };
             for e in entries {
                 let cmd = Command::from_bytes(&e.payload)?;
                 store.apply(e.index, &cmd)?;
@@ -368,6 +391,7 @@ impl<R: Runtime> Store<R> {
             )));
         }
         match cmd {
+            Command::Noop => self.memtable.note_index(index),
             Command::Upsert(docs) => {
                 for d in docs {
                     let mut d = d.clone();
@@ -607,6 +631,111 @@ impl<R: Runtime> Store<R> {
         Ok(())
     }
 
+    /// The current manifest (a snapshot of everything up to `applied_index` of the manifest).
+    pub fn manifest(&self) -> &ShardManifest {
+        &self.manifest
+    }
+
+    /// Encoded manifest bytes, for shipping as a Raft snapshot.
+    pub fn manifest_bytes(&self) -> bytes::Bytes {
+        ManifestStore::<R>::encode(&self.manifest)
+    }
+
+    /// Files a snapshot receiver must fetch for `manifest`: segment and deletion files.
+    pub fn snapshot_files(manifest: &ShardManifest) -> Vec<String> {
+        let mut v = Vec::new();
+        for s in &manifest.segments {
+            v.push(format!("segs/{:016x}.seg", s.id.get()));
+            v.push(format!("segs/{:016x}.del", s.id.get()));
+        }
+        v
+    }
+
+    /// Reads a file of this shard (for shipping), relative to the shard directory.
+    pub async fn read_file(&self, rel: &str) -> Result<Option<bytes::Bytes>> {
+        let disk = self.rt.disk();
+        let path = format!("{}/{rel}", self.dir);
+        if !disk.exists(&path).await? {
+            return Ok(None);
+        }
+        let f = disk.open(&path, cairn_core::OpenMode::Read).await?;
+        let len = disk.len(&f).await?;
+        Ok(Some(disk.read_at(&f, 0, len as usize).await?))
+    }
+
+    /// Replaces the whole shard state with a snapshot: `files` are `(relative path, bytes)`
+    /// listed by [`Store::snapshot_files`] (missing deletion files are skipped), `manifest`
+    /// the encoded manifest. The log is reset to start after the manifest's applied index.
+    pub async fn install_snapshot(
+        &mut self,
+        manifest: &[u8],
+        files: Vec<(String, bytes::Bytes)>,
+    ) -> Result<()> {
+        let m: ShardManifest = ManifestStore::<R>::decode(manifest)?;
+        if m.schema != self.manifest.schema {
+            return Err(Error::Schema("snapshot schema differs".into()));
+        }
+        let disk = self.rt.disk();
+        for (rel, bytes) in files {
+            let path = format!("{}/{rel}", self.dir);
+            let tmp = format!("{path}.tmp");
+            let f = disk
+                .open(&tmp, cairn_core::OpenMode::CreateTruncate)
+                .await?;
+            disk.write_at(&f, 0, bytes).await?;
+            disk.sync(&f).await?;
+            disk.rename(&tmp, &path).await?;
+        }
+        self.manifest_store.store(&m).await?;
+        // Reopen segments from the new manifest.
+        self.segments.clear();
+        for meta in &m.segments {
+            let reader =
+                SegmentReader::open(self.rt.clone(), &seg_path(&self.dir, meta.id)).await?;
+            let docs = DocStore::open(&reader).await?;
+            let del_store = ManifestStore::new(self.rt.clone(), del_path(&self.dir, meta.id));
+            let deletions = match del_store.load::<DeletionSet>().await? {
+                Some(d) => d,
+                None => DeletionSet::new(meta.doc_count),
+            };
+            self.segments.push(OpenSegment {
+                meta: meta.clone(),
+                reader,
+                docs,
+                deletions,
+                deletions_dirty: false,
+            });
+        }
+        self.manifest = m;
+        self.memtable.clear();
+        self.applied = self.manifest.applied_index;
+        if self.log.first_index() != self.applied.next()
+            || self.log.last_index().is_some_and(|l| l <= self.applied)
+        {
+            self.log.reset(self.applied.next()).await?;
+        }
+        self.memtable_version += 1;
+        self.segments_version += 1;
+        // Drop orphan files not referenced by the new manifest.
+        let referenced: Vec<String> = self
+            .manifest
+            .segments
+            .iter()
+            .flat_map(|s| {
+                [
+                    format!("{:016x}.seg", s.id.get()),
+                    format!("{:016x}.del", s.id.get()),
+                ]
+            })
+            .collect();
+        for name in disk.list(&format!("{}/segs", self.dir)).await? {
+            if !referenced.contains(&name) {
+                disk.remove(&format!("{}/segs/{name}", self.dir)).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Number of live documents across memtable and segments (walks deletion sets).
     pub fn approx_live_docs(&self) -> u64 {
         let seg: u64 = self
@@ -782,6 +911,7 @@ mod tests {
                 let mut model: HashMap<DocId, Option<Document>> = HashMap::default();
                 for c in &cmds[..applied] {
                     match c {
+                        Command::Noop => {}
                         Command::Upsert(ds) => {
                             for d in ds {
                                 model.insert(d.id, Some(d.clone()));
