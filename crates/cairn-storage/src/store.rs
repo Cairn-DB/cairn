@@ -109,6 +109,34 @@ impl Manifest for ShardManifest {
     }
 }
 
+/// Builds the index sections of a segment from its documents (rows in the given order).
+/// Implemented in `cairn-index`; the store only writes what it returns.
+pub trait SegmentIndexer {
+    /// Extra sections `(name, bytes)` for a segment holding `docs`.
+    fn sections(&self, schema: &Schema, docs: &[&Document]) -> Result<Vec<(String, Vec<u8>)>>;
+}
+
+/// Indexer that adds nothing (row store only).
+pub struct NoIndexer;
+
+impl SegmentIndexer for NoIndexer {
+    fn sections(&self, _schema: &Schema, _docs: &[&Document]) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Read-only view of one open segment for the query layer.
+pub struct SegmentView<'a, R: Runtime> {
+    /// Manifest entry.
+    pub meta: &'a SegmentMeta,
+    /// Container reader.
+    pub reader: &'a SegmentReader<R>,
+    /// Row store (doc ids).
+    pub docs: &'a DocStore,
+    /// Current deletions.
+    pub deletions: &'a DeletionSet,
+}
+
 struct OpenSegment<R: Runtime> {
     meta: SegmentMeta,
     reader: SegmentReader<R>,
@@ -128,6 +156,11 @@ pub struct Store<R: Runtime> {
     segments: Vec<OpenSegment<R>>,
     memtable: Memtable,
     applied: LogIndex,
+    indexer: Box<dyn SegmentIndexer>,
+    /// Bumped whenever the memtable changes.
+    memtable_version: u64,
+    /// Bumped whenever the segment list changes.
+    segments_version: u64,
 }
 
 fn refs_len(docs: &[Document]) -> u32 {
@@ -234,6 +267,9 @@ impl<R: Runtime> Store<R> {
             segments,
             memtable: Memtable::new(),
             applied: LogIndex(0),
+            indexer: Box::new(NoIndexer),
+            memtable_version: 0,
+            segments_version: 0,
         };
         store.applied = store.manifest.applied_index;
         // Replay the log after the manifest's applied index.
@@ -248,6 +284,49 @@ impl<R: Runtime> Store<R> {
             }
         }
         Ok(store)
+    }
+
+    /// Installs the indexer used by future flushes and compactions.
+    pub fn set_indexer(&mut self, indexer: Box<dyn SegmentIndexer>) {
+        self.indexer = indexer;
+    }
+
+    /// The memtable.
+    pub fn memtable(&self) -> &Memtable {
+        &self.memtable
+    }
+
+    /// Changes whenever the memtable changes.
+    pub fn memtable_version(&self) -> u64 {
+        self.memtable_version
+    }
+
+    /// Changes whenever a segment is added or removed.
+    pub fn segments_version(&self) -> u64 {
+        self.segments_version
+    }
+
+    /// View of the segment with `id`.
+    pub fn segment(&self, id: SegmentId) -> Option<SegmentView<'_, R>> {
+        self.segments
+            .iter()
+            .find(|s| s.meta.id == id)
+            .map(|s| SegmentView {
+                meta: &s.meta,
+                reader: &s.reader,
+                docs: &s.docs,
+                deletions: &s.deletions,
+            })
+    }
+
+    /// Views of every segment, oldest first.
+    pub fn segment_views(&self) -> impl Iterator<Item = SegmentView<'_, R>> {
+        self.segments.iter().map(|s| SegmentView {
+            meta: &s.meta,
+            reader: &s.reader,
+            docs: &s.docs,
+            deletions: &s.deletions,
+        })
     }
 
     /// The schema.
@@ -305,6 +384,7 @@ impl<R: Runtime> Store<R> {
             }
         }
         self.applied = index;
+        self.memtable_version += 1;
         Ok(())
     }
 
@@ -379,6 +459,9 @@ impl<R: Runtime> Store<R> {
             let path = seg_path(&self.dir, id);
             let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
             write_columns(&mut w, &self.manifest.schema, &docs).await?;
+            for (name, bytes) in self.indexer.sections(&self.manifest.schema, &docs)? {
+                w.add_section(&name, &bytes).await?;
+            }
             let (file_len, file_hash) = w.finish().await?;
             let meta = SegmentMeta {
                 id,
@@ -406,6 +489,8 @@ impl<R: Runtime> Store<R> {
             self.segments.push(s);
         }
         self.memtable.clear();
+        self.memtable_version += 1;
+        self.segments_version += 1;
         self.log.truncate_prefix(last.next()).await?;
         self.maybe_compact().await
     }
@@ -479,6 +564,9 @@ impl<R: Runtime> Store<R> {
         let path = seg_path(&self.dir, id);
         let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
         write_columns(&mut w, &self.manifest.schema, &refs).await?;
+        for (name, bytes) in self.indexer.sections(&self.manifest.schema, &refs)? {
+            w.add_section(&name, &bytes).await?;
+        }
         let (file_len, file_hash) = w.finish().await?;
         let meta = SegmentMeta {
             id,
@@ -495,6 +583,7 @@ impl<R: Runtime> Store<R> {
         new_manifest.next_segment_id += 1;
         self.manifest_store.store(&new_manifest).await?;
         self.manifest = new_manifest;
+        self.segments_version += 1;
         let removed: Vec<OpenSegment<R>> = self
             .segments
             .splice(

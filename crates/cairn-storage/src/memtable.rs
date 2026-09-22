@@ -76,6 +76,11 @@ impl Memtable {
         v
     }
 
+    /// Live documents in unspecified order.
+    pub fn docs(&self) -> impl Iterator<Item = &Document> {
+        self.docs.values()
+    }
+
     /// Number of live documents.
     pub fn len(&self) -> usize {
         self.docs.len()

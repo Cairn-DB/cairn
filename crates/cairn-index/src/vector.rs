@@ -29,9 +29,11 @@ impl Default for VectorIndexParams {
         VectorIndexParams {
             hnsw: HnswParams::default(),
             sq8: true,
-            scan_max_rows: 20_000,
-            scan_max_fraction: 0.10,
-            two_hop_below_fraction: 0.30,
+            scan_max_rows: 50_000,
+            scan_max_fraction: 0.05,
+            // Two-hop expansion lost to plain graph search everywhere in the SIFT1M sweep
+            // (bench-results/phase2-sift1m.md); disabled unless forced.
+            two_hop_below_fraction: 0.0,
         }
     }
 }
@@ -65,7 +67,7 @@ pub struct VectorQuery {
 }
 
 impl VectorQuery {
-    /// Defaults for `k` results: `ef = max(64, 4k)`, rerank `4k`.
+    /// Defaults for `k` results: `ef = max(64, 4k)`, rerank `4k`, at most 8192 graph visits.
     pub fn new(k: usize) -> Self {
         VectorQuery {
             k,
@@ -115,6 +117,33 @@ impl VectorIndex {
             params,
             scratch: RefCell::new(SearchScratch::new(n)),
         }
+    }
+
+    /// Builds vectors and SQ8 only (no graph): every query scans. Used for the memtable.
+    pub fn build_scan_only(
+        field: usize,
+        metric: Metric,
+        dims: usize,
+        rows: Vec<f32>,
+        present: Bitmap,
+        _doc_ids: &[u64],
+        params: VectorIndexParams,
+    ) -> Self {
+        let vectors = Vectors::from_rows(metric, dims, rows, params.sq8);
+        let n = vectors.len();
+        VectorIndex {
+            field,
+            vectors,
+            present,
+            hnsw: None,
+            params,
+            scratch: RefCell::new(SearchScratch::new(n)),
+        }
+    }
+
+    /// Replaces the dispatch parameters.
+    pub fn set_params(&mut self, params: VectorIndexParams) {
+        self.params = params;
     }
 
     /// Sections to add to the segment: `sq8.<field>` (if any) and `hnsw.<field>`.
@@ -415,7 +444,7 @@ mod tests {
             }
         }
         for (name, f, expect_strategy) in [
-            ("random10", &random10, Strategy::HnswTwoHop),
+            ("random10", &random10, Strategy::Hnsw),
             ("cluster", &cluster, Strategy::Scan),
         ] {
             let mut totals = [0.0f64; 3];

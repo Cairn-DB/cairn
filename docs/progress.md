@@ -54,7 +54,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     catastrophic at 0.1% (22 ms); 1M sweep pending -> `bench-results/phase2-sift1m.md`.
   - M2.3 DONE 2026-09-22: Predicate AST (cairn-core::filter), StructuredIndex (term lists,
     ordered keys, IsNull via nulls), proptest vs document semantics, segment round-trip.
-  - M2.4 IN PROGRESS: BM25.
+  - M2.2 sweep DONE: `bench-results/phase2-sift1m.md` (scan <5% exact & fast; capped graph
+    above; two-hop dropped; defaults updated).
+  - M2.4 DONE 2026-09-22: TextIndex (tokenizer, postings, BM25 vs naive reference, section).
+  - M2.5 DONE 2026-09-22: SegmentIndexer hook in Store, DefaultIndexer, cairn-query (Query,
+    fusion RRF/weighted, ShardEngine with per-segment indexes + lazily rebuilt memtable
+    indexes), end-to-end tests vs reference incl. takedown visibility across memtable/segments.
+  - M2.6 IN PROGRESS: YFCC-10M sweep (download running), phase report.
 
 ## Next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,

@@ -8,6 +8,7 @@
 
 mod datasets;
 mod kmeans;
+mod yfcc;
 
 use anyhow::Context;
 use cairn_bench_gen::{Correlation, GenConfig, Generator};
@@ -54,6 +55,36 @@ enum Cmd {
         /// Number of k-means clusters for the correlated attributes.
         #[arg(long, default_value_t = 1000)]
         clusters: usize,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Filtered-search sweep on the Big-ANN YFCC-10M filtered track.
+    YfccSweep {
+        /// Directory holding base.10M.u8bin, query.public.100K.u8bin, *.spmat, GT.public.ibin.
+        #[arg(long, default_value = "data/yfcc10m")]
+        dir: PathBuf,
+        /// Base rows to use (prefix; 10000000 enables the official ground truth).
+        #[arg(long, default_value_t = 10_000_000)]
+        n: usize,
+        /// Queries to use (prefix).
+        #[arg(long, default_value_t = 10_000)]
+        queries: usize,
+        /// k for recall@k.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Rows per segment.
+        #[arg(long, default_value_t = 1_000_000)]
+        segment_rows: usize,
+        /// HNSW M.
+        #[arg(long, default_value_t = 16)]
+        m: u32,
+        /// HNSW efConstruction.
+        #[arg(long, default_value_t = 100)]
+        ef_construction: u32,
+        /// Search ef.
+        #[arg(long, default_value_t = 128)]
+        ef: u32,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -355,5 +386,26 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Result<Vec<_>, _>>()?;
             sift_sweep(dir, n, queries, k, m, ef_construction, efs, clusters, out)
         }
+        Cmd::YfccSweep {
+            dir,
+            n,
+            queries,
+            k,
+            segment_rows,
+            m,
+            ef_construction,
+            ef,
+            out,
+        } => yfcc::yfcc_sweep(
+            &dir,
+            n,
+            queries,
+            k,
+            segment_rows,
+            m,
+            ef_construction,
+            ef,
+            &out,
+        ),
     }
 }

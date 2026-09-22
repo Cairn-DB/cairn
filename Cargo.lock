@@ -204,6 +204,9 @@ version = "0.0.1"
 dependencies = [
  "cairn-core",
  "cairn-index",
+ "cairn-runtime",
+ "cairn-sim",
+ "cairn-storage",
  "proptest",
  "thiserror",
  "tracing",

@@ -78,3 +78,11 @@ subset (tag filters) and compare with the published baselines. If HNSW+two-hop c
 recall at the 1–5% band on correlated filters, the fallback is to raise `T` (more scanning, more
 CPU) and to reduce segment size; the ultimate fallback is a Vamana-style label-aware build for
 enum attributes only.
+
+## Outcome of the Phase 2 experiment (2026-09-22)
+
+`bench-results/phase2-sift1m.md`: exact scan holds recall 0.99 below 5% selectivity at
+< 1.5 ms; uncapped filtered graph search collapses (66–188 ms at 0.1%); capped graph search
+above 5% stays above 0.95 recall. Two-hop expansion on a plain graph was worse than plain graph
+search in every cell and is disabled by default. Adopted thresholds: scan ≤ 5% or ≤ 50k rows,
+graph otherwise with an 8,192-visit cap.
