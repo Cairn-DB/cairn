@@ -25,6 +25,10 @@ pub struct StoreConfig {
     pub memtable_max_bytes: usize,
     /// Log settings.
     pub log: LogConfig,
+    /// Compact when more than this many segments exist.
+    pub max_segments: usize,
+    /// Rewrite a segment once this fraction of its rows is deleted.
+    pub max_deleted_fraction: f64,
 }
 
 impl Default for StoreConfig {
@@ -32,6 +36,8 @@ impl Default for StoreConfig {
         StoreConfig {
             memtable_max_bytes: 64 << 20,
             log: LogConfig::default(),
+            max_segments: 8,
+            max_deleted_fraction: 0.3,
         }
     }
 }
@@ -122,6 +128,10 @@ pub struct Store<R: Runtime> {
     segments: Vec<OpenSegment<R>>,
     memtable: Memtable,
     applied: LogIndex,
+}
+
+fn refs_len(docs: &[Document]) -> u32 {
+    docs.len() as u32
 }
 
 fn seg_path(dir: &str, id: SegmentId) -> String {
@@ -397,6 +407,114 @@ impl<R: Runtime> Store<R> {
         }
         self.memtable.clear();
         self.log.truncate_prefix(last.next()).await?;
+        self.maybe_compact().await
+    }
+
+    /// Applies the compaction policy until it is satisfied.
+    pub async fn maybe_compact(&mut self) -> Result<()> {
+        loop {
+            let n = self.segments.len();
+            // 1. A segment with too many deleted rows is rewritten alone.
+            let stale = self.segments.iter().position(|s| {
+                s.meta.doc_count > 0
+                    && f64::from(s.deletions.count()) / f64::from(s.meta.doc_count)
+                        > self.cfg.max_deleted_fraction
+            });
+            if let Some(i) = stale {
+                let id = self.segments[i].meta.id;
+                self.compact(&[id]).await?;
+                continue;
+            }
+            // 2. Too many segments: merge the adjacent pair with the fewest live rows.
+            if n > self.cfg.max_segments {
+                let live = |s: &OpenSegment<R>| s.meta.doc_count - s.deletions.count();
+                let (i, _) = (0..n - 1)
+                    .map(|i| {
+                        (
+                            i,
+                            live(&self.segments[i]) as u64 + live(&self.segments[i + 1]) as u64,
+                        )
+                    })
+                    .min_by_key(|(_, rows)| *rows)
+                    .expect("n > 1");
+                let ids = [self.segments[i].meta.id, self.segments[i + 1].meta.id];
+                self.compact(&ids).await?;
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Merges the given segments (which must be adjacent in manifest order) into one new segment
+    /// without their deleted rows, publishes it, and removes the inputs.
+    pub async fn compact(&mut self, ids: &[SegmentId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let first = self
+            .segments
+            .iter()
+            .position(|s| s.meta.id == ids[0])
+            .ok_or_else(|| Error::InvalidRequest(format!("unknown segment {}", ids[0])))?;
+        for (k, id) in ids.iter().enumerate() {
+            if self.segments.get(first + k).map(|s| s.meta.id) != Some(*id) {
+                return Err(Error::InvalidRequest(
+                    "segments to compact must be adjacent and in order".into(),
+                ));
+            }
+        }
+        let range = first..first + ids.len();
+        let mut docs: Vec<Document> = Vec::new();
+        let mut log_last = LogIndex(0);
+        for s in &self.segments[range.clone()] {
+            let dels = &s.deletions;
+            docs.extend(s.docs.read_all(&s.reader, |row| dels.contains(row)).await?);
+            log_last = log_last.max(s.meta.log_last);
+        }
+        // Live ids are unique across segments (an upsert masks older rows), so a sort suffices.
+        docs.sort_by_key(|d| d.id);
+        debug_assert!(docs.windows(2).all(|p| p[0].id < p[1].id));
+        let refs: Vec<&Document> = docs.iter().collect();
+        let id = SegmentId(self.manifest.next_segment_id);
+        let path = seg_path(&self.dir, id);
+        let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
+        write_columns(&mut w, &self.manifest.schema, &refs).await?;
+        let (file_len, file_hash) = w.finish().await?;
+        let meta = SegmentMeta {
+            id,
+            doc_count: refs.len() as u32,
+            log_last,
+            file_len,
+            file_hash,
+        };
+        let reader = SegmentReader::open(self.rt.clone(), &path).await?;
+        let docstore = DocStore::open(&reader).await?;
+        drop(refs);
+        let mut new_manifest = self.manifest.clone();
+        new_manifest.segments.splice(range.clone(), [meta.clone()]);
+        new_manifest.next_segment_id += 1;
+        self.manifest_store.store(&new_manifest).await?;
+        self.manifest = new_manifest;
+        let removed: Vec<OpenSegment<R>> = self
+            .segments
+            .splice(
+                range,
+                [OpenSegment {
+                    meta,
+                    reader,
+                    docs: docstore,
+                    deletions: DeletionSet::new(refs_len(&docs)),
+                    deletions_dirty: false,
+                }],
+            )
+            .collect();
+        for s in removed {
+            let disk = self.rt.disk();
+            let _ = disk.remove(&seg_path(&self.dir, s.meta.id)).await;
+            if disk.exists(&del_path(&self.dir, s.meta.id)).await? {
+                disk.remove(&del_path(&self.dir, s.meta.id)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -487,6 +605,8 @@ mod tests {
             log: LogConfig {
                 max_file_bytes: 4096,
             },
+            max_segments: 3,
+            max_deleted_fraction: 0.3,
         }
     }
 
@@ -502,6 +622,10 @@ mod tests {
                 st.write(&Command::Upsert(vec![doc(i, 1)])).await.unwrap();
             }
             assert!(st.segments().count() >= 2, "flushes expected");
+            assert!(
+                st.segments().count() <= 3,
+                "compaction policy bounds the segment count"
+            );
             st.write(&Command::Delete(vec![DocId(3), DocId(40)]))
                 .await
                 .unwrap();
@@ -646,5 +770,51 @@ mod tests {
             assert_eq!(st.get(DocId(39)).await.unwrap(), Some(doc(39, 5)));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_drops_deleted_rows_and_removes_old_files() {
+        let (sim, mut ex) = Simulation::new(5, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let mut st = Store::open(rt.clone(), "c", schema(), small_cfg())
+                .await
+                .unwrap();
+            for i in 1..=60u64 {
+                st.write(&Command::Upsert(vec![doc(i, 3)])).await.unwrap();
+            }
+            st.flush().await.unwrap();
+            let before: Vec<SegmentId> = st.segments().map(|s| s.id).collect();
+            // Delete half of everything: every segment crosses the deleted fraction.
+            st.write(&Command::Delete(
+                (1..=60).filter(|i| i % 2 == 0).map(DocId).collect(),
+            ))
+            .await
+            .unwrap();
+            st.flush().await.unwrap();
+            let after: Vec<SegmentId> = st.segments().map(|s| s.id).collect();
+            assert!(
+                before.iter().all(|id| !after.contains(id)),
+                "all stale segments rewritten"
+            );
+            let rows: u32 = st.segments().map(|s| s.doc_count).sum();
+            assert_eq!(rows, 30);
+            assert_eq!(st.approx_live_docs(), 30);
+            for i in 1..=60u64 {
+                let want = if i % 2 == 0 { None } else { Some(doc(i, 3)) };
+                assert_eq!(st.get(DocId(i)).await.unwrap(), want);
+            }
+            let files = rt.disk().list("c/segs").await.unwrap();
+            assert_eq!(
+                files.iter().filter(|f| f.ends_with(".seg")).count(),
+                after.len()
+            );
+            assert!(!files.iter().any(|f| f.ends_with(".tmp")));
+            drop(st);
+            let st = Store::open(rt.clone(), "c", schema(), small_cfg())
+                .await
+                .unwrap();
+            assert_eq!(st.approx_live_docs(), 30);
+        });
     }
 }

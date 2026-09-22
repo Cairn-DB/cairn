@@ -179,6 +179,64 @@ impl DocStore {
         Ok(doc)
     }
 
+    /// Reads every row (whole-section reads), skipping rows for which `skip(row)` is true.
+    pub async fn read_all<R: Runtime>(
+        &self,
+        reader: &SegmentReader<R>,
+        skip: impl Fn(u32) -> bool,
+    ) -> Result<Vec<Document>> {
+        let rows = self.docids.len();
+        let mut docs: Vec<Document> = (0..rows)
+            .filter(|r| !skip(*r as u32))
+            .map(|r| Document::new(DocId(self.docids[r]), self.schema.fields.len()))
+            .collect();
+        let kept: Vec<usize> = (0..rows).filter(|r| !skip(*r as u32)).collect();
+        for (i, f) in self.schema.fields.iter().enumerate() {
+            let nulls = reader.read_section(&format!("nulls.{i}")).await?;
+            if nulls.len() != rows {
+                return Err(Error::corruption("nulls section length"));
+            }
+            let col = reader.read_section(&format!("col.{i}")).await?;
+            match layout(&f.kind) {
+                Layout::Fixed(width) => {
+                    if col.len() != width * rows {
+                        return Err(Error::corruption(format!("column {i} length")));
+                    }
+                    for (out, &row) in docs.iter_mut().zip(&kept) {
+                        if nulls[row] != 0 {
+                            out.values[i] =
+                                Some(decode_fixed(&f.kind, &col[row * width..(row + 1) * width])?);
+                        }
+                    }
+                }
+                Layout::Var => {
+                    let base = 4 * (rows + 1);
+                    if col.len() < base {
+                        return Err(Error::corruption(format!("column {i} offsets")));
+                    }
+                    let off = |r: usize| {
+                        u32::from_le_bytes(col[4 * r..4 * r + 4].try_into().expect("4 bytes"))
+                            as usize
+                    };
+                    for (out, &row) in docs.iter_mut().zip(&kept) {
+                        if nulls[row] != 0 {
+                            let (start, end) = (off(row), off(row + 1));
+                            if end < start || base + end > col.len() {
+                                return Err(Error::corruption(format!(
+                                    "column {i} row {row} range"
+                                )));
+                            }
+                            let mut r = Reader::new(&col[base + start..base + end]);
+                            out.values[i] = Some(Value::decode(&mut r)?);
+                            r.finish()?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(docs)
+    }
+
     /// Reads one field of one row.
     pub async fn read_value<R: Runtime>(
         &self,

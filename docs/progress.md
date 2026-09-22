@@ -37,7 +37,9 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     (page-aligned sections, xxh3 per section, file hash, crc'd TOC), document columns, memtable,
     deletion sets (.del files via the manifest container), shard Store (log + memtable +
     segments + manifest; replay from manifest.applied_index). 120-seed crash test vs model.
-  - M1.4 IN PROGRESS: compaction.
+  - M1.4 DONE 2026-09-22: compaction (rewrite stale segments, merge smallest adjacent pair
+    when over max_segments), bulk column reads, orphan cleanup. 36 workspace tests.
+  - M1.5 + M1.6 IN PROGRESS: storage benchmarks, bench-gen v1.
 
 ## Next step
 M1.3 (see State). Then M1.4 compaction, M1.5 runtime spike + storage benchmarks, M1.6 bench-gen.
