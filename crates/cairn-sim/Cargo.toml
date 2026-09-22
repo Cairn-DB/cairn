@@ -1,0 +1,21 @@
+[package]
+name = "cairn-sim"
+description = "Deterministic simulation harness: seeded network, disk, clock, fault injection, linearizability checker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+rand.workspace = true
+rand_chacha.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

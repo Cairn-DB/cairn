@@ -1,0 +1,23 @@
+[package]
+name = "cairn-index"
+description = "Vector (filtered ANN), full-text and structured indexes over immutable segments."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+cairn-storage = { path = "../cairn-storage" }
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+hdrhistogram.workspace = true

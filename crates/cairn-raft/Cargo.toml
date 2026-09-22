@@ -1,0 +1,19 @@
+[package]
+name = "cairn-raft"
+description = "Raft integration: one group per logical shard, snapshot/segment shipping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+cairn-storage = { path = "../cairn-storage" }
+raft.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true

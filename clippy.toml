@@ -1,0 +1,24 @@
+# Determinism rules for engine crates (docs/adr/0011-determinism-rules.md).
+# Engine code (cairn-core, -storage, -index, -query, -raft) must go through the Clock / Rng / Disk /
+# Network / Spawn traits. Crates that own real I/O (cairn-runtime, cairn-server, cairn-bench-gen)
+# opt out with a crate-level `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
+
+disallowed-methods = [
+  { path = "std::time::SystemTime::now", reason = "use the Clock trait (ADR 0011)" },
+  { path = "std::time::Instant::now", reason = "use the Clock trait (ADR 0011)" },
+  { path = "std::thread::sleep", reason = "use Clock::sleep (ADR 0011)" },
+  { path = "std::thread::spawn", reason = "no threads in engine crates; use Spawn (ADR 0011)" },
+  { path = "std::fs::read", reason = "use the Disk trait (ADR 0011)" },
+  { path = "std::fs::write", reason = "use the Disk trait (ADR 0011)" },
+  { path = "std::fs::File::open", reason = "use the Disk trait (ADR 0011)" },
+  { path = "std::fs::File::create", reason = "use the Disk trait (ADR 0011)" },
+  { path = "std::net::TcpStream::connect", reason = "use the Network trait (ADR 0011)" },
+  { path = "std::net::TcpListener::bind", reason = "use the Network trait (ADR 0011)" },
+]
+
+disallowed-types = [
+  { path = "std::time::Instant", reason = "use cairn_core time types (ADR 0011)" },
+  { path = "std::time::SystemTime", reason = "use cairn_core time types (ADR 0011)" },
+  { path = "std::collections::HashMap", reason = "RandomState iteration order is nondeterministic; use cairn_core::HashMap (ADR 0011)" },
+  { path = "std::collections::HashSet", reason = "RandomState iteration order is nondeterministic; use cairn_core::HashSet (ADR 0011)" },
+]

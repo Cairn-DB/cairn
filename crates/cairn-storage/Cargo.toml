@@ -1,0 +1,25 @@
+[package]
+name = "cairn-storage"
+description = "Storage engine: WAL, memtable, immutable segments, compaction, checksums."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+thiserror.workspace = true
+bytes.workspace = true
+crc32fast.workspace = true
+xxhash-rust.workspace = true
+memmap2.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+loom.workspace = true

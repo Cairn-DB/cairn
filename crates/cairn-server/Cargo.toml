@@ -1,0 +1,23 @@
+[package]
+name = "cairn-server"
+description = "Cairn node binary: thread-per-core runtime, shard placement, client API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+cairn-storage = { path = "../cairn-storage" }
+cairn-index = { path = "../cairn-index" }
+cairn-query = { path = "../cairn-query" }
+cairn-raft = { path = "../cairn-raft" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# I/O runtime (glommio | monoio) is an open decision: add it here after ADR.

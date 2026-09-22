@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+/data
+/bench-results/*.tmp
+.DS_Store

@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/cairn-core",
+  "crates/cairn-storage",
+  "crates/cairn-index",
+  "crates/cairn-query",
+  "crates/cairn-raft",
+  "crates/cairn-sim",
+  "crates/cairn-server",
+  "tools/cairn-bench-gen",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/CHANGE-ME/cairn"
+
+# Versions verified against the crates.io index on 2026-09-21.
+# NOT compile-checked (no Rust toolchain was available when this scaffold was generated).
+# Phase 0 must run `cargo check --workspace` first and fix anything that breaks.
+[workspace.dependencies]
+# --- errors, logging, CLI ---
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6", features = ["derive"] }
+
+# --- data plumbing ---
+serde = { version = "1.0", features = ["derive"] }
+bytes = "1.12"
+crc32fast = "1.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+memmap2 = "0.9"
+
+# --- consensus (DECIDED: pure state machine, no I/O; see docs/adr/0001) ---
+# raft-rs 0.7 is old (last release 2023-03). Phase 0 verdict: see docs/adr/0008.
+# protobuf-codec is used because prost-codec needs a system `protoc` at build time.
+# raft-rs 0.7 is old: Phase 0 must confirm it is still a sound choice
+# (maintenance, prost vs protobuf codec, rand 0.8 coexisting with rand 0.10) or propose an alternative.
+raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+
+# --- randomness (seeded, deterministic simulation) ---
+rand = "0.10"
+rand_chacha = "0.10"
+
+# --- testing / benchmarking / fuzzing ---
+proptest = "1.11"
+criterion = "0.8"
+loom = "0.7"
+arbitrary = "1.4"
+libfuzzer-sys = "0.4"
+hdrhistogram = "7.6"
+
+# --- INTENTIONALLY NOT PINNED (open decisions, see SPEC.md section 5) ---
+# I/O runtime: glommio vs monoio (thread-per-core, io_uring)
+# Full-text: own BM25 vs tantivy
+# Filtered ANN: filtered HNSW vs DiskANN-style (Vamana)
+# SIMD: std::simd (nightly) vs `wide` vs hand-written intrinsics
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+debug = true
