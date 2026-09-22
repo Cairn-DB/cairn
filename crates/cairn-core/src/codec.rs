@@ -3,8 +3,8 @@
 //! Little-endian fixed-width integers, length-prefixed byte strings. Every read reports
 //! corruption instead of panicking, which is what makes the readers fuzzable.
 
+use crate::{Error, Result};
 use bytes::Bytes;
-use cairn_core::{Error, Result};
 
 /// Appends fields to a byte vector.
 #[derive(Default)]

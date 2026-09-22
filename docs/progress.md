@@ -33,8 +33,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     at first bad record, suffix/prefix truncation), codec, manifest store (tmp+sync+rename).
     Tests: 150-seed sim crash/recovery with torn writes, 400-case damaged-image proptest,
     manifest crash-at-any-point, real-fs roundtrip. 29 tests total.
-  - M1.3 IN PROGRESS: schema/document/command types, segment container, columns, memtable,
-    deletion sets, shard store with recovery.
+  - M1.3 DONE 2026-09-22: schema/document/command types (cairn-core), segment container
+    (page-aligned sections, xxh3 per section, file hash, crc'd TOC), document columns, memtable,
+    deletion sets (.del files via the manifest container), shard Store (log + memtable +
+    segments + manifest; replay from manifest.applied_index). 120-seed crash test vs model.
+  - M1.4 IN PROGRESS: compaction.
 
 ## Next step
 M1.3 (see State). Then M1.4 compaction, M1.5 runtime spike + storage benchmarks, M1.6 bench-gen.

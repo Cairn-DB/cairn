@@ -19,6 +19,7 @@ rustc-hash.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 xxhash-rust.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
