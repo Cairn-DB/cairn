@@ -25,3 +25,7 @@ cairn-sim = { path = "../cairn-sim" }
 proptest.workspace = true
 criterion.workspace = true
 loom.workspace = true
+
+[[bench]]
+name = "storage"
+harness = false

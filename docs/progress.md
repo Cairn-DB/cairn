@@ -39,10 +39,19 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     segments + manifest; replay from manifest.applied_index). 120-seed crash test vs model.
   - M1.4 DONE 2026-09-22: compaction (rewrite stale segments, merge smallest adjacent pair
     when over max_segments), bulk column reads, orphan cleanup. 36 workspace tests.
-  - M1.5 + M1.6 IN PROGRESS: storage benchmarks, bench-gen v1.
+  - M1.5 DONE 2026-09-22: criterion storage benchmarks on the NVMe, results in
+    `bench-results/phase1-storage.md` (fsync 2-4 ms dominates; 14.5k rec/s at batch 64;
+    100k-row segment build 120 ms). io_uring/glommio spike deferred to M4.2.
+  - M1.6 DONE 2026-09-22: cairn-bench-gen lib + CLI (flags at 50/10/1/0.1%, random or
+    cluster-correlated; realistic attrs; takedown schedule).
+- Phase 1: DONE 2026-09-22. Report: `docs/reports/phase-1.md`.
+- Phase 2: IN PROGRESS.
+  - M2.1 IN PROGRESS: kernels (scalar/AVX2/AVX-512, SQ8), proptest vs scalar, criterion bench.
 
 ## Next step
-M1.3 (see State). Then M1.4 compaction, M1.5 runtime spike + storage benchmarks, M1.6 bench-gen.
+M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
+level from hash of doc id), exact scan, filter bitmaps, selectivity-adaptive dispatch, SQ8 +
+rerank; SIFT1M loader in a new `tools/cairn-bench` crate; selectivity x correlation sweep.
 
 ## Previous step (kept for context)
 M1.2: `cairn-storage::log` (segmented files named by first index, header with magic/version,
@@ -61,6 +70,8 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
 (none yet)
 
 ## Log
+- 2026-09-22: Phase 1 closed (40 tests). Bench lesson: consumer NVMe fsync jitter makes
+  batch-1 vs batch-16 comparisons meaningless; only report group-commit throughput.
 - 2026-09-22: M1.2 done. Lesson: edition 2024 reserves `gen`; `truncate_suffix` below the
   first file's start must empty the file.
 - 2026-09-22: M1.1 done (executor, blocking runtime, simulator core). Lesson: with a seeded

@@ -10,11 +10,20 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cairn-bench-gen"
+path = "src/main.rs"
+
 [dependencies]
+cairn-core = { path = "../../crates/cairn-core" }
 anyhow.workspace = true
 clap.workspace = true
-rand.workspace = true
-rand_chacha.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
