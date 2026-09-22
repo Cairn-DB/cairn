@@ -1,6 +1,6 @@
 # ADR 0008: Raft — own minimal pure-state-machine Raft, `raft-rs` kept for differential testing
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O7; refines D4
 

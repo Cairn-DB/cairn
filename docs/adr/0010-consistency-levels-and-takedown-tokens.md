@@ -1,6 +1,6 @@
 # ADR 0010: Consistency levels and takedown tokens
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Refines: SPEC.md D6 and the "signature test" in section 7
 

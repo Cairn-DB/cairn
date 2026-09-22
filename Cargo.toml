@@ -41,7 +41,7 @@ memmap2 = "0.9"
 # protobuf-codec is used because prost-codec needs a system `protoc` at build time.
 # raft-rs 0.7 is old: Phase 0 must confirm it is still a sound choice
 # (maintenance, prost vs protobuf codec, rand 0.8 coexisting with rand 0.10) or propose an alternative.
-raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+# raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }  # optional Phase 3 oracle only (ADR 0012)
 
 # --- randomness (seeded, deterministic simulation) ---
 rand = "0.10"

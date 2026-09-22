@@ -1,6 +1,6 @@
 # ADR 0004: Segment format — single container file, columnar sections, SQ8 first
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O3
 

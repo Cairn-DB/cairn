@@ -1,6 +1,6 @@
 # ADR 0005: Full-text — own minimal BM25 over the Cairn segment format
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O4
 

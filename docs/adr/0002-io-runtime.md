@@ -1,6 +1,6 @@
 # ADR 0002: I/O runtime — own per-core executor over `io-uring`, reactor swappable for simulation
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O1
 

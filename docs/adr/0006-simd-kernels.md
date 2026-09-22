@@ -1,6 +1,6 @@
 # ADR 0006: SIMD strategy — hand-written kernels, runtime dispatch, scalar oracle
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O5
 

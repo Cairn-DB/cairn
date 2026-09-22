@@ -33,3 +33,24 @@ cargo bench -p cairn-index                     # criterion benchmarks
 - Tests added or updated, all green.
 - Docs updated (public items, ADR if a decision was made).
 - Benchmarks re-run if the change touches a hot path.
+
+## Autonomous delivery mode (in force since 2026-09-22)
+
+The owner delegated all decisions and will not intervene until a fully functional prototype is
+delivered. These rules amend the ones above for that period:
+
+- Read, in order: `SPEC.md`, this file, `docs/progress.md` (the journal: state, next step, open
+  problems). The journal is the hand-off between context windows; update it at every milestone and
+  whenever a non-obvious problem is solved. Never rely on conversation memory for state.
+- Decisions the owner would have taken are taken by the agent and recorded: ADR status
+  `accepted (delegated YYYY-MM-DD)`. Rule 8 (ask before heavy deps / format changes / phase exit)
+  becomes: decide, justify in an ADR or in `docs/progress.md`, proceed.
+- Phase gates are self-approved only with evidence: a report in `docs/reports/phase-N.md` with the
+  exact commands run, their results, and benchmark files under `bench-results/`.
+- Commit per milestone or smaller, on `main`, message says why, with the Co-Authored-By trailer.
+- Long jobs (> 2 min) run in the background with output to a file; poll, do not block.
+- Absolute paths in every shell command (parallel calls share one cwd).
+- No `sudo`, no system packages. Tooling is `rustup`/`cargo install` only.
+- Datasets live in `data/` (gitignored), fetched by `tools/fetch-datasets.sh` with checksums.
+- Hardware target for all benchmarks: this machine (see `docs/progress.md` "Environment").
+- Honesty rule unchanged: a missed target is reported as missed, in the report and the journal.

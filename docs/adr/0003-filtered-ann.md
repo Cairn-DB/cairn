@@ -1,6 +1,6 @@
 # ADR 0003: Filtered ANN — selectivity-adaptive search per immutable segment
 
-- Status: proposed
+- Status: accepted (delegated 2026-09-22, see ADR 0012)
 - Date: 2026-09-22
 - Resolves: SPEC.md O2
 
