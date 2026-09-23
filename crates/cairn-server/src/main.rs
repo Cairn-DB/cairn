@@ -47,6 +47,9 @@ struct Cli {
     /// Build disk-resident vector indexes (Vamana + PQ in RAM, blocks on disk; ADR 0014).
     #[arg(long)]
     disk_index: bool,
+    /// Vamana build passes (1: faster build; 2: DiskANN default).
+    #[arg(long, default_value_t = 2)]
+    vamana_passes: u32,
     /// Tiered compaction target in live rows per merged segment (0: pairwise policy only).
     #[arg(long, default_value_t = 0)]
     target_segment_rows: u32,
@@ -90,6 +93,7 @@ fn main() -> anyhow::Result<()> {
         max_segments: cli.max_segments,
         sq8_only: cli.sq8_only,
         disk_index: cli.disk_index,
+        vamana_passes: cli.vamana_passes,
         target_segment_rows: cli.target_segment_rows,
         compaction_slots: cli.compaction_slots,
         idle_flush_ms: cli.idle_flush_ms,
