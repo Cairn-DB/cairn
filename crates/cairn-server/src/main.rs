@@ -50,7 +50,7 @@ struct Cli {
     /// Tiered compaction target in live rows per merged segment (0: pairwise policy only).
     #[arg(long, default_value_t = 0)]
     target_segment_rows: u32,
-    /// Concurrent compactions on this node across all shards.
+    /// Concurrent index builds (flushes and compactions) on this node across all shards.
     #[arg(long, default_value_t = 2)]
     compaction_slots: usize,
     /// Flush an idle memtable after this many milliseconds without writes (0: never).

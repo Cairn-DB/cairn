@@ -100,7 +100,8 @@ pub struct ReplicaConfig {
     /// Flush a non-empty memtable after this many ticks without applied writes (0: never).
     /// Queries scan the memtable without a graph, so a large idle memtable costs every query.
     pub idle_flush_ticks: u32,
-    /// Shared bound on concurrent compactions (`None`: unbounded, one per replica).
+    /// Shared bound on concurrent index builds, flushes and compactions (`None`: unbounded,
+    /// one per replica).
     pub compaction_slots: Option<std::sync::Arc<JobSlots>>,
 }
 
@@ -545,6 +546,7 @@ impl<R: Runtime> Replica<R> {
             Event::QueryLegs(q, c, done) => self.read(Event::QueryLegs(q, c, done)).await?,
             Event::Get(id, c, done) => self.read(Event::Get(id, c, done)).await?,
             Event::FlushBuilt(job, docs, sections) => {
+                self.release_slot();
                 let sections = sections?;
                 self.engine
                     .store_mut()
@@ -854,7 +856,9 @@ impl<R: Runtime> Replica<R> {
         if self.engine.store().memtable_bytes() < self.cfg.engine.store.memtable_max_bytes {
             return Ok(());
         }
-        self.start_flush_job()
+        self.start_flush_job()?;
+        self.release_deferred();
+        Ok(())
     }
 
     /// Freezes the memtable and builds its indexes off the actor (`Runtime::offload`); the
@@ -863,7 +867,16 @@ impl<R: Runtime> Replica<R> {
         if self.engine.store().job_active() {
             return Ok(());
         }
+        // Flush builds share the node's slots with compactions: each build holds its rows,
+        // their vectors and the new graph in memory at once.
+        if let Some(slots) = &self.cfg.compaction_slots {
+            if !slots.try_acquire() {
+                return Ok(());
+            }
+            self.holds_slot = true;
+        }
         let Some(mut job) = self.engine.store_mut().begin_flush() else {
+            self.release_slot();
             return Ok(());
         };
         // The build owns the documents and hands them back; `finish_flush` takes them as an
@@ -898,12 +911,11 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
-    /// Write backpressure: while a flush is building, the active memtable keeps filling; past
-    /// twice its threshold, new proposals wait for the build. Without it, ingest faster than
-    /// index builds grows the memtable (and the in-memory Raft log) without bound.
+    /// Write backpressure: while a flush builds (or waits for a build slot), the active
+    /// memtable keeps filling; past twice its threshold, new proposals wait. Without it, ingest
+    /// faster than index builds grows the memtable (and the in-memory Raft log) without bound.
     fn over_write_limit(&self) -> bool {
-        let st = self.engine.store();
-        st.job_active() && st.memtable_bytes() >= 2 * self.cfg.engine.store.memtable_max_bytes
+        self.engine.store().memtable_bytes() >= 2 * self.cfg.engine.store.memtable_max_bytes
     }
 
     /// Releases held-back proposals while under the limit.
@@ -951,8 +963,16 @@ impl<R: Runtime> Replica<R> {
         {
             return self.start_flush_job();
         }
-        if self.cfg.compaction_slots.is_some() && self.ticks % 20 == 0 {
-            self.maybe_compact_job().await?;
+        if self.cfg.compaction_slots.is_some() && !self.engine.store().job_active() {
+            // A flush may be waiting for a build slot.
+            if self.engine.store().memtable_bytes() >= self.cfg.engine.store.memtable_max_bytes {
+                self.start_flush_job()?;
+                self.release_deferred();
+                return Ok(());
+            }
+            if self.ticks % 20 == 0 {
+                self.maybe_compact_job().await?;
+            }
         }
         Ok(())
     }
