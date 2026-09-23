@@ -30,11 +30,13 @@ Option 2, as a third *residency* of `VectorIndex`: `memory` (f32 + SQ8 + HNSW, t
 `sq8` (ADR 0013), and `disk`.
 
 - **PQ.** M = dims / 4 subspaces with 256 centroids each (one byte per subspace), trained per
-  segment by seeded k-means on at most 64k rows. Queries build an M × 256 distance table
+  segment by seeded k-means (6 iterations) on at most 16k evenly spaced rows. Queries build an M × 256 distance table
   (asymmetric distance). About 32 B per row stay in RAM at 128-d, 48 B at 192-d.
-- **Vamana.** Max degree R = 48, build list L = 96, alpha 1.2. The start node is the medoid. Two
-  passes (alpha 1, then alpha), with rows inserted in row order and a seeded tie-break, so the
-  build is deterministic (ADR 0001/D1: replicas build identical graphs).
+- **Vamana.** Max degree R = 48, build list L = 96, alpha 1.2. The start node is the medoid. By
+  default two passes (alpha 1, then alpha); `passes = 1` builds about 1.5 times faster with
+  the same recall on SIFT (100k rows, 0.989 at L = 100 either way). Rows are inserted in row
+  order with ties broken on row ids, so the build is deterministic (ADR 0001/D1: replicas
+  build identical graphs).
 - **Disk layout.** Section `vamana.<field>`: a header, then fixed-size node blocks
   `[f32 × dims][u32 degree][u32 × R]`, packed so that no block straddles a 4 KiB page.
   Section `pq.<field>`: the codebooks and the codes.
@@ -66,6 +68,7 @@ Option 2, as a third *residency* of `VectorIndex`: `memory` (f32 + SQ8 + HNSW, t
 ## Measured (2026-09-23)
 
 `bench-results/phase4-diskann-sift1m.md`, one 1M-row SIFT segment, single thread:
+- These in-process numbers use `passes = 1`; the servers use the default (2 passes).
 - recall@10 0.983 at L = 100, 0.989 at L = 128. Warm p50 0.49 / 0.62 ms, and fully cold
   p50 13 / 17 ms.
 - 33 B per row in RAM, 819 B per row of blocks on disk. The build runs at 3.1k rows/s per

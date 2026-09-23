@@ -438,6 +438,8 @@ pub fn scale_bench(a: ScaleArgs) -> anyhow::Result<()> {
                 let writers = a.writers;
                 s.spawn(move || {
                     let mut client = Client::new(addrs);
+                    // Writes may wait for an index build under backpressure.
+                    client.timeout = Duration::from_secs(300);
                     let mut docs = Vec::with_capacity(batch);
                     let mut i = w * batch;
                     // Writers take whole batches round-robin so each batch is contiguous.
