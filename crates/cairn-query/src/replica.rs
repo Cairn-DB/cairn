@@ -794,10 +794,12 @@ impl<R: Runtime> Replica<R> {
         if self.engine.store().job_active() {
             return Ok(());
         }
-        let Some(job) = self.engine.store_mut().begin_flush() else {
+        let Some(mut job) = self.engine.store_mut().begin_flush() else {
             return Ok(());
         };
-        let docs = job.docs.clone();
+        // The build owns the documents and hands them back; `finish_flush` takes them as an
+        // argument, so the job need not keep a second copy of the frozen memtable.
+        let docs = std::mem::take(&mut job.docs);
         let schema = self.engine.schema().clone();
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,

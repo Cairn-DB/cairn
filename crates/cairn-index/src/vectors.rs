@@ -80,7 +80,23 @@ impl Vectors {
         self.sq8.is_some()
     }
 
-    /// One row.
+    /// Whether the f32 rows are resident (see [`Vectors::drop_f32`]).
+    pub fn has_f32(&self) -> bool {
+        self.n == 0 || !self.f32.is_empty()
+    }
+
+    /// Frees the f32 rows when an SQ8 copy exists, keeping only the codes in memory. Scoring
+    /// then uses SQ8 everywhere: "exact" requests and reranking fall back to SQ8 distances.
+    /// Returns whether the rows were dropped.
+    pub fn drop_f32(&mut self) -> bool {
+        if self.sq8.is_none() || self.n == 0 {
+            return false;
+        }
+        self.f32 = Vec::new();
+        true
+    }
+
+    /// One row. Panics if the f32 rows were dropped.
     pub fn row_f32(&self, row: u32) -> &[f32] {
         &self.f32[row as usize * self.dims..(row as usize + 1) * self.dims]
     }
@@ -127,7 +143,7 @@ impl Vectors {
     ) {
         debug_assert_eq!(rows.len(), out.len());
         let d = self.dims;
-        match (&self.sq8, exact) {
+        match (&self.sq8, exact && self.has_f32()) {
             (Some((q8, params)), false) => {
                 gather_u8.clear();
                 gather_u8.reserve(rows.len() * d);
@@ -160,7 +176,7 @@ impl Vectors {
     pub fn distances_range(&self, q: &[f32], start: u32, exact: bool, out: &mut [f32]) {
         let d = self.dims;
         let (s, e) = (start as usize * d, (start as usize + out.len()) * d);
-        match (&self.sq8, exact) {
+        match (&self.sq8, exact && self.has_f32()) {
             (Some((q8, params)), false) => match self.metric {
                 Metric::L2 => {
                     kernels::l2_sq_u8_batch(q, &q8[s..e], &params.min, &params.scale, out)

@@ -38,6 +38,9 @@ struct Cli {
     /// Compact a shard once it holds more than this many segments.
     #[arg(long, default_value_t = 8)]
     max_segments: usize,
+    /// Keep only SQ8 codes and graphs of loaded segments in memory (no exact f32 rerank).
+    #[arg(long)]
+    sq8_only: bool,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -69,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         schema,
         memtable_max_bytes: cli.memtable_bytes,
         max_segments: cli.max_segments,
+        sq8_only: cli.sq8_only,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

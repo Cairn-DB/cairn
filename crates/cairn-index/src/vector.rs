@@ -22,6 +22,10 @@ pub struct VectorIndexParams {
     pub scan_max_fraction: f32,
     /// Use two-hop expansion when the filter passes less than this fraction.
     pub two_hop_below_fraction: f32,
+    /// Keep the f32 rows of loaded segments in memory for exact reranking. When false (and SQ8
+    /// is on), only the SQ8 codes and the graph stay resident: about a quarter of the memory,
+    /// at the cost of SQ8-only scoring. Builds always use f32.
+    pub keep_f32: bool,
 }
 
 impl Default for VectorIndexParams {
@@ -34,6 +38,7 @@ impl Default for VectorIndexParams {
             // Two-hop expansion lost to plain graph search everywhere in the SIFT1M sweep
             // (bench-results/phase2-sift1m.md); disabled unless forced.
             two_hop_below_fraction: 0.0,
+            keep_f32: true,
         }
     }
 }
@@ -191,7 +196,10 @@ impl VectorIndex {
         } else {
             None
         };
-        let vectors = Vectors::from_rows_and_sq8(metric, dims, rows, sq8.as_deref())?;
+        let mut vectors = Vectors::from_rows_and_sq8(metric, dims, rows, sq8.as_deref())?;
+        if !params.keep_f32 {
+            vectors.drop_f32();
+        }
         let hnsw_name = format!("hnsw.{field}");
         let hnsw = if reader.has_section(&hnsw_name) {
             let h = Hnsw::decode(&reader.read_section(&hnsw_name).await?)?;
@@ -295,7 +303,7 @@ impl VectorIndex {
                     opts,
                     &mut scratch,
                 );
-                if self.vectors.has_sq8() && !q.exact {
+                if self.vectors.has_sq8() && self.vectors.has_f32() && !q.exact {
                     let rows: Vec<u32> = cands.iter().map(|c| c.1).collect();
                     let mut d = vec![0f32; rows.len()];
                     let (mut g8, mut g32) = (Vec::new(), Vec::new());
@@ -391,6 +399,48 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn sq8_only_residency_answers_every_path() {
+        let (full, _) = build(5, 5_000, 16, 20, true);
+        let (mut lean, _) = build(5, 5_000, 16, 20, true);
+        assert!(lean.vectors.drop_f32());
+        assert!(!lean.vectors().has_f32());
+        let mut filter = Bitmap::empty(5_000);
+        for r in (0..5_000).step_by(3) {
+            filter.set(r);
+        }
+        let qs = queries(&full, 6, 50);
+        let mut total = 0.0;
+        let mut cases = 0.0;
+        for q in &qs {
+            for (f, force, exact) in [
+                (None, Some(Strategy::Hnsw), false),
+                (None, Some(Strategy::Scan), false),
+                (Some(&filter), Some(Strategy::Scan), true),
+                (Some(&filter), Some(Strategy::Hnsw), false),
+            ] {
+                let truth = brute(full.vectors(), q, 10, f);
+                let (got, _) = lean
+                    .search(
+                        q,
+                        f,
+                        VectorQuery {
+                            force,
+                            exact,
+                            ..VectorQuery::new(10)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(got.len(), 10);
+                assert!(got.windows(2).all(|w| w[0].0 <= w[1].0));
+                total += recall(&got, &truth);
+                cases += 1.0;
+            }
+        }
+        let r = total / cases;
+        assert!(r > 0.9, "SQ8-only recall {r}");
     }
 
     #[test]

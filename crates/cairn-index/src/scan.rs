@@ -81,7 +81,7 @@ pub fn exact_scan(
     rerank: usize,
 ) -> Vec<(f32, u32)> {
     let n = vectors.len();
-    let use_sq8 = vectors.has_sq8() && !exact;
+    let use_sq8 = vectors.has_sq8() && (!exact || !vectors.has_f32());
     let k_first = if use_sq8 { rerank.max(k) } else { k };
     let mut top = TopK::new(k_first);
     let mut rows: Vec<u32> = Vec::with_capacity(CHUNK);
@@ -122,8 +122,8 @@ pub fn exact_scan(
         }
     }
     let first = top.into_sorted();
-    if !use_sq8 {
-        return first;
+    if !use_sq8 || !vectors.has_f32() {
+        return first.into_iter().take(k).collect();
     }
     let rows: Vec<u32> = first.iter().map(|(_, r)| *r).collect();
     let mut exact_d = vec![0f32; rows.len()];

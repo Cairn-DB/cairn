@@ -38,6 +38,8 @@ pub struct NodeConfig {
     pub memtable_max_bytes: usize,
     /// Compact a shard once it holds more than this many segments.
     pub max_segments: usize,
+    /// Keep only SQ8 codes and graphs of loaded segments in memory (no f32 rerank).
+    pub sq8_only: bool,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -216,7 +218,10 @@ impl Node {
                         log: LogConfig::default(),
                         ..StoreConfig::default()
                     },
-                    ..EngineConfig::default()
+                    vector: cairn_index::VectorIndexParams {
+                        keep_f32: !cfg.sq8_only,
+                        ..cairn_index::VectorIndexParams::default()
+                    },
                 },
                 dir: format!("shard{s}"),
                 seed: u64::from(cfg.id.get()) * 1000 + u64::from(s),
