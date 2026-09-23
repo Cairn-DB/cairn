@@ -59,7 +59,8 @@ impl JobSlots {
         }
     }
 
-    fn try_acquire(&self) -> bool {
+    /// Takes a slot if one is free.
+    pub fn try_acquire(&self) -> bool {
         use std::sync::atomic::Ordering;
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
@@ -68,7 +69,8 @@ impl JobSlots {
             .is_ok()
     }
 
-    fn release(&self) {
+    /// Returns a slot.
+    pub fn release(&self) {
         self.used.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -995,6 +997,18 @@ impl<R: Runtime> Replica<R> {
     /// Background upkeep on ticks: flush an idle memtable, and retry a compaction that was
     /// waiting for a free slot.
     async fn on_idle_tick(&mut self) -> Result<()> {
+        // Held-back proposals are retried on every tick, not only after a flush: a replica that
+        // lost leadership while holding them would otherwise keep clients waiting until their
+        // timeout (seen on GCP). On a follower, `propose` fails them with a leader hint.
+        if !self.deferred.is_empty() {
+            if self.raft.role() != Role::Leader {
+                for (cmd, done) in self.deferred.drain(..).collect::<Vec<_>>() {
+                    self.propose(cmd, done);
+                }
+            } else {
+                self.release_deferred();
+            }
+        }
         let idle = u64::from(self.cfg.idle_flush_ticks);
         if idle > 0
             && self.ticks - self.last_apply_tick >= idle

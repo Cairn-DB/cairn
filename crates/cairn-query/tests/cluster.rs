@@ -379,3 +379,106 @@ fn leader_crash_reelection_and_snapshot_catch_up() {
     let digest = sim.digest();
     assert_ne!(digest, 0);
 }
+
+/// A leader holding proposals back (memtable over its limit, no build slot free) that loses
+/// leadership must fail them promptly with a leader hint, not keep clients waiting until
+/// their timeout (seen on a real cluster).
+#[test]
+fn held_back_proposals_fail_over_when_leadership_is_lost() {
+    use cairn_query::JobSlots;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(4, SimConfig::default());
+    let memtable = 3000;
+    // Every node's only build slot is held by the test: no flush can start.
+    let slots: Vec<std::sync::Arc<JobSlots>> = (0..3)
+        .map(|_| {
+            let s = std::sync::Arc::new(JobSlots::new(1));
+            assert!(s.try_acquire());
+            s
+        })
+        .collect();
+    let mut handles: Vec<ReplicaHandle> = Vec::new();
+    for n in 1..=3u32 {
+        let mut cfg = config(NodeId(n), memtable);
+        cfg.compaction_slots = Some(slots[(n - 1) as usize].clone());
+        let h = ex.block_on({
+            let sim = sim.clone();
+            let hh = ex.handle();
+            async move {
+                Replica::spawn(sim.runtime(NodeId(n), &hh), cfg, schema())
+                    .await
+                    .unwrap()
+            }
+        });
+        handles.push(h);
+    }
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let li = ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move {
+            let li = wait_leader(&rt, &hs).await;
+            // Fill the leader's memtable to twice its threshold (writes past it are held).
+            for i in 1..=200u64 {
+                let st = hs[li].status().await.unwrap();
+                if st.memtable_bytes >= 2 * memtable as u64 {
+                    break;
+                }
+                propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            }
+            li
+        }
+    });
+    // This proposal is held back by the leader.
+    let result: Rc<RefCell<Option<cairn_core::Result<Token>>>> = Rc::new(RefCell::new(None));
+    {
+        let (h, r) = (handles[li].clone(), result.clone());
+        rt.spawn(async move {
+            *r.borrow_mut() = Some(h.propose(Command::Upsert(vec![doc(1000)])).await);
+        });
+    }
+    ex.block_on({
+        let rt = rt.clone();
+        async move { rt.sleep(Duration::from_millis(200)).await }
+    });
+    let st = ex
+        .block_on({
+            let h = handles[li].clone();
+            async move { h.status().await }
+        })
+        .unwrap();
+    assert!(
+        result.borrow().is_none(),
+        "the proposal should be held back"
+    );
+    assert!(st.queued[0] > 0, "held back: {:?}", st.queued);
+    // Isolate the leader; the others elect a new one; heal so the old leader learns the term.
+    let old = NodeId(li as u32 + 1);
+    for n in 1..=3u32 {
+        if NodeId(n) != old {
+            sim.block(old, NodeId(n));
+            sim.block(NodeId(n), old);
+        }
+    }
+    ex.block_on({
+        let rt = rt.clone();
+        async move { rt.sleep(Duration::from_millis(1500)).await }
+    });
+    for n in 1..=3u32 {
+        sim.unblock(old, NodeId(n));
+        sim.unblock(NodeId(n), old);
+    }
+    ex.block_on({
+        let rt = rt.clone();
+        async move { rt.sleep(Duration::from_millis(1000)).await }
+    });
+    let got = result.borrow_mut().take();
+    match got {
+        Some(Err(cairn_core::Error::NotLeader { .. })) => {}
+        other => panic!("held-back proposal should fail over with NotLeader, got {other:?}"),
+    }
+    for s in &slots {
+        s.release();
+    }
+}
