@@ -1029,6 +1029,7 @@ impl<R: Runtime> Replica<R> {
                 return Err(e);
             }
         };
+        tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, inputs = ?job.inputs, rows = job.docs.len(), "compaction started");
         let schema = self.engine.schema().clone();
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,

@@ -164,6 +164,9 @@ enum Cmd {
         /// Skip ingest (cluster already loaded).
         #[arg(long)]
         skip_ingest: bool,
+        /// First row to ingest (resume a partial load).
+        #[arg(long, default_value_t = 0)]
+        start: usize,
         /// File with server pids, for memory reporting.
         #[arg(long)]
         pids: Option<PathBuf>,
@@ -582,6 +585,7 @@ fn main() -> anyhow::Result<()> {
             takedowns,
             settle_secs,
             skip_ingest,
+            start,
             pids,
             out,
         } => scale::scale_bench(scale::ScaleArgs {
@@ -603,6 +607,7 @@ fn main() -> anyhow::Result<()> {
             takedowns,
             settle_secs,
             skip_ingest,
+            start,
             pids,
             out,
         }),

@@ -101,6 +101,8 @@ pub struct ScaleArgs {
     pub settle_secs: u64,
     /// Skip ingest (the cluster already holds the data).
     pub skip_ingest: bool,
+    /// First row to ingest (resume a partial load; earlier rows must already be there).
+    pub start: usize,
     /// File with the server pids (one per line), for memory reporting.
     pub pids: Option<PathBuf>,
     /// Output markdown.
@@ -435,13 +437,14 @@ pub fn scale_bench(a: ScaleArgs) -> anyhow::Result<()> {
                 );
                 let dataset = a.dataset;
                 let batch = a.batch;
+                let start = a.start;
                 let writers = a.writers;
                 s.spawn(move || {
                     let mut client = Client::new(addrs);
                     // Writes may wait for an index build under backpressure.
                     client.timeout = Duration::from_secs(300);
                     let mut docs = Vec::with_capacity(batch);
-                    let mut i = w * batch;
+                    let mut i = start + w * batch;
                     // Writers take whole batches round-robin so each batch is contiguous.
                     while i < base.n {
                         for r in i..(i + batch).min(base.n) {
@@ -505,14 +508,16 @@ pub fn scale_bench(a: ScaleArgs) -> anyhow::Result<()> {
         let secs = t.elapsed().as_secs_f64();
         let h = Arc::try_unwrap(lat).unwrap().into_inner().unwrap();
         eprintln!(
-            "ingested {} in {secs:.0}s ({:.0} docs/s)",
+            "ingested rows {}..{} in {secs:.0}s ({:.0} docs/s)",
+            a.start,
             base.n,
-            base.n as f64 / secs
+            (base.n - a.start) as f64 / secs
         );
         ingest_line = format!(
-            "| ingest throughput | {:.0} docs/s ({:.0} s for {} rows) |",
-            base.n as f64 / secs,
+            "| ingest throughput | {:.0} docs/s ({:.0} s for rows {}..{}) |",
+            (base.n - a.start) as f64 / secs,
             secs,
+            a.start,
             base.n
         );
         batch_line = format!(
