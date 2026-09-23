@@ -293,12 +293,19 @@ struct SnapshotFetch {
     last_index: LogIndex,
     from: NodeId,
     needed: Vec<String>,
-    got: HashMap<String, Vec<u8>>,
-    partial: HashMap<String, (u64, Vec<u8>)>,
+    /// Files completely fetched (streamed to their staging files and synced).
+    got: Vec<String>,
+    /// Bytes received so far per file still being fetched.
+    partial: HashMap<String, u64>,
     req: u64,
 }
 
 const CHUNK: usize = 256 * 1024;
+
+/// A leader keeps log entries a follower has not matched yet, up to this many payload bytes,
+/// instead of compacting them at a flush: a follower one flush behind then catches up from
+/// the log rather than through a snapshot (which ships segment files).
+const RETAIN_LOG_BYTES: usize = 256 << 20;
 
 /// The actor. Create with [`Replica::spawn`].
 pub struct Replica<R: Runtime> {
@@ -571,7 +578,7 @@ impl<R: Runtime> Replica<R> {
                         .raft
                         .term_at(up_to)
                         .unwrap_or(self.raft.snapshot_term());
-                    self.raft.compact(Snapshot {
+                    self.compact_raft_log(Snapshot {
                         last_index: up_to,
                         last_term: term,
                         data: self.engine.store().manifest_bytes(),
@@ -698,14 +705,13 @@ impl<R: Runtime> Replica<R> {
                 if !path.starts_with("segs/") || path.contains("..") {
                     return Ok(());
                 }
-                let data = self.engine.store().read_file(&path).await?;
-                let (total, chunk) = match data {
-                    None => (u64::MAX, Bytes::new()),
-                    Some(d) => {
-                        let end = (offset as usize + CHUNK).min(d.len());
-                        (d.len() as u64, d.slice((offset as usize).min(d.len())..end))
-                    }
-                };
+                // One chunk read per request: never the whole (possibly very large) file.
+                let data = self
+                    .engine
+                    .store()
+                    .read_file_range(&path, offset, CHUNK)
+                    .await?;
+                let (total, chunk) = data.unwrap_or((u64::MAX, Bytes::new()));
                 self.send(
                     from,
                     FrameBody::FileChunk {
@@ -928,6 +934,22 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
+    /// Compacts the in-memory Raft log to `snap`, unless this leader still has a follower
+    /// behind it and the log is under [`RETAIN_LOG_BYTES`]: then it only offers the new
+    /// snapshot and keeps the entries.
+    fn compact_raft_log(&mut self, snap: Snapshot) {
+        let keep = self
+            .raft
+            .min_follower_matched()
+            .is_some_and(|m| m < snap.last_index)
+            && self.raft.log_bytes() < RETAIN_LOG_BYTES;
+        if keep {
+            self.raft.offer_snapshot(snap);
+        } else {
+            self.raft.compact(snap);
+        }
+    }
+
     async fn after_publish(&mut self) -> Result<()> {
         self.engine.refresh().await?;
         let up_to = self.engine.store().manifest().applied_index;
@@ -940,7 +962,7 @@ impl<R: Runtime> Replica<R> {
                 last_term: term,
                 data: self.engine.store().manifest_bytes(),
             };
-            self.raft.compact(snap);
+            self.compact_raft_log(snap);
             self.state.snapshot_term = term;
             self.state_store.store(&self.state).await?;
         }
@@ -1036,7 +1058,7 @@ impl<R: Runtime> Replica<R> {
 
     async fn start_fetch(&mut self, s: Snapshot) -> Result<()> {
         let m: cairn_storage::ShardManifest = ManifestStore::<R>::decode(&s.data)?;
-        let needed = Store::<R>::snapshot_files(&m);
+        let needed = self.engine.store().snapshot_files_needed(&m);
         let from = self.raft.leader().unwrap_or(self.cfg.id);
         tracing::info!(node = %self.cfg.id, %from, last_index = %s.last_index, segments = ?m.segments.iter().map(|x| x.id.get()).collect::<Vec<_>>(), "fetching snapshot");
         let req = self.next_read;
@@ -1046,7 +1068,7 @@ impl<R: Runtime> Replica<R> {
             last_index: s.last_index,
             from,
             needed: needed.clone(),
-            got: HashMap::default(),
+            got: Vec::new(),
             partial: HashMap::default(),
             req,
         };
@@ -1055,7 +1077,7 @@ impl<R: Runtime> Replica<R> {
             return self.finish_fetch().await;
         }
         for p in &needed {
-            fetch.partial.insert(p.clone(), (0, Vec::new()));
+            fetch.partial.insert(p.clone(), 0);
             self.send(
                 from,
                 FrameBody::FetchFile {
@@ -1085,7 +1107,7 @@ impl<R: Runtime> Replica<R> {
         if f.req != req || f.from != from {
             return Ok(());
         }
-        let Some((have, buf)) = f.partial.get_mut(&path) else {
+        let Some(have) = f.partial.get(&path).copied() else {
             return Ok(());
         };
         if total == u64::MAX {
@@ -1099,20 +1121,30 @@ impl<R: Runtime> Replica<R> {
             // Missing deletion checkpoint: optional.
             f.partial.remove(&path);
             f.needed.retain(|p| *p != path);
-        } else if offset == *have {
-            buf.extend_from_slice(&data);
-            *have += data.len() as u64;
-            if *have >= total {
-                let (_, buf) = f.partial.remove(&path).expect("present");
-                f.got.insert(path.clone(), buf);
+        } else if offset == have {
+            // Stream to the staging file: a catch-up never holds whole segments in memory.
+            let len = data.len() as u64;
+            self.engine
+                .store()
+                .write_fetch_chunk(&path, offset, data)
+                .await?;
+            let have = have + len;
+            if have >= total || len == 0 {
+                self.engine.store().sync_fetched(&path).await?;
+                if let Some(f) = self.fetch.as_mut() {
+                    f.partial.remove(&path);
+                    f.got.push(path.clone());
+                }
             } else {
-                let next = *have;
+                if let Some(f) = self.fetch.as_mut() {
+                    f.partial.insert(path.clone(), have);
+                }
                 self.send(
                     from,
                     FrameBody::FetchFile {
                         req,
                         path,
-                        offset: next,
+                        offset: have,
                     },
                 )
                 .await;
@@ -1130,10 +1162,11 @@ impl<R: Runtime> Replica<R> {
         let Some(f) = self.fetch.take() else {
             return Ok(());
         };
-        let files: Vec<(String, Bytes)> = f
+        let files: Vec<String> = f
             .needed
             .iter()
-            .filter_map(|p| f.got.get(p).map(|b| (p.clone(), Bytes::from(b.clone()))))
+            .filter(|p| f.got.contains(p))
+            .cloned()
             .collect();
         self.engine
             .store_mut()

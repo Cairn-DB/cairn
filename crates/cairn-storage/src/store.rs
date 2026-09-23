@@ -859,6 +859,77 @@ impl<R: Runtime> Store<R> {
         v
     }
 
+    /// Files a follower must fetch to install `manifest`: every deletion checkpoint, and the
+    /// segment files it does not already hold with the same length and hash. Segments are
+    /// immutable and named by id, so matching metadata means identical bytes; re-shipping them
+    /// is what made catch-up copy the whole shard.
+    pub fn snapshot_files_needed(&self, manifest: &ShardManifest) -> Vec<String> {
+        let mut v = Vec::new();
+        for s in &manifest.segments {
+            let have = self.segments.iter().any(|o| {
+                o.meta.id == s.id
+                    && o.meta.file_len == s.file_len
+                    && o.meta.file_hash == s.file_hash
+            });
+            if !have {
+                v.push(format!("segs/{:016x}.seg", s.id.get()));
+            }
+            v.push(format!("segs/{:016x}.del", s.id.get()));
+        }
+        v
+    }
+
+    /// Reads up to `len` bytes at `offset` of a shard file (for shipping in chunks, without
+    /// reading the whole file); `None` if the file does not exist. Returns the file length too.
+    pub async fn read_file_range(
+        &self,
+        rel: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<(u64, bytes::Bytes)>> {
+        let disk = self.rt.disk();
+        let path = format!("{}/{rel}", self.dir);
+        if !disk.exists(&path).await? {
+            return Ok(None);
+        }
+        let f = disk.open(&path, cairn_core::OpenMode::Read).await?;
+        let total = disk.len(&f).await?;
+        let start = offset.min(total);
+        let n = (total - start).min(len as u64) as usize;
+        Ok(Some((total, disk.read_at(&f, start, n).await?)))
+    }
+
+    /// Writes one fetched chunk of `rel` into its staging file (`<rel>.fetch`); the first
+    /// chunk (offset 0) truncates any leftover from an earlier attempt.
+    pub async fn write_fetch_chunk(
+        &self,
+        rel: &str,
+        offset: u64,
+        data: bytes::Bytes,
+    ) -> Result<()> {
+        let disk = self.rt.disk();
+        let path = format!("{}/{rel}.fetch", self.dir);
+        let mode = if offset == 0 {
+            cairn_core::OpenMode::CreateTruncate
+        } else {
+            cairn_core::OpenMode::CreateOrOpen
+        };
+        let f = disk.open(&path, mode).await?;
+        disk.write_at(&f, offset, data).await
+    }
+
+    /// Makes a completely fetched staging file durable.
+    pub async fn sync_fetched(&self, rel: &str) -> Result<()> {
+        let disk = self.rt.disk();
+        let f = disk
+            .open(
+                &format!("{}/{rel}.fetch", self.dir),
+                cairn_core::OpenMode::ReadWrite,
+            )
+            .await?;
+        disk.sync(&f).await
+    }
+
     /// Reads a file of this shard (for shipping), relative to the shard directory.
     pub async fn read_file(&self, rel: &str) -> Result<Option<bytes::Bytes>> {
         let disk = self.rt.disk();
@@ -871,29 +942,21 @@ impl<R: Runtime> Store<R> {
         Ok(Some(disk.read_at(&f, 0, len as usize).await?))
     }
 
-    /// Replaces the whole shard state with a snapshot: `files` are `(relative path, bytes)`
-    /// listed by [`Store::snapshot_files`] (missing deletion files are skipped), `manifest`
-    /// the encoded manifest. The log is reset to start after the manifest's applied index
+    /// Replaces the whole shard state with a snapshot: `fetched` lists the files (relative
+    /// paths, from [`Store::snapshot_files_needed`]) already streamed to their `.fetch` staging
+    /// files with [`Store::write_fetch_chunk`] and synced; segments the node already held are
+    /// reused. `manifest` is the encoded manifest. The log is reset to start after the manifest's applied index
     /// unless it already does.
-    pub async fn install_snapshot(
-        &mut self,
-        manifest: &[u8],
-        files: Vec<(String, bytes::Bytes)>,
-    ) -> Result<()> {
+    pub async fn install_snapshot(&mut self, manifest: &[u8], fetched: Vec<String>) -> Result<()> {
         let m: ShardManifest = ManifestStore::<R>::decode(manifest)?;
         if m.schema != self.manifest.schema {
             return Err(Error::Schema("snapshot schema differs".into()));
         }
         let disk = self.rt.disk();
-        for (rel, bytes) in files {
+        // Fetched files were streamed to `<rel>.fetch` and synced; publish them by rename.
+        for rel in fetched {
             let path = format!("{}/{rel}", self.dir);
-            let tmp = format!("{path}.tmp");
-            let f = disk
-                .open(&tmp, cairn_core::OpenMode::CreateTruncate)
-                .await?;
-            disk.write_at(&f, 0, bytes).await?;
-            disk.sync(&f).await?;
-            disk.rename(&tmp, &path).await?;
+            disk.rename(&format!("{path}.fetch"), &path).await?;
         }
         self.manifest_store.store(&m).await?;
         self.segments.clear();

@@ -550,6 +550,36 @@ impl Raft {
         }
     }
 
+    /// Lowest index matched by a follower (leader only; `None` otherwise or alone).
+    pub fn min_follower_matched(&self) -> Option<LogIndex> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        self.progress
+            .iter()
+            .filter(|(p, _)| **p != self.cfg.id)
+            .map(|(_, x)| x.matched)
+            .min()
+    }
+
+    /// Payload bytes of the entries held in memory.
+    pub fn log_bytes(&self) -> usize {
+        self.entries.iter().map(|e| e.payload.len()).sum()
+    }
+
+    /// Replaces the snapshot offered to lagging followers without dropping log entries (the
+    /// leader keeps entries a slow follower still needs, see [`Raft::compact`]).
+    pub fn offer_snapshot(&mut self, snapshot: Snapshot) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|s| snapshot.last_index >= s.last_index)
+            && snapshot.last_index <= self.last_index()
+        {
+            self.snapshot = Some(snapshot);
+        }
+    }
+
     /// Installs the local snapshot offered to lagging followers and drops in-memory entries up
     /// to its index (the driver truncated the on-disk log accordingly).
     pub fn compact(&mut self, snapshot: Snapshot) {
@@ -971,10 +1001,7 @@ impl Raft {
                 bytes += self.entries[end].payload.len();
                 end += 1;
             }
-            (
-                LogIndex(from.get() - 1),
-                self.entries[start..end].to_vec(),
-            )
+            (LogIndex(from.get() - 1), self.entries[start..end].to_vec())
         } else {
             (LogIndex(p.next.get() - 1), Vec::new())
         };
