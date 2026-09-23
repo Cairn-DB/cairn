@@ -98,6 +98,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     docs/reports/phase-4.md.
 - Phase 4: DONE 2026-09-22. PROTOTYPE DELIVERED.
 
+- Scale follow-up (2026-09-23, owner request: 10M then 50M through the cluster):
+  - `cairn-bench cluster-scale` (YFCC-10M with official GT; BigANN prefix with brute-force GT),
+    `--max-segments` and `--sq8-only` server flags (ADR 0013).
+  - First YFCC-10M attempt with defaults: 9 GB/node at 2M rows, stopped (would not fit).
+    After ADR 0013 (SQ8-only residency, one less memtable copy): 9.1 GB/node settled at 10M.
+  - YFCC-10M through the cluster DONE: bench-results/phase4-cluster-yfcc10m.md. 6.7k docs/s,
+    recall@10 0.989, p99 80 ms stale / 117 ms linearizable (target < 100 ms MISSED for
+    linearizable), takedown p99 39 ms. Latency is flat across selectivity buckets: fixed cost
+    of 8 shards x 16 segments per query.
+  - 50M: does not fit (3 full replicas on one 58 GB host, >= ~0.55 KB/row/node). Largest
+    BigANN run that fits: 20M (in progress). Download host stalls over IPv6: fetch with -4.
+
 ## Next step
 Delivered. Candidate follow-ups, by value: (1) move segment publication and compaction input
 reads off the actor (ingest p99); (2) group commit across proposals; (3) io_uring reactor;
