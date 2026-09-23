@@ -129,3 +129,94 @@ the following:
 
 Recall figures use SQ8-only scoring on uint8 datasets, where SQ8 is almost lossless. They
 would be lower on float embeddings without the f32 rerank (ADR 0013).
+
+---
+
+# Part 2 (2026-09-23, afternoon): fixing the missed p99, placement, disk-resident index
+
+The owner asked to catch the two missed 100 ms targets (YFCC linearizable, BigANN unfiltered),
+accepted the three levers for 50M (a bigger host, placement, a disk-resident index), and
+offered a Hetzner Cloud account.
+
+## Why the p99 was missed
+
+Four causes, each measured or read in the code:
+
+1. **One node did all the work.** Every `cairn-client` started on the lowest node id, so every
+   stale read and every query coordination landed on node 1's four cores. Nodes 2 and 3 stayed
+   idle.
+2. **Sequential forwarding.** For linearizable reads, the coordinator forwarded the legs of
+   shards led elsewhere one round trip after another.
+3. **Idle memtables were never flushed.** After a bulk load, each shard kept up to 64 MB of
+   rows in its memtable, and every query scanned them without a graph.
+4. **Too many segments.** Every query ran 23 segment searches per shard (184 in total at 20M).
+
+## Changes
+
+- The client rotates its starting node. The coordinator forwards legs concurrently, and on a
+  transport failure it tries the shard's other hosts.
+- `--idle-flush-ms`, 5 s by default, flushes a memtable that receives no writes.
+- Tiered compaction (`--target-segment-rows`) merges the longest run of adjacent segments that
+  fits the target, so each row is rewritten about once per size tier.
+  `--compaction-slots` caps concurrent merges per node, because a merge holds its rows in
+  RAM.
+- `MALLOC_ARENA_MAX=2` in `cluster.sh`. Without it, glibc kept freed merge buffers in
+  per-thread arenas: 15.9 GB per node for 8.7 GB of live data.
+
+## Results (same data, restarted, post-load compaction to 2-5 segments per shard)
+
+| | before | after |
+|---|---|---|
+| BigANN-20M unfiltered p99, stale / linearizable | 120 / 110 ms | **19.7 / 48.6 ms** |
+| BigANN-20M unfiltered QPS (8 threads), stale | 88 | 573 |
+| BigANN-20M 1% filter p99, stale / linearizable | 47 / 42 ms | 22 / 43 ms |
+| YFCC-10M tag filter p99, stale / linearizable | 80 / 117 ms | **34 / 59 ms** |
+| YFCC-10M QPS, stale / linearizable | 243 / 148 | 605 / 287 |
+| recall@10 (BigANN unfiltered, YFCC) | 0.987, 0.989 | 0.986, 0.988 |
+| takedown visible on all nodes, p99 | 43, 39 ms | 43, 43 ms |
+
+Files: `bench-results/phase4-cluster-bigann20m-latency.md`,
+`bench-results/phase4-cluster-yfcc10m-latency.md`. **Both missed targets are now met.**
+Linearizable reads still cost about 2.5 times the stale ones. Follower reads (ReadIndex
+served by the follower) would remove the forwarding. They were not needed to reach the target
+and are listed as the next lever.
+
+Memory after the compaction is 12.4 GB per node for YFCC, against 9.1 GB before. The
+allocator keeps some of the merge buffers even with two arenas.
+
+## Placement (fewer copies per host)
+
+`--replication N` puts shard *s* on N consecutive nodes, starting at *s* mod the node count.
+Nodes host only their shards and redirect the rest to a host. The new process test
+`placement_with_fewer_replicas_than_nodes` covers 4 nodes, 8 shards and 3 replicas: every
+entry node serves reads, queries and takedowns for every shard, and killing a node leaves
+writes and linearizable reads working. **Dynamic membership (adding or removing a replica of a
+live shard) is not implemented.** Placement is static, fixed at start.
+
+## Disk-resident vector index (ADR 0014)
+
+A Vamana graph with PQ codes in RAM, and node blocks (full vector and neighbors, packed so
+that none straddles a page) read through the new `Disk::map` (mmap in the real runtimes). Search
+is a beam of 4 nodes whose blocks are prefetched together with `madvise(WILLNEED)`. It starts
+from the medoid plus 64 spread seeds. On one SIFT1M segment
+(`bench-results/phase4-diskann-sift1m.md`), single thread:
+
+| | recall@10 | warm p50 / p99 | cold p50 / p99 |
+|---|---|---|---|
+| L = 64 | 0.968 | 0.35 / 0.64 ms | 9.0 / 14.0 ms |
+| L = 100 | 0.983 | 0.49 / 0.87 ms | 13.0 / 18.7 ms |
+| L = 128 | 0.989 | 0.62 / 1.07 ms | 16.6 / 24.7 ms |
+| 1% filter, PQ scan + rerank 100 | 1.000 | 0.37 / 0.48 ms | 3.8 / 5.9 ms |
+
+It uses 33 B per row in RAM, against 430 B per row in SQ8 mode and about 1.1 KB with f32
+resident. It uses 819 B per row of node blocks on disk. The build runs at 3.1k rows per second
+per thread (HNSW: 5k). "Cold" drops the index file's pages from the page cache before every
+query (`madvise` + `fadvise DONTNEED`). Serial page faults cost 20.8 ms per cold search at
+100k rows; the prefetched beam brings that to 7.8 ms.
+
+## Hetzner
+
+`docs/hetzner-plan.md` and `tools/scripts/hcloud/`. The recommended setup is 3 × ccx43
+(16 dedicated vCPU, 64 GB) plus a ccx33 for the client, on a real private network, at about
+€1.87/h, or roughly €8 for a 50M run. **Nothing was created**, because creating servers bills
+the account, which also holds production servers. It waits for the owner's go.
