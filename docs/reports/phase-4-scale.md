@@ -220,3 +220,47 @@ query (`madvise` + `fadvise DONTNEED`). Serial page faults cost 20.8 ms per cold
 (16 dedicated vCPU, 64 GB) plus a ccx33 for the client, on a real private network, at about
 €1.87/h, or roughly €8 for a 50M run. **Nothing was created**, because creating servers bills
 the account, which also holds production servers. It waits for the owner's go.
+
+---
+
+# Part 3 (2026-09-23 evening to 2026-09-24): 50M rows
+
+## 50M on the development machine, disk-resident index
+
+`bench-results/phase4-cluster-bigann50m-disk.md`. Three processes on one 58 GB host, 4 shards
+with 4 cores each, `--disk-index --vamana-passes 1`, no compaction (about 50 segments per
+shard). The load needed five restarts (see below). The final part resumed from row 38.8M on the
+same data (`cairn-bench cluster-scale --start`).
+
+| | result |
+|---|---|
+| memory per node | 8.6-9.7 GB (anonymous 7.5-8.4 GB; the rest is mapped index pages) |
+| unfiltered recall@10 / p50 / p99 (stale) | 0.978 / 2.8 s / 13.5 s, 2 QPS |
+| 1% filter recall@10 / p50 / p99 (stale) | 0.980 / 1.9 s / 5.1 s |
+| takedown visible on all nodes p99 | 118 ms |
+
+**50M fits on this machine with three replicas, but it misses the latency target by one to two
+orders of magnitude.** Each query searches about 200 disk segments per node, mostly cold. The
+three copies share one page cache, and page faults block the executor cores (ADR 0014). This
+configuration demonstrates the memory footprint only. It is not a serving configuration.
+
+## What the 50M attempts exposed (all fixed, all with tests or campaign evidence)
+
+| symptom | cause | fix |
+|---|---|---|
+| memtable grew without bound while an index built | no write backpressure | writes wait once the memtable is at twice its threshold |
+| 15 GB per node, stalled | every shard built its index at once | flush builds share the per-node build slots |
+| 32 GB on one node | leader re-sent 19 MB appends to a slow follower on each proposal | Raft flow control (window, byte cap) |
+| follower too slow to answer | segment loads hashed and validated on the actor | offloaded |
+| 10 GB jump during catch-up | snapshot re-shipped every segment, buffered in RAM; leader read whole files per chunk | only missing segments, streamed to disk, range reads; leader keeps its log for laggards |
+| GCP: leader OOM-killed at 65 GB, 42 GB queued for peers | the flow-control window freed a slot on heartbeat responses and re-sent batches repeatedly | exact settlement per append, loss by timeout, per-peer queue capped at 256 MB |
+| replicas at the same applied index with different documents (chaos seed 2227) | the hard state (commit index) was persisted before the log entries; a crash in between replayed a stale entry as committed (latent since Phase 3) | entries are synced before the hard state |
+| a build that began before a snapshot install could publish over a snapshot segment | no job invalidation | store generation |
+
+The watchdog stops of the fourth and fifth attempts were probably false alarms. That watchdog
+measured total RSS, which includes file-backed pages of the mapped index. The kernel reclaims
+those, and anonymous memory stayed around 8 GB. The watchdog now measures anonymous memory.
+
+Verification after the fixes: `cargo test --workspace` (83 tests), the Raft harness with
+in-order delivery (500 seeds), and a new test that bounds re-sends. The simulation campaign
+passed 60,000 seeds with zero violations.
