@@ -62,3 +62,19 @@ Option 2, as a third *residency* of `VectorIndex`: `memory` (f32 + SQ8 + HNSW, t
 - The format is new and versioned (header magic and version). The existing segments are
   unchanged: the residency is chosen at build time per segment and recorded by which sections
   exist.
+
+## Measured (2026-09-23)
+
+`bench-results/phase4-diskann-sift1m.md`, one 1M-row SIFT segment, single thread:
+- recall@10 0.983 at L = 100, 0.989 at L = 128. Warm p50 0.49 / 0.62 ms, and fully cold
+  p50 13 / 17 ms.
+- 33 B per row in RAM, 819 B per row of blocks on disk. The build runs at 3.1k rows/s per
+  thread.
+- Serial page faults cost 20.8 ms per cold search at 100k rows. A beam of 4 with
+  `madvise(WILLNEED)` prefetch brings that to 7.8 ms, and a beam of 8 to 6.0 ms. The default
+  is 4.
+- A single medoid entry point failed on very clustered data, where pruning cut the graph into
+  components. Search now also seeds from 64 spread rows scored by PQ.
+- Ingest is limited by the build rate once segments use this index. That exposed missing
+  write backpressure: the memtable grew without bound while a flush built (fixed in
+  commit e6250b8).

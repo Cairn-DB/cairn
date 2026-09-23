@@ -129,8 +129,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Disk-resident index DONE (ADR 0014, commit 335182c): Vamana + PQ, Disk::map/prefetcher,
     beam search. 100k SIFT: recall 0.994 @L64, warm 0.32 ms, cold 7.8 ms (beam 4). Build
     3.4k rows/s/thread. 33 B/row RAM, 819 B/row disk.
-  - Next: 20M latency measurement; YFCC-10M latency re-test; SIFT1M disk-sweep; 50M local run
-    with --disk-index (BigANN prefix in data/bigann, download nearly complete).
+  - Latency fix MEASURED: BigANN-20M unfiltered p99 120 -> 20 ms stale / 49 ms linearizable;
+    YFCC-10M linearizable p99 117 -> 59 ms. Both targets met (commits ad661d7, ea153ca).
+  - SIFT1M disk-sweep DONE (bench-results/phase4-diskann-sift1m.md).
+  - Follower reads + failed-read reporting + write backpressure DONE (e6250b8); campaign 20k
+    seeds zero violations. Linearizable numbers above predate follower reads: re-measure on
+    data/scale-bigann and data/scale-yfcc (restart cluster, --skip-ingest).
+  - 50M local run with --disk-index: first attempt stopped by the watchdog at 6M rows (no
+    backpressure). Second attempt RUNNING since 17:14 (data/run-disk50m.sh, 4 shards, 160 MB
+    memtables, no compaction); ingest ~4k docs/s, bounded by Vamana builds; ETA ~21:00.
+  - Lessons: glibc arenas hold freed merge buffers (MALLOC_ARENA_MAX=2 in cluster.sh);
+    `pkill -f <pattern>` kills the calling shell when the pattern is in its own command line
+    (use pids); the BigANN CDN stalls over IPv6 (curl -4).
 
 ## Next step
 Scale runs delivered 2026-09-23; owner wants to discuss concepts next. Scale-specific levers:
