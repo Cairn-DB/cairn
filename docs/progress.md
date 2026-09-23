@@ -111,7 +111,7 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     8.7 GB/node settled (0.43 KB/row/node), 1% filter: recall 0.991, p99 47 ms; unfiltered:
     recall 0.987, p99 120 ms (MISSED, 184 segment searches per query). Takedown p99 43 ms.
   - 50M: does not fit (3 full replicas on one 58 GB host: ~65 GB before transients). First
-    50M BigANN rows downloaded to data/bigann/ (fetch.sh; the host stalls over IPv6, use -4).
+    50M BigANN rows downloading to data/bigann/ (fetch.sh; the host stalls over IPv6, use -4).
   - Report: docs/reports/phase-4-scale.md.
 
 ## Next step

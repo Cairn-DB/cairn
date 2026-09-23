@@ -110,7 +110,8 @@ Reading:
 means three copies in one machine's RAM. The settled footprint measured at 20M is 0.43 KB per
 row per node, with SQ8-only residency. 50M rows would need about 0.43 KB × 50M × 3 = 65 GB
 before ingest transients, against 58 GB installed and about 48 GB free. The first 50M rows of
-BigANN are downloaded to `data/bigann/` for a run on larger hardware. Reaching 50M needs one of
+BigANN are being downloaded to `data/bigann/` (26M done when this was written) for a run on
+larger hardware. Reaching 50M needs one of
 the following:
 
 - three machines, or one machine with at least about 96 GB,
