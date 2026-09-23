@@ -135,9 +135,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Follower reads + failed-read reporting + write backpressure DONE (e6250b8); campaign 20k
     seeds zero violations. Linearizable numbers above predate follower reads: re-measure on
     data/scale-bigann and data/scale-yfcc (restart cluster, --skip-ingest).
-  - 50M local run with --disk-index: first attempt stopped by the watchdog at 6M rows (no
-    backpressure). Second attempt RUNNING since 17:14 (data/run-disk50m.sh, 4 shards, 160 MB
-    memtables, no compaction); ingest ~4k docs/s, bounded by Vamana builds; ETA ~21:00.
+  - 50M local run with --disk-index, attempts and what each exposed:
+    1. stopped at 6M (watchdog): memtable grew without bound while a flush built -> write
+       backpressure (e6250b8).
+    2. stalled at 5M, 15 GB/node: 4 concurrent Vamana builds per node -> flushes share the
+       per-node build slots (dfafc80).
+    3. slow (2.6k docs/s) -> --vamana-passes 1, 3 slots (e95423a); then node 2 grew to 32 GB
+       at 9M rows: leader re-sent 19 MB appends to a slow follower on every proposal -> Raft
+       flow control (4130c92); follower slow because segment loads hashed/validated on the
+       actor -> offloaded (85f4145). Campaign zero violations after each Raft change.
+    4. RUNNING since 19:13 (data/run-disk50m.sh: 4 shards x 4 cores, 128 MB memtables,
+       --compaction-slots 3 --vamana-passes 1, no compaction; watchdog stops on avail < 4 GB
+       or any node > 20 GB). Expected ~5k docs/s.
   - Lessons: glibc arenas hold freed merge buffers (MALLOC_ARENA_MAX=2 in cluster.sh);
     `pkill -f <pattern>` kills the calling shell when the pattern is in its own command line
     (use pids); the BigANN CDN stalls over IPv6 (curl -4).
