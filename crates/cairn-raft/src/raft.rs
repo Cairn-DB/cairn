@@ -53,7 +53,20 @@ struct Progress {
     matched: LogIndex,
     /// Highest heartbeat sequence acknowledged.
     acked_seq: u64,
+    /// Appends carrying entries sent and not yet answered (flow control).
+    inflight: u32,
+    /// Last index sent in an append carrying entries (pipelining point).
+    sent: LogIndex,
+    /// Sequence of the latest append carrying entries.
+    sent_seq: u64,
 }
+
+/// Appends carrying entries allowed in flight per follower. Beyond it the leader only sends
+/// heartbeats: without a window, every proposal re-sent the whole unacknowledged batch to a
+/// slow follower and its inbox grew without bound (30 GB in the 50M run).
+const MAX_INFLIGHT: u32 = 4;
+/// Upper bound on the entry payload of one append (at least one entry is always sent).
+const MAX_APPEND_BYTES: usize = 4 << 20;
 
 #[derive(Debug, Clone)]
 struct PendingRead {
@@ -394,6 +407,9 @@ impl Raft {
                     next,
                     matched: LogIndex(0),
                     acked_seq: 0,
+                    inflight: 0,
+                    sent: LogIndex(next.get() - 1),
+                    sent_seq: 0,
                 },
             );
         }
@@ -681,11 +697,22 @@ impl Raft {
                     return;
                 };
                 p.acked_seq = p.acked_seq.max(seq);
+                // Flow control: a response to the latest entry-bearing append (or later) means
+                // every earlier one was processed or lost; otherwise one fewer is in flight.
+                if seq >= p.sent_seq {
+                    p.inflight = 0;
+                } else {
+                    p.inflight = p.inflight.saturating_sub(1);
+                }
                 if success {
                     if index > p.matched {
                         p.matched = index;
                     }
                     p.next = p.matched.next().max(p.next);
+                    if p.inflight == 0 && p.sent > p.matched {
+                        // Something sent was lost: resend from `next`.
+                        p.sent = p.matched;
+                    }
                     let next = p.next;
                     self.maybe_commit();
                     self.check_reads();
@@ -696,6 +723,8 @@ impl Raft {
                     // Back off to the follower's hint, never below what it already matched.
                     let hint = index.max(p.matched.next());
                     p.next = hint.min(p.next.get().saturating_sub(1).max(1).into());
+                    p.inflight = 0;
+                    p.sent = LogIndex(p.next.get() - 1);
                     self.send_append(from);
                 }
             }
@@ -923,13 +952,48 @@ impl Raft {
             }
             return;
         }
-        let prev_index = LogIndex(p.next.get() - 1);
+        // Pipeline after what is already in flight; when the window is full (or nothing is new),
+        // send a heartbeat (no entries) anchored at `next`.
+        let from = if p.inflight > 0 {
+            p.next.max(p.sent.next())
+        } else {
+            p.next
+        };
+        let with_entries = p.inflight < MAX_INFLIGHT && from <= self.last_index();
+        let (prev_index, entries) = if with_entries {
+            let start = (from.get() - self.first_index.get()) as usize;
+            let mut end = start;
+            let mut bytes = 0usize;
+            while end < self.entries.len()
+                && end - start < self.cfg.max_batch
+                && (end == start || bytes + self.entries[end].payload.len() <= MAX_APPEND_BYTES)
+            {
+                bytes += self.entries[end].payload.len();
+                end += 1;
+            }
+            (
+                LogIndex(from.get() - 1),
+                self.entries[start..end].to_vec(),
+            )
+        } else {
+            (LogIndex(p.next.get() - 1), Vec::new())
+        };
         let prev_term = self.term_at(prev_index).unwrap_or(Term(0));
-        let start = (p.next.get() - self.first_index.get()) as usize;
-        let end = (start + self.cfg.max_batch).min(self.entries.len());
-        let entries: Vec<Entry> = self.entries[start.min(end)..end].to_vec();
         let commit = self.commit;
-        let seq = self.heartbeat_seq;
+        let seq = if entries.is_empty() {
+            self.heartbeat_seq
+        } else {
+            // A fresh sequence per entry-bearing append lets a response tell which appends it
+            // covers (sequences stay monotonic, as ReadIndex needs).
+            self.heartbeat_seq += 1;
+            let seq = self.heartbeat_seq;
+            if let Some(pm) = self.progress.get_mut(&to) {
+                pm.inflight += 1;
+                pm.sent = entries.last().map_or(pm.sent, |e| e.index);
+                pm.sent_seq = seq;
+            }
+            seq
+        };
         self.send(
             to,
             Message::Append {
