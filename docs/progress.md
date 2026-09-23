@@ -107,11 +107,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     recall@10 0.989, p99 80 ms stale / 117 ms linearizable (target < 100 ms MISSED for
     linearizable), takedown p99 39 ms. Latency is flat across selectivity buckets: fixed cost
     of 8 shards x 16 segments per query.
-  - 50M: does not fit (3 full replicas on one 58 GB host, >= ~0.55 KB/row/node). Largest
-    BigANN run that fits: 20M (in progress). Download host stalls over IPv6: fetch with -4.
+  - BigANN-20M through the cluster DONE: bench-results/phase4-cluster-bigann20m.md. 7.4k docs/s,
+    8.7 GB/node settled (0.43 KB/row/node), 1% filter: recall 0.991, p99 47 ms; unfiltered:
+    recall 0.987, p99 120 ms (MISSED, 184 segment searches per query). Takedown p99 43 ms.
+  - 50M: does not fit (3 full replicas on one 58 GB host: ~65 GB before transients). First
+    50M BigANN rows downloaded to data/bigann/ (fetch.sh; the host stalls over IPv6, use -4).
+  - Report: docs/reports/phase-4-scale.md.
 
 ## Next step
-Delivered. Candidate follow-ups, by value: (1) move segment publication and compaction input
+Scale runs delivered 2026-09-23; owner wants to discuss concepts next. Scale-specific levers:
+fewer, larger segments (post-load compaction), per-query fixed cost (filter evaluation per
+segment), linearizable leg forwarding, and a disk-resident index for 50M on one host.
+Earlier candidate follow-ups, by value: (1) move segment publication and compaction input
 reads off the actor (ingest p99); (2) group commit across proposals; (3) io_uring reactor;
 (4) BM25 scoring loop (term-at-a-time accumulators or block-max WAND); (5) membership changes;
 (6) fuzz targets + Miri on the scalar kernel paths; (7) 10M-row end-to-end ingest run.

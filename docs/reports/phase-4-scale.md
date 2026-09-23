@@ -71,16 +71,60 @@ Reading:
 - The ingest tail (a 9.3 s maximum batch) comes from segment publication on the replica actor,
   which is the known gap from the Phase 4 report.
 
+## BigANN (SIFT1B) 20M prefix, brute-force ground truth
+
+Result file: `bench-results/phase4-cluster-bigann20m.md`. Rows are a 20M prefix of
+`base.1B.u8bin` (128-d uint8) with bench-gen attributes. The tool computes the ground truth by
+brute force on 5,000 of the public queries, unfiltered and with `flag_1` (about 1%).
+
+```
+N=20000000 TAG=20m data/run-bigann.sh   # same flags as YFCC, sift-schema.json
+```
+
+| metric | result |
+|---|---|
+| ingest | 7,366 docs/s (20M rows in 45 min), batch p99 1.9 s, max 8.4 s |
+| memory per node after settling | 8.7-8.9 GB (about 0.43 KB per row per node) |
+| segments per shard | 23 (8 shards) |
+| unfiltered recall@10, p50 / p99 (stale) | 0.9870, 90.3 / 120.2 ms, 88 QPS |
+| unfiltered, linearizable | 0.9870, 86.1 / 110.2 ms, 92 QPS |
+| flag_1 (≈1%) recall@10, p50 / p99 (stale) | 0.9910, 31.2 / 46.8 ms, 255 QPS |
+| flag_1, linearizable | 0.9910, 33.0 / 41.7 ms, 240 QPS |
+| takedown visible on all nodes p50 / p99 | 31.6 / 43.1 ms |
+
+Reading:
+
+- **Selective filters meet every target at 20M:** recall 0.991, p99 under 50 ms at both
+  consistency levels, takedowns under 50 ms.
+- **Unfiltered queries miss the 100 ms p99 target** (110-120 ms). Each query runs a graph
+  search in 8 × 23 = 184 segments of about 110k rows each. The cost grows with the number of
+  segments, not with the rows. Fewer, larger segments (compaction after the bulk load, or
+  bigger memtables once memory allows) is the obvious lever. It was not tried, to keep memory
+  within the host.
+- In this run linearizable reads are no slower than stale reads. With 5,000 queries and a longer
+  per-query search, the extra hop is a small share of the latency.
+
 ## 50M rows
 
 **Not run: it does not fit on this machine.** Every node holds every shard, so three replicas
-means three copies in one machine's RAM. The measured footprint at 10M is about 0.9 KB per row
-per node including transients, or about 0.65 KB per row for the settled indexes. At 128
-dimensions, 50M rows need more than 0.5 KB × 50M × 3 = 75 GB against 58 GB installed. Reaching
-50M needs one of the following:
+means three copies in one machine's RAM. The settled footprint measured at 20M is 0.43 KB per
+row per node, with SQ8-only residency. 50M rows would need about 0.43 KB × 50M × 3 = 65 GB
+before ingest transients, against 58 GB installed and about 48 GB free. The first 50M rows of
+BigANN are downloaded to `data/bigann/` for a run on larger hardware. Reaching 50M needs one of
+the following:
 
-- three machines,
+- three machines, or one machine with at least about 96 GB,
 - shard placement with fewer copies per host (membership work), or
 - a disk-resident index (DiskANN-style) that keeps only compressed codes in RAM.
 
-The largest BigANN run that fits is reported below.
+## Summary against SPEC section 8
+
+| target | YFCC-10M (filtered track) | BigANN-20M |
+|---|---|---|
+| recall@10 > 95% with selective filter | met, 0.989 | met, 0.991 (1%) |
+| p99 < 100 ms | met for stale reads (80 ms), missed for linearizable reads (117 ms) | met with the filter (47 ms), missed unfiltered (120 ms) |
+| takedown cluster-wide < 1 s | met, 39 ms p99 | met, 43 ms p99 |
+| 10-50M rows | 10M done | 20M done; 50M does not fit on one host |
+
+Recall figures use SQ8-only scoring on uint8 datasets, where SQ8 is almost lossless. They
+would be lower on float embeddings without the f32 rerank (ADR 0013).
