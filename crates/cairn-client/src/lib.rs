@@ -23,9 +23,18 @@ pub struct Client {
 }
 
 impl Client {
-    /// Creates a client for the given nodes; connections are opened lazily.
+    /// Creates a client for the given nodes; connections are opened lazily. Successive clients
+    /// in a process start on successive nodes, so reads served locally (stale, read-your-writes)
+    /// and query coordination spread over the cluster instead of all landing on one node.
     pub fn new(addrs: HashMap<NodeId, SocketAddr>) -> Self {
-        let current = addrs.keys().min().copied().unwrap_or(NodeId(1));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut ids: Vec<NodeId> = addrs.keys().copied().collect();
+        ids.sort();
+        let current = if ids.is_empty() {
+            NodeId(1)
+        } else {
+            ids[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % ids.len()]
+        };
         Client {
             addrs,
             conns: HashMap::default(),

@@ -41,6 +41,38 @@ pub struct Token {
     pub index: LogIndex,
 }
 
+/// Bounds how many compaction jobs run at once across the replicas that share it (one node).
+/// A compaction holds all live rows of its input segments in memory while it rebuilds their
+/// indexes, so an unbounded number of concurrent jobs can exhaust a node's RAM.
+#[derive(Debug)]
+pub struct JobSlots {
+    used: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl JobSlots {
+    /// Allows `max` concurrent jobs.
+    pub fn new(max: usize) -> Self {
+        JobSlots {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            max: max.max(1),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                (u < self.max).then_some(u + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.used.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Replica settings.
 #[derive(Debug, Clone)]
 pub struct ReplicaConfig {
@@ -65,6 +97,11 @@ pub struct ReplicaConfig {
     /// Spawn a task that reads the runtime's network inbox and delivers frames to this replica.
     /// A multi-shard node sets this to `false` and delivers through [`ReplicaHandle::deliver`].
     pub own_receiver: bool,
+    /// Flush a non-empty memtable after this many ticks without applied writes (0: never).
+    /// Queries scan the memtable without a graph, so a large idle memtable costs every query.
+    pub idle_flush_ticks: u32,
+    /// Shared bound on concurrent compactions (`None`: unbounded, one per replica).
+    pub compaction_slots: Option<std::sync::Arc<JobSlots>>,
 }
 
 /// Snapshot of a replica's state for diagnostics and checkers.
@@ -276,6 +313,8 @@ pub struct Replica<R: Runtime> {
     next_read: u64,
     fetch: Option<SnapshotFetch>,
     ticks: u64,
+    last_apply_tick: u64,
+    holds_slot: bool,
 }
 
 impl<R: Runtime> Replica<R> {
@@ -406,6 +445,8 @@ impl<R: Runtime> Replica<R> {
             next_read: 1,
             fetch: None,
             ticks: 0,
+            last_apply_tick: 0,
+            holds_slot: false,
         };
         // Ticker.
         let (h, r2, tick) = (handle.clone(), rt.clone(), cfg.tick);
@@ -478,6 +519,7 @@ impl<R: Runtime> Replica<R> {
             Event::Tick => {
                 self.ticks += 1;
                 self.raft.tick();
+                self.on_idle_tick().await?;
             }
             Event::Net(from, bytes) => match Frame::from_bytes(&bytes) {
                 Ok(f) if f.shard == self.cfg.shard => self.handle_frame(from, f.body).await?,
@@ -502,6 +544,7 @@ impl<R: Runtime> Replica<R> {
                 self.after_publish().await?;
             }
             Event::CompactBuilt(job, sections) => {
+                self.release_slot();
                 let sections = sections?;
                 self.engine
                     .store_mut()
@@ -752,6 +795,7 @@ impl<R: Runtime> Replica<R> {
                 }
             }
             if !ready.committed.is_empty() {
+                self.last_apply_tick = self.ticks;
                 self.engine.refresh().await?;
                 self.maybe_flush().await?;
             }
@@ -839,12 +883,52 @@ impl<R: Runtime> Replica<R> {
         self.maybe_compact_job().await
     }
 
+    /// Background upkeep on ticks: flush an idle memtable, and retry a compaction that was
+    /// waiting for a free slot.
+    async fn on_idle_tick(&mut self) -> Result<()> {
+        let idle = u64::from(self.cfg.idle_flush_ticks);
+        if idle > 0
+            && self.ticks - self.last_apply_tick >= idle
+            && self.engine.store().memtable_bytes() > 0
+            && !self.engine.store().job_active()
+        {
+            return self.start_flush_job();
+        }
+        if self.cfg.compaction_slots.is_some() && self.ticks % 20 == 0 {
+            self.maybe_compact_job().await?;
+        }
+        Ok(())
+    }
+
+    fn release_slot(&mut self) {
+        if self.holds_slot {
+            self.holds_slot = false;
+            if let Some(slots) = &self.cfg.compaction_slots {
+                slots.release();
+            }
+        }
+    }
+
     async fn maybe_compact_job(&mut self) -> Result<()> {
         if self.engine.store().job_active() {
             return Ok(());
         }
-        let Some(job) = self.engine.store_mut().begin_compact().await? else {
-            return Ok(());
+        if let Some(slots) = &self.cfg.compaction_slots {
+            if !slots.try_acquire() {
+                return Ok(());
+            }
+            self.holds_slot = true;
+        }
+        let job = match self.engine.store_mut().begin_compact().await {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                self.release_slot();
+                return Ok(());
+            }
+            Err(e) => {
+                self.release_slot();
+                return Err(e);
+            }
         };
         let schema = self.engine.schema().clone();
         let indexer = DefaultIndexer {

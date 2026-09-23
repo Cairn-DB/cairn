@@ -29,6 +29,13 @@ pub struct StoreConfig {
     pub max_segments: usize,
     /// Rewrite a segment once this fraction of its rows is deleted.
     pub max_deleted_fraction: f64,
+    /// Tiered merging: when non-zero, merge the longest run of adjacent segments whose live
+    /// rows add up to at most this many, once the run has `min_merge` segments. Each row is
+    /// rewritten about once per size tier instead of once per pairwise merge, and a shard
+    /// converges to a few large segments (fewer per-query segment searches).
+    pub target_segment_rows: u32,
+    /// Shortest run the tiered policy merges (below `max_segments`).
+    pub min_merge: usize,
 }
 
 impl Default for StoreConfig {
@@ -38,6 +45,8 @@ impl Default for StoreConfig {
             log: LogConfig::default(),
             max_segments: 8,
             max_deleted_fraction: 0.3,
+            target_segment_rows: 0,
+            min_merge: 4,
         }
     }
 }
@@ -653,17 +662,18 @@ impl<R: Runtime> Store<R> {
                 && f64::from(s.deletions.count()) / f64::from(s.meta.doc_count)
                     > self.cfg.max_deleted_fraction
         });
+        let live = |s: &OpenSegment<R>| u64::from(s.meta.doc_count - s.deletions.count());
+        let run = self.tiered_run(n, &live);
         let ids: Vec<SegmentId> = if let Some(i) = stale {
             vec![self.segments[i].meta.id]
+        } else if let Some((first, len)) = run {
+            self.segments[first..first + len]
+                .iter()
+                .map(|s| s.meta.id)
+                .collect()
         } else if n > self.cfg.max_segments {
-            let live = |s: &OpenSegment<R>| s.meta.doc_count - s.deletions.count();
             let (i, _) = (0..n - 1)
-                .map(|i| {
-                    (
-                        i,
-                        live(&self.segments[i]) as u64 + live(&self.segments[i + 1]) as u64,
-                    )
-                })
+                .map(|i| (i, live(&self.segments[i]) + live(&self.segments[i + 1])))
                 .min_by_key(|(_, rows)| *rows)
                 .expect("n > 1");
             vec![self.segments[i].meta.id, self.segments[i + 1].meta.id]
@@ -671,6 +681,43 @@ impl<R: Runtime> Store<R> {
             return Ok(None);
         };
         self.begin_compact_ids(&ids).await.map(Some)
+    }
+
+    /// The run of adjacent segments the tiered policy would merge: the longest run whose live
+    /// rows fit `target_segment_rows` (ties: fewest rows), if it has at least `min_merge`
+    /// segments, or at least two when the shard holds more than `max_segments`.
+    fn tiered_run(
+        &self,
+        n: usize,
+        live: &dyn Fn(&OpenSegment<R>) -> u64,
+    ) -> Option<(usize, usize)> {
+        let target = u64::from(self.cfg.target_segment_rows);
+        if target == 0 || n < 2 {
+            return None;
+        }
+        let mut best: Option<(usize, usize, u64)> = None;
+        for first in 0..n {
+            let mut total = 0u64;
+            let mut len = 0;
+            while first + len < n && total + live(&self.segments[first + len]) <= target {
+                total += live(&self.segments[first + len]);
+                len += 1;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bl, bt)) => len > bl || (len == bl && total < bt),
+            };
+            if len >= 2 && better {
+                best = Some((first, len, total));
+            }
+        }
+        let (first, len, _) = best?;
+        let need = if n > self.cfg.max_segments {
+            2
+        } else {
+            self.cfg.min_merge.max(2)
+        };
+        (len >= need).then_some((first, len))
     }
 
     /// Reads the live rows of the given adjacent segments into a compaction job.
@@ -993,7 +1040,56 @@ mod tests {
             },
             max_segments: 3,
             max_deleted_fraction: 0.3,
+            target_segment_rows: 0,
+            min_merge: 4,
         }
+    }
+
+    /// Segment row counts after writing `n` documents with the given tiered settings (and a
+    /// `max_segments` high enough that the pairwise policy never triggers).
+    fn tiered_run(seed: u64, n: u64, target: u32, min_merge: usize) -> Vec<u32> {
+        let (sim, mut ex) = Simulation::new(seed, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let cfg = StoreConfig {
+                max_segments: 1000,
+                target_segment_rows: target,
+                min_merge,
+                ..small_cfg()
+            };
+            let mut st = Store::open(rt.clone(), "t", schema(), cfg.clone())
+                .await
+                .unwrap();
+            for i in 1..=n {
+                st.write(&Command::Upsert(vec![doc(i, 1)])).await.unwrap();
+            }
+            st.flush().await.unwrap();
+            for i in 1..=n {
+                assert_eq!(st.get(DocId(i)).await.unwrap(), Some(doc(i, 1)));
+            }
+            let rows: Vec<u32> = st.segments().map(|s| s.doc_count).collect();
+            drop(st);
+            let st = Store::open(rt.clone(), "t", schema(), cfg).await.unwrap();
+            assert_eq!(st.approx_live_docs(), n);
+            rows
+        })
+    }
+
+    #[test]
+    fn tiered_policy_merges_runs_up_to_the_target() {
+        let plain = tiered_run(9, 200, 0, 4);
+        assert!(plain.len() > 8, "many flush-sized segments: {plain:?}");
+        let flush_rows = *plain.iter().max().unwrap();
+        // A target of three flushes: runs of 2-3 segments merge, nothing grows past the target.
+        let target = 3 * flush_rows;
+        let tiered = tiered_run(9, 200, target, 2);
+        assert!(tiered.len() < plain.len(), "{tiered:?} vs {plain:?}");
+        assert!(tiered.iter().all(|&r| r <= target), "{tiered:?} > {target}");
+        assert_eq!(tiered.iter().sum::<u32>(), 200);
+        // A target above the data: everything converges to one segment.
+        assert_eq!(tiered_run(9, 200, 10_000, 2), vec![200]);
+        // min_merge above the number of segments: the tiered policy never fires.
+        assert_eq!(tiered_run(9, 200, 10_000, 1000).len(), plain.len());
     }
 
     #[test]

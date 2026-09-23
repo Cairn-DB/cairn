@@ -14,4 +14,6 @@ pub mod wire;
 pub use engine::{EngineConfig, ShardEngine};
 pub use fusion::{Fusion, LegList, fuse};
 pub use query::{Hit, LegHit, Query, TextLeg, VectorLeg};
-pub use replica::{Consistency, Replica, ReplicaConfig, ReplicaHandle, ReplicaStatus, Token};
+pub use replica::{
+    Consistency, JobSlots, Replica, ReplicaConfig, ReplicaHandle, ReplicaStatus, Token,
+};

@@ -28,8 +28,12 @@ pub struct NodeConfig {
     pub peers: HashMap<NodeId, SocketAddr>,
     /// Data directory.
     pub data_dir: PathBuf,
-    /// Shards per collection (every shard is replicated on every node).
+    /// Shards per collection.
     pub shards: u32,
+    /// Replicas per shard (0 or at least the node count: every node hosts every shard).
+    /// Shard `s` lives on `replication` consecutive nodes (by id) starting at `s mod nodes`,
+    /// so a cluster of N nodes holds `replication / N` of the data per node.
+    pub replication: usize,
     /// Executor threads.
     pub cores: usize,
     /// Collection schema.
@@ -40,6 +44,12 @@ pub struct NodeConfig {
     pub max_segments: usize,
     /// Keep only SQ8 codes and graphs of loaded segments in memory (no f32 rerank).
     pub sq8_only: bool,
+    /// Tiered compaction target (live rows per merged segment; 0: pairwise policy only).
+    pub target_segment_rows: u32,
+    /// Concurrent compactions allowed on this node, across all its shards.
+    pub compaction_slots: usize,
+    /// Flush an idle memtable after this many milliseconds without writes (0: never).
+    pub idle_flush_ms: u64,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -99,6 +109,36 @@ pub struct Node {
     net: TcpNetwork,
     cores: usize,
     threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Compaction slots shared by every core of this process (one node per process).
+fn job_slots(max: usize) -> std::sync::Arc<cairn_query::JobSlots> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<cairn_query::JobSlots>> =
+        std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| std::sync::Arc::new(cairn_query::JobSlots::new(max)))
+        .clone()
+}
+
+/// Nodes hosting `shard`, in placement order.
+pub fn placement(cfg: &NodeConfig, shard: ShardId) -> Vec<NodeId> {
+    let mut nodes: Vec<NodeId> = cfg.peers.keys().copied().collect();
+    nodes.sort();
+    let n = nodes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let rf = if cfg.replication == 0 {
+        n
+    } else {
+        cfg.replication.min(n)
+    };
+    let start = shard.get() as usize % n;
+    (0..rf).map(|j| nodes[(start + j) % n]).collect()
+}
+
+fn hosts(cfg: &NodeConfig, shard: ShardId) -> bool {
+    placement(cfg, shard).contains(&cfg.id)
 }
 
 fn core_of(shard: ShardId, cores: usize) -> usize {
@@ -180,10 +220,10 @@ impl Node {
         let rt = PoolRuntime::new(ex.handle(), disk, net);
         let handles = ex.block_on(Self::spawn_replicas(rt.clone(), cfg.clone(), core));
         let queue = queues[core].clone();
-        let (rt2, h2) = (rt.clone(), handles.clone());
+        let (rt2, h2, cfg2) = (rt.clone(), handles.clone(), cfg.clone());
         rt.spawn(async move {
             while let Some(req) = queue.pop().await {
-                Self::serve(&rt2, &h2, req);
+                Self::serve(&rt2, &cfg2, &h2, req);
             }
         });
         if core == 0 {
@@ -199,15 +239,16 @@ impl Node {
         core: usize,
     ) -> HashMap<ShardId, ReplicaHandle> {
         let mut handles = HashMap::default();
+        let slots = job_slots(cfg.compaction_slots);
         for s in 0..cfg.shards {
             let shard = ShardId(s);
-            if core_of(shard, cfg.cores) != core {
+            if core_of(shard, cfg.cores) != core || !hosts(&cfg, shard) {
                 continue;
             }
             let rc = ReplicaConfig {
                 shard,
                 id: cfg.id,
-                peers: cfg.peers.keys().copied().collect(),
+                peers: placement(&cfg, shard),
                 tick: cairn_core::Duration::from_millis(cfg.tick_ms),
                 election_ticks: 10,
                 heartbeat_ticks: 2,
@@ -215,6 +256,7 @@ impl Node {
                     store: StoreConfig {
                         memtable_max_bytes: cfg.memtable_max_bytes,
                         max_segments: cfg.max_segments,
+                        target_segment_rows: cfg.target_segment_rows,
                         log: LogConfig::default(),
                         ..StoreConfig::default()
                     },
@@ -226,6 +268,8 @@ impl Node {
                 dir: format!("shard{s}"),
                 seed: u64::from(cfg.id.get()) * 1000 + u64::from(s),
                 own_receiver: false,
+                idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
+                compaction_slots: Some(slots.clone()),
             };
             match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
                 Ok(h) => {
@@ -237,7 +281,12 @@ impl Node {
         handles
     }
 
-    fn serve(rt: &Runtime, handles: &HashMap<ShardId, ReplicaHandle>, req: CoreRequest) {
+    fn serve(
+        rt: &Runtime,
+        cfg: &NodeConfig,
+        handles: &HashMap<ShardId, ReplicaHandle>,
+        req: CoreRequest,
+    ) {
         let shard = match &req {
             CoreRequest::Net { shard, .. }
             | CoreRequest::Propose { shard, .. }
@@ -246,7 +295,20 @@ impl Node {
             | CoreRequest::Status { shard, .. } => *shard,
         };
         let Some(h) = handles.get(&shard).cloned() else {
-            let e = || Error::InvalidRequest(format!("no shard {shard}"));
+            // Not hosted here: point the coordinator at a hosting node (rotating, so reads
+            // that any replica may serve spread over the shard's replicas).
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let owners = placement(cfg, shard);
+            let hint = (!owners.is_empty()).then(|| {
+                owners[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % owners.len()]
+            });
+            let e = || match hint {
+                Some(h) if h != cfg.id => Error::NotLeader {
+                    shard,
+                    leader_hint: Some(h),
+                },
+                _ => Error::InvalidRequest(format!("no shard {shard}")),
+            };
             match req {
                 CoreRequest::Propose { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Get { reply, .. } => reply.send(Err(e())),
@@ -333,16 +395,60 @@ impl Node {
         rx
     }
 
-    /// Forwards `req` to `node` over a peer connection (blocking call on a helper thread).
-    async fn forward(rt: &Runtime, cfg: &NodeConfig, node: NodeId, req: Request) -> Response {
+    /// Forwards `req` for `shard` to `node`. Follows up to three redirections (the node may
+    /// not host or lead the shard and answers with a hint), and on a transport failure (a dead
+    /// or restarting node) tries the shard's other hosts before giving up.
+    async fn forward(
+        rt: &Runtime,
+        cfg: &NodeConfig,
+        node: NodeId,
+        shard: ShardId,
+        req: Request,
+    ) -> Response {
+        let mut tried: Vec<NodeId> = Vec::new();
+        let mut target = Some(node);
+        let mut last = Response::Error {
+            message: format!("no reachable host for {shard}"),
+            leader_hint: None,
+        };
+        let mut redirects = 0;
+        while let Some(t) = target {
+            tried.push(t);
+            match Self::forward_once(rt, cfg, t, req.clone()).await {
+                Ok(Response::Error {
+                    message,
+                    leader_hint: Some(h),
+                }) if h != t && h != cfg.id && redirects < 3 && !tried.contains(&h) => {
+                    redirects += 1;
+                    last = Response::Error {
+                        message,
+                        leader_hint: Some(h),
+                    };
+                    target = Some(h);
+                    continue;
+                }
+                Ok(resp) => return resp,
+                Err(e) => last = Response::from_error(&e),
+            }
+            target = placement(cfg, shard)
+                .into_iter()
+                .find(|n| *n != cfg.id && !tried.contains(n));
+        }
+        last
+    }
+
+    /// One forwarded call to `node` over a peer connection (blocking call on a helper thread).
+    async fn forward_once(
+        rt: &Runtime,
+        cfg: &NodeConfig,
+        node: NodeId,
+        req: Request,
+    ) -> Result<Response> {
         let Some(addr) = cfg.peers.get(&node).copied() else {
-            return Response::Error {
-                message: format!("unknown node {node}"),
-                leader_hint: None,
-            };
+            return Err(Error::InvalidRequest(format!("unknown node {node}")));
         };
         let bytes = Request::Forwarded(Box::new(req)).to_bytes();
-        let result = offload(&rt.completer(), move || {
+        offload(&rt.completer(), move || {
             let conn = {
                 let mut m = peer_conns().lock().expect("peer conns");
                 match m.get(&node) {
@@ -362,11 +468,7 @@ impl Node {
                 }
             }
         })
-        .await;
-        match result {
-            Ok(r) => r,
-            Err(e) => Response::from_error(&e),
-        }
+        .await
     }
 
     fn not_leader(shard: ShardId, message: &str, hint: Option<NodeId>) -> Error {
@@ -408,7 +510,7 @@ impl Node {
                     Command::Delete(ids) => Request::Delete(ids),
                     Command::Noop => return Ok(Vec::new()),
                 };
-                match Self::forward(rt, cfg, l, req).await {
+                match Self::forward(rt, cfg, l, shard, req).await {
                     Response::Ack(tokens) => Ok(tokens),
                     Response::Error {
                         message,
@@ -451,6 +553,7 @@ impl Node {
                     rt,
                     cfg,
                     l,
+                    shard,
                     Request::Get {
                         id,
                         consistency,
@@ -577,41 +680,59 @@ impl Node {
                         }
                     }));
                 }
-                let mut merged: Vec<LegList> = Vec::new();
+                // Collect local answers first; shards led elsewhere are forwarded to their
+                // leaders concurrently (one task per shard), not one round trip after another.
+                let mut outcomes: Vec<Option<Result<Vec<LegList>>>> = Vec::new();
+                let mut forwards: Vec<(usize, CrossReceiver<Response>)> = Vec::new();
                 for (s, rx) in receivers.into_iter().enumerate() {
                     let shard = ShardId(s as u32);
-                    let outcome = match rx.await {
+                    match rx.await {
                         Some(Err(Error::NotLeader {
                             leader_hint: Some(l),
                             ..
                         })) if may_forward && l != cfg.id => {
                             let c = Self::per_shard(consistency, &tokens, shard);
-                            match Self::forward(
-                                rt,
-                                cfg,
-                                l,
-                                Request::ShardLegs {
+                            let (tx, frx) = cross_oneshot();
+                            let (rt2, cfg2, q2) = (rt.clone(), cfg.clone(), query.clone());
+                            rt.spawn(async move {
+                                let resp = Self::forward(
+                                    &rt2,
+                                    &cfg2,
+                                    l,
                                     shard,
-                                    query: query.clone(),
-                                    consistency: c,
-                                },
-                            )
-                            .await
-                            {
-                                Response::Legs(lists) => Ok(lists),
-                                Response::Error {
-                                    message,
-                                    leader_hint,
-                                } => Err(Self::not_leader(shard, &message, leader_hint)),
-                                other => Err(Error::Internal(format!(
-                                    "unexpected forward response {other:?}"
-                                ))),
-                            }
+                                    Request::ShardLegs {
+                                        shard,
+                                        query: q2,
+                                        consistency: c,
+                                    },
+                                )
+                                .await;
+                                tx.send(resp);
+                            });
+                            forwards.push((s, frx));
+                            outcomes.push(None);
                         }
-                        Some(r) => r,
-                        None => Err(Error::Internal("core stopped".into())),
-                    };
-                    match outcome {
+                        Some(r) => outcomes.push(Some(r)),
+                        None => outcomes.push(Some(Err(Error::Internal("core stopped".into())))),
+                    }
+                }
+                for (s, frx) in forwards {
+                    let shard = ShardId(s as u32);
+                    outcomes[s] = Some(match frx.await {
+                        Some(Response::Legs(lists)) => Ok(lists),
+                        Some(Response::Error {
+                            message,
+                            leader_hint,
+                        }) => Err(Self::not_leader(shard, &message, leader_hint)),
+                        Some(other) => Err(Error::Internal(format!(
+                            "unexpected forward response {other:?}"
+                        ))),
+                        None => Err(Error::Internal("forward task dropped".into())),
+                    });
+                }
+                let mut merged: Vec<LegList> = Vec::new();
+                for outcome in outcomes {
+                    match outcome.expect("every shard answered") {
                         Ok(lists) => {
                             if merged.is_empty() {
                                 merged = lists;

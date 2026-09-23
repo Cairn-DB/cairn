@@ -1,4 +1,5 @@
-//! Three real processes: writes, hybrid queries, takedowns, a killed and restarted node.
+//! Real processes: writes, hybrid queries, takedowns, a killed and restarted node; and shard
+//! placement with fewer replicas than nodes.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use bytes::Bytes;
@@ -86,6 +87,17 @@ impl Drop for Proc {
 }
 
 fn start(id: u32, addrs: &[(u32, SocketAddr)], data: &Path, schema_path: &Path) -> Proc {
+    start_with(id, addrs, data, schema_path, 4, 0)
+}
+
+fn start_with(
+    id: u32,
+    addrs: &[(u32, SocketAddr)],
+    data: &Path,
+    schema_path: &Path,
+    shards: u32,
+    replication: usize,
+) -> Proc {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cairn-server"));
     cmd.arg("--node-id")
         .arg(id.to_string())
@@ -96,7 +108,9 @@ fn start(id: u32, addrs: &[(u32, SocketAddr)], data: &Path, schema_path: &Path) 
         .arg("--schema")
         .arg(schema_path)
         .arg("--shards")
-        .arg("4")
+        .arg(shards.to_string())
+        .arg("--replication")
+        .arg(replication.to_string())
         .arg("--cores")
         .arg("2")
         .arg("--memtable-bytes")
@@ -266,6 +280,107 @@ fn three_process_cluster() {
     );
     assert_eq!(c2.get(DocId(5), Consistency::Stale).unwrap(), None);
     assert_eq!(c2.get(DocId(45), Consistency::Stale).unwrap(), None);
+    drop(procs);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Four nodes, eight shards, three replicas per shard: every node hosts six shards, every
+/// request works from every entry node (forwarded to a hosting node), and a killed node leaves
+/// every shard with a majority.
+#[test]
+fn placement_with_fewer_replicas_than_nodes() {
+    let dir = std::env::temp_dir().join(format!("cairn-placement-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let schema_path = dir.join("schema.json");
+    std::fs::write(&schema_path, serde_json::to_vec(&schema()).unwrap()).unwrap();
+    let addrs: Vec<(u32, SocketAddr)> = (1..=4).map(|i| (i, free_port())).collect();
+    let mut procs: Vec<Option<Proc>> = addrs
+        .iter()
+        .map(|(i, _)| Some(start_with(*i, &addrs, &dir, &schema_path, 8, 3)))
+        .collect();
+    let map: HashMap<NodeId, SocketAddr> = addrs.iter().map(|(i, a)| (NodeId(*i), *a)).collect();
+    let single = |i: u32| {
+        let mut c = Client::new([(NodeId(i), map[&NodeId(i)])].into_iter().collect());
+        c.max_attempts = 5;
+        c
+    };
+    let mut client = Client::new(map.clone());
+    wait_ready(&mut client);
+    for i in 1..=4 {
+        let mut c = single(i);
+        wait_ready(&mut c);
+        assert_eq!(c.status().unwrap().len(), 6, "node {i} hosts 6 of 8 shards");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    let docs: Vec<Document> = (1..=300).map(doc).collect();
+    for chunk in docs.chunks(50) {
+        client.upsert(chunk.to_vec()).unwrap();
+    }
+    let tokens = client.tokens();
+    let mut q = Query::new(5);
+    q.vectors.push(VectorLeg {
+        field: 0,
+        vector: match doc(45).values[0].clone().unwrap() {
+            Value::Vector(x) => x,
+            _ => unreachable!(),
+        },
+        ef: 0,
+    });
+    // Every node answers point reads and queries for every shard, hosted or not.
+    for i in 1..=4 {
+        let mut c = single(i);
+        for id in [1u64, 77, 150, 299] {
+            assert_eq!(
+                c.get(DocId(id), Consistency::Linearizable).unwrap(),
+                Some(doc(id)),
+                "node {i} doc {id}"
+            );
+        }
+        let hits = c.query(q.clone(), Consistency::Linearizable).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0].doc_id, DocId(45), "node {i}");
+    }
+    // Read-your-writes with this client's tokens, entering through each node.
+    for i in 1..=4 {
+        let mut c = single(i);
+        let hits = c
+            .call(&cairn_proto::Request::Query {
+                query: q.clone(),
+                consistency: Consistency::ReadYourWrites(tokens[0]),
+                tokens: tokens.clone(),
+            })
+            .unwrap();
+        assert!(matches!(hits, cairn_proto::Response::Hits(h) if h.len() == 5));
+    }
+
+    // Takedown visible from every entry node.
+    client.delete(vec![DocId(45)]).unwrap();
+    for i in 1..=4 {
+        let mut c = single(i);
+        assert_eq!(c.get(DocId(45), Consistency::Linearizable).unwrap(), None);
+        let hits = c.query(q.clone(), Consistency::Linearizable).unwrap();
+        assert!(hits.iter().all(|h| h.doc_id != DocId(45)), "node {i}");
+    }
+
+    // Kill node 2: every shard keeps two of its three replicas, so writes and linearizable
+    // reads continue through the surviving nodes.
+    procs[1] = None;
+    std::thread::sleep(Duration::from_secs(2));
+    let mut survivors: HashMap<NodeId, SocketAddr> = map.clone();
+    survivors.remove(&NodeId(2));
+    let mut c = Client::new(survivors);
+    for i in 301..=340u64 {
+        c.upsert(vec![doc(i)]).unwrap();
+    }
+    for id in [1u64, 150, 320, 340] {
+        assert_eq!(
+            c.get(DocId(id), Consistency::Linearizable).unwrap(),
+            Some(doc(id))
+        );
+    }
+    assert_eq!(c.query(q, Consistency::Linearizable).unwrap().len(), 5);
     drop(procs);
     let _ = std::fs::remove_dir_all(&dir);
 }

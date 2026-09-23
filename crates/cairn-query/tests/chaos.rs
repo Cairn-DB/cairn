@@ -69,6 +69,8 @@ fn config(node: NodeId) -> ReplicaConfig {
                 },
                 max_segments: 3,
                 max_deleted_fraction: 0.3,
+                target_segment_rows: 0,
+                min_merge: 4,
             },
             vector: VectorIndexParams {
                 hnsw: HnswParams {
@@ -81,6 +83,8 @@ fn config(node: NodeId) -> ReplicaConfig {
         dir: "shard0".into(),
         seed: 3,
         own_receiver: true,
+        idle_flush_ticks: 0,
+        compaction_slots: None,
     }
 }
 

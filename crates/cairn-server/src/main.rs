@@ -29,6 +29,9 @@ struct Cli {
     /// Shards.
     #[arg(long, default_value_t = 4)]
     shards: u32,
+    /// Replicas per shard (0: every node hosts every shard).
+    #[arg(long, default_value_t = 0)]
+    replication: usize,
     /// Executor threads.
     #[arg(long, default_value_t = 2)]
     cores: usize,
@@ -41,6 +44,15 @@ struct Cli {
     /// Keep only SQ8 codes and graphs of loaded segments in memory (no exact f32 rerank).
     #[arg(long)]
     sq8_only: bool,
+    /// Tiered compaction target in live rows per merged segment (0: pairwise policy only).
+    #[arg(long, default_value_t = 0)]
+    target_segment_rows: u32,
+    /// Concurrent compactions on this node across all shards.
+    #[arg(long, default_value_t = 2)]
+    compaction_slots: usize,
+    /// Flush an idle memtable after this many milliseconds without writes (0: never).
+    #[arg(long, default_value_t = 5000)]
+    idle_flush_ms: u64,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -68,11 +80,15 @@ fn main() -> anyhow::Result<()> {
         peers,
         data_dir: cli.data,
         shards: cli.shards,
+        replication: cli.replication,
         cores: cli.cores,
         schema,
         memtable_max_bytes: cli.memtable_bytes,
         max_segments: cli.max_segments,
         sq8_only: cli.sq8_only,
+        target_segment_rows: cli.target_segment_rows,
+        compaction_slots: cli.compaction_slots,
+        idle_flush_ms: cli.idle_flush_ms,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;
