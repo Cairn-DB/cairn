@@ -114,6 +114,24 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     50M BigANN rows downloading to data/bigann/ (fetch.sh; the host stalls over IPv6, use -4).
   - Report: docs/reports/phase-4-scale.md.
 
+- Scale follow-up part 2 (2026-09-23, owner: fix the missed 100 ms p99, accept 96 GB host,
+  membership/placement and a disk-resident index; Hetzner account available):
+  - Latency causes found: all clients on node 1; sequential leader forwards; idle memtables
+    scanned by every query; 23 segments/shard. Fixed (commit a967eca): client rotation,
+    concurrent forwards, --idle-flush-ms, tiered compaction (--target-segment-rows,
+    --compaction-slots per node). Measurement on the 20M data: IN PROGRESS (cluster restarted
+    on data/scale-bigann, post-load compaction to ~3 segments/shard, watcher
+    data/watch-compaction.sh).
+  - Placement DONE: --replication N (shard s on N consecutive nodes), 4-node RF3 process test
+    incl. a killed node. Dynamic membership changes (add/remove replica) NOT done yet.
+  - Hetzner: scripts + plan (docs/hetzner-plan.md), NOTHING created; needs the owner's go
+    (the hcloud project also holds production servers; everything is labelled project=cairn).
+  - Disk-resident index DONE (ADR 0014, commit 335182c): Vamana + PQ, Disk::map/prefetcher,
+    beam search. 100k SIFT: recall 0.994 @L64, warm 0.32 ms, cold 7.8 ms (beam 4). Build
+    3.4k rows/s/thread. 33 B/row RAM, 819 B/row disk.
+  - Next: 20M latency measurement; YFCC-10M latency re-test; SIFT1M disk-sweep; 50M local run
+    with --disk-index (BigANN prefix in data/bigann, download nearly complete).
+
 ## Next step
 Scale runs delivered 2026-09-23; owner wants to discuss concepts next. Scale-specific levers:
 fewer, larger segments (post-load compaction), per-query fixed cost (filter evaluation per
