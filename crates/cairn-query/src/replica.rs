@@ -121,6 +121,8 @@ pub struct ReplicaStatus {
     pub applied: LogIndex,
     /// Live documents (approximate: memtable + segments minus deletions).
     pub live_docs: u64,
+    /// Bytes in the active memtable (bounded by write backpressure).
+    pub memtable_bytes: u64,
     /// Segment ids in manifest order.
     pub segments: Vec<u64>,
 }
@@ -315,6 +317,8 @@ pub struct Replica<R: Runtime> {
     ticks: u64,
     last_apply_tick: u64,
     holds_slot: bool,
+    /// Proposals held back while the memtable is over its hard limit (write backpressure).
+    deferred: std::collections::VecDeque<(Command, Sender<Result<Token>>)>,
 }
 
 impl<R: Runtime> Replica<R> {
@@ -397,6 +401,9 @@ impl<R: Runtime> Replica<R> {
         for (_, (_, done)) in self.waiting_commit.drain() {
             done.send(closed());
         }
+        for (_, done) in self.deferred.drain(..) {
+            done.send(closed());
+        }
         for (_, ev) in self.waiting_reads.drain() {
             Self::fail(
                 ev,
@@ -447,6 +454,7 @@ impl<R: Runtime> Replica<R> {
             ticks: 0,
             last_apply_tick: 0,
             holds_slot: false,
+            deferred: std::collections::VecDeque::new(),
         };
         // Ticker.
         let (h, r2, tick) = (handle.clone(), rt.clone(), cfg.tick);
@@ -526,12 +534,13 @@ impl<R: Runtime> Replica<R> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("bad frame from {from}: {e}"),
             },
-            Event::Propose(cmd, done) => match self.raft.propose(cmd.to_bytes()) {
-                Ok(index) => {
-                    self.waiting_commit.insert(index, (self.raft.term(), done));
+            Event::Propose(cmd, done) => {
+                if self.over_write_limit() {
+                    self.deferred.push_back((cmd, done));
+                } else {
+                    self.propose(cmd, done);
                 }
-                Err(e) => done.send(Err(e)),
-            },
+            }
             Event::Query(q, c, done) => self.read(Event::Query(q, c, done)).await?,
             Event::QueryLegs(q, c, done) => self.read(Event::QueryLegs(q, c, done)).await?,
             Event::Get(id, c, done) => self.read(Event::Get(id, c, done)).await?,
@@ -542,6 +551,7 @@ impl<R: Runtime> Replica<R> {
                     .finish_flush(job, docs, sections)
                     .await?;
                 self.after_publish().await?;
+                self.release_deferred();
             }
             Event::CompactBuilt(job, sections) => {
                 self.release_slot();
@@ -566,6 +576,7 @@ impl<R: Runtime> Replica<R> {
                     });
                 }
                 self.maybe_compact_job().await?;
+                self.release_deferred();
             }
             Event::Status(done) => {
                 let st = self.engine.store();
@@ -577,6 +588,7 @@ impl<R: Runtime> Replica<R> {
                     commit: self.raft.commit_index(),
                     applied: st.applied_index(),
                     live_docs: st.approx_live_docs(),
+                    memtable_bytes: st.memtable_bytes() as u64,
                     segments: st.segments().map(|s| s.id.get()).collect(),
                 });
             }
@@ -804,6 +816,19 @@ impl<R: Runtime> Replica<R> {
                     self.waiting_applied.push((index, ev));
                 }
             }
+            // Reads Raft gave up on (leadership changed, or the leader never answered a
+            // follower read): fail them with a hint so the coordinator retries at the leader.
+            for id in ready.failed_reads {
+                if let Some(ev) = self.waiting_reads.remove(&id) {
+                    Self::fail(
+                        ev,
+                        Error::NotLeader {
+                            shard: self.cfg.shard,
+                            leader_hint: self.raft.leader(),
+                        },
+                    );
+                }
+            }
             // Proposals from a lost leadership can never commit with their term.
             if self.raft.role() != Role::Leader && !self.waiting_commit.is_empty() {
                 let hint = self.raft.leader();
@@ -864,6 +889,33 @@ impl<R: Runtime> Replica<R> {
 
     /// After a segment was published: reload indexes, compact the Raft log to the manifest,
     /// and start a compaction if the policy asks for one.
+    fn propose(&mut self, cmd: Command, done: Sender<Result<Token>>) {
+        match self.raft.propose(cmd.to_bytes()) {
+            Ok(index) => {
+                self.waiting_commit.insert(index, (self.raft.term(), done));
+            }
+            Err(e) => done.send(Err(e)),
+        }
+    }
+
+    /// Write backpressure: while a flush is building, the active memtable keeps filling; past
+    /// twice its threshold, new proposals wait for the build. Without it, ingest faster than
+    /// index builds grows the memtable (and the in-memory Raft log) without bound.
+    fn over_write_limit(&self) -> bool {
+        let st = self.engine.store();
+        st.job_active() && st.memtable_bytes() >= 2 * self.cfg.engine.store.memtable_max_bytes
+    }
+
+    /// Releases held-back proposals while under the limit.
+    fn release_deferred(&mut self) {
+        while !self.over_write_limit() {
+            let Some((cmd, done)) = self.deferred.pop_front() else {
+                break;
+            };
+            self.propose(cmd, done);
+        }
+    }
+
     async fn after_publish(&mut self) -> Result<()> {
         self.engine.refresh().await?;
         let up_to = self.engine.store().manifest().applied_index;
@@ -879,6 +931,11 @@ impl<R: Runtime> Replica<R> {
             self.raft.compact(snap);
             self.state.snapshot_term = term;
             self.state_store.store(&self.state).await?;
+        }
+        // A full memtable flushes before any compaction: compactions are long, and writes are
+        // held back while the memtable is over its limit.
+        if self.engine.store().memtable_bytes() >= self.cfg.engine.store.memtable_max_bytes {
+            return self.start_flush_job();
         }
         self.maybe_compact_job().await
     }

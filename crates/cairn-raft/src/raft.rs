@@ -60,6 +60,8 @@ struct PendingRead {
     id: u64,
     index: LogIndex,
     seq: u64,
+    /// The follower that asked (follower read), or `None` for a read served here.
+    from: Option<NodeId>,
 }
 
 /// What the driver must do after a batch of steps.
@@ -79,6 +81,9 @@ pub struct Ready {
     pub snapshot: Option<Snapshot>,
     /// Reads that may now be served at (or after) the given applied index.
     pub read_states: Vec<(u64, LogIndex)>,
+    /// Reads that will never complete here (leadership changed or the leader did not answer):
+    /// the driver fails them so the client retries through the current leader.
+    pub failed_reads: Vec<u64>,
 }
 
 impl Ready {
@@ -91,6 +96,7 @@ impl Ready {
             && self.committed.is_empty()
             && self.snapshot.is_none()
             && self.read_states.is_empty()
+            && self.failed_reads.is_empty()
     }
 }
 
@@ -125,6 +131,9 @@ pub struct Raft {
     msgs: Vec<(NodeId, Message)>,
     snapshot_to_install: Option<Snapshot>,
     read_states: Vec<(u64, LogIndex)>,
+    /// Follower reads waiting for the leader's answer: `(id, ticks waited)`.
+    follower_reads: Vec<(u64, u32)>,
+    failed_reads: Vec<u64>,
     /// Local snapshot offered to lagging followers.
     snapshot: Option<Snapshot>,
     /// An accepted snapshot the driver has not finished installing.
@@ -176,6 +185,8 @@ impl Raft {
             msgs: Vec::new(),
             snapshot_to_install: None,
             read_states: Vec::new(),
+            follower_reads: Vec::new(),
+            failed_reads: Vec::new(),
             snapshot: None,
             installing: false,
             cfg,
@@ -291,11 +302,33 @@ impl Raft {
         self.role = Role::Follower;
         self.leader = leader;
         self.votes.clear();
-        self.reads.clear();
+        self.abandon_reads();
         self.reset_election_timer();
     }
 
+    /// Leadership changed (or may have): every pending read is failed, locally for this node's
+    /// own reads and with a refusal for followers that asked us. Clients retry.
+    fn abandon_reads(&mut self) {
+        for r in std::mem::take(&mut self.reads) {
+            match r.from {
+                None => self.failed_reads.push(r.id),
+                Some(p) => self.send(
+                    p,
+                    Message::ReadIndexResp {
+                        term: self.term,
+                        id: r.id,
+                        index: LogIndex(0),
+                        ok: false,
+                    },
+                ),
+            }
+        }
+        self.failed_reads
+            .extend(self.follower_reads.drain(..).map(|(id, _)| id));
+    }
+
     fn become_pre_candidate(&mut self) {
+        self.abandon_reads();
         self.role = Role::PreCandidate;
         self.leader = None;
         self.votes.clear();
@@ -409,6 +442,19 @@ impl Raft {
 
     /// Advances time by one tick.
     pub fn tick(&mut self) {
+        // A follower read whose answer never came (lost message, leader gone quiet) fails after
+        // two election timeouts; the client retries.
+        let limit = self.cfg.election_ticks.max(1) * 2;
+        let mut i = 0;
+        while i < self.follower_reads.len() {
+            self.follower_reads[i].1 += 1;
+            if self.follower_reads[i].1 > limit {
+                let (id, _) = self.follower_reads.swap_remove(i);
+                self.failed_reads.push(id);
+            } else {
+                i += 1;
+            }
+        }
         match self.role {
             Role::Leader => {
                 self.heartbeat_elapsed += 1;
@@ -439,21 +485,43 @@ impl Raft {
         Ok(index)
     }
 
-    /// Requests a linearizable read point; leader only. The driver waits for the matching
-    /// `read_states` entry, then applies up to that index before serving.
+    /// Requests a linearizable read point. On the leader, a heartbeat round confirms
+    /// leadership. On a follower that knows its leader, the leader is asked for its commit index
+    /// (follower read, Raft thesis 6.4) and the read is served here once applied up to it.
+    /// The driver waits for the matching `read_states` entry (or `failed_reads`).
     pub fn read_index(&mut self, id: u64) -> Result<()> {
-        if self.role != Role::Leader {
-            return Err(Error::NotLeader {
+        match (self.role, self.leader) {
+            (Role::Leader, _) => {
+                self.start_read(id, None);
+                Ok(())
+            }
+            (Role::Follower, Some(l)) if l != self.cfg.id => {
+                self.follower_reads.push((id, 0));
+                self.send(
+                    l,
+                    Message::ReadIndexReq {
+                        term: self.term,
+                        id,
+                    },
+                );
+                Ok(())
+            }
+            _ => Err(Error::NotLeader {
                 shard: cairn_core::ShardId(0),
                 leader_hint: self.leader,
-            });
+            }),
         }
+    }
+
+    /// Leader: records a read at the current commit index and starts a heartbeat round.
+    fn start_read(&mut self, id: u64, from: Option<NodeId>) {
         self.heartbeat_seq += 1;
         let seq = self.heartbeat_seq;
         self.reads.push(PendingRead {
             id,
             index: self.commit,
             seq,
+            from,
         });
         if self.cfg.peers.len() == 1 {
             self.check_reads();
@@ -464,7 +532,6 @@ impl Raft {
                 }
             }
         }
-        Ok(())
     }
 
     /// Installs the local snapshot offered to lagging followers and drops in-memory entries up
@@ -664,6 +731,36 @@ impl Raft {
                         index: snapshot.last_index,
                     },
                 );
+            }
+            Message::ReadIndexReq { id, .. } => {
+                if self.role == Role::Leader {
+                    self.start_read(id, Some(from));
+                } else {
+                    self.send(
+                        from,
+                        Message::ReadIndexResp {
+                            term: self.term,
+                            id,
+                            index: LogIndex(0),
+                            ok: false,
+                        },
+                    );
+                }
+            }
+            Message::ReadIndexResp { id, index, ok, .. } => {
+                // Only the current leader's answer counts; a stale one is ignored and the read
+                // times out (or was already failed by a leadership change).
+                if self.leader != Some(from) {
+                    return;
+                }
+                if let Some(pos) = self.follower_reads.iter().position(|r| r.0 == id) {
+                    self.follower_reads.swap_remove(pos);
+                    if ok {
+                        self.read_states.push((id, index));
+                    } else {
+                        self.failed_reads.push(id);
+                    }
+                }
             }
             Message::SnapshotResp { index, .. } => {
                 if self.role != Role::Leader {
@@ -907,7 +1004,19 @@ impl Raft {
         }
         for i in done.into_iter().rev() {
             let r = self.reads.remove(i);
-            self.read_states.push((r.id, r.index.max(self.lead_start)));
+            let index = r.index.max(self.lead_start);
+            match r.from {
+                None => self.read_states.push((r.id, index)),
+                Some(p) => self.send(
+                    p,
+                    Message::ReadIndexResp {
+                        term: self.term,
+                        id: r.id,
+                        index,
+                        ok: true,
+                    },
+                ),
+            }
         }
     }
 
@@ -956,6 +1065,7 @@ impl Raft {
             ready.committed = self.entries[start..end].to_vec();
         }
         ready.read_states = std::mem::take(&mut self.read_states);
+        ready.failed_reads = std::mem::take(&mut self.failed_reads);
         ready
     }
 
@@ -995,6 +1105,7 @@ mod tests {
         disk: Disk,
         alive: bool,
         read_states: Vec<(u64, LogIndex)>,
+        failed_reads: Vec<u64>,
     }
 
     struct Cluster {
@@ -1035,6 +1146,7 @@ mod tests {
                     disk: Disk::default(),
                     alive: true,
                     read_states: Vec::new(),
+                    failed_reads: Vec::new(),
                 })
                 .collect();
             Cluster {
@@ -1107,6 +1219,7 @@ mod tests {
                 .last()
                 .map_or(node.disk.snapshot.0, |e| e.index);
             node.read_states.extend(ready.read_states.iter().copied());
+            node.failed_reads.extend(ready.failed_reads.iter().copied());
             node.raft.advance(persisted, applied);
             let from = node.raft.id();
             if node.raft.role() == Role::Leader {
@@ -1369,9 +1482,58 @@ mod tests {
         });
         assert_eq!(id, 42);
         assert!(index >= c.nodes[li].raft.commit_index().min(index));
-        // A follower cannot serve read index.
+
+        // Follower read: the leader confirms and answers with an index at least its commit
+        // index when the request arrived.
+        c.propose();
+        for _ in 0..10 {
+            c.tick();
+            c.deliver_some(50);
+        }
+        let leader_commit = c.nodes[li].raft.commit_index();
         let fi = (0..3).find(|i| *i != li).unwrap();
-        assert!(c.nodes[fi].raft.read_index(1).is_err());
+        c.nodes[fi].raft.read_index(7).unwrap();
+        c.drain_ready(fi);
+        let mut got = None;
+        for _ in 0..40 {
+            c.deliver_some(50);
+            if let Some(rs) = c.nodes[fi].read_states.iter().find(|r| r.0 == 7) {
+                got = Some(*rs);
+                break;
+            }
+        }
+        let (_, index) = got.expect("follower read resolved");
+        assert!(index >= leader_commit, "{index} < {leader_commit}");
+    }
+
+    #[test]
+    fn follower_read_fails_when_the_leader_goes_away() {
+        let mut c = Cluster::new(3, 9, 0.0);
+        for _ in 0..40 {
+            c.tick();
+            c.deliver_some(50);
+        }
+        let li = c
+            .nodes
+            .iter()
+            .position(|n| n.raft.role() == Role::Leader)
+            .unwrap();
+        let fi = (0..3).find(|i| *i != li).unwrap();
+        c.crash(li);
+        c.nodes[fi].raft.read_index(99).unwrap();
+        c.drain_ready(fi);
+        for _ in 0..200 {
+            c.tick();
+            c.deliver_some(50);
+            if c.nodes[fi].failed_reads.contains(&99) {
+                break;
+            }
+        }
+        assert!(
+            c.nodes[fi].failed_reads.contains(&99),
+            "the read must fail, not hang"
+        );
+        assert!(!c.nodes[fi].read_states.iter().any(|r| r.0 == 99));
     }
 
     fn chaos(seed: u64, nodes: u32, steps: usize) {
@@ -1469,6 +1631,16 @@ mod tests {
     fn message_codec_roundtrip() {
         use cairn_core::codec::{Reader, Writer};
         let msgs = vec![
+            Message::ReadIndexReq {
+                term: Term(3),
+                id: 17,
+            },
+            Message::ReadIndexResp {
+                term: Term(3),
+                id: 17,
+                index: LogIndex(40),
+                ok: true,
+            },
             Message::PreVote {
                 term: Term(3),
                 last_index: LogIndex(9),

@@ -203,12 +203,16 @@ fn replicates_serves_all_consistency_levels_and_hides_takedowns() {
             .await
             .unwrap();
         assert_eq!(got, Some(doc(30)));
-        // Linearizable on a follower is refused.
+        // Linearizable on a follower (follower read: the leader confirms a read index, the
+        // follower serves once applied up to it) sees the last acknowledged write.
         let fi = (0..3).find(|i| *i != li).unwrap();
-        assert!(matches!(
-            hs[fi].get(DocId(30), Consistency::Linearizable).await,
-            Err(cairn_core::Error::NotLeader { .. })
-        ));
+        assert_eq!(
+            hs[fi]
+                .get(DocId(30), Consistency::Linearizable)
+                .await
+                .unwrap(),
+            Some(doc(30))
+        );
         // Read-your-writes with the token succeeds on every replica (waiting if needed).
         for h in &hs {
             assert_eq!(

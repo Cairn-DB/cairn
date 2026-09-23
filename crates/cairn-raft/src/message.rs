@@ -113,6 +113,24 @@ pub enum Message {
         /// Last index the follower now holds.
         index: LogIndex,
     },
+    /// A follower asks the leader for a linearizable read point (follower reads).
+    ReadIndexReq {
+        /// Sender's term.
+        term: Term,
+        /// The follower's read id.
+        id: u64,
+    },
+    /// The leader's answer, after confirming its leadership with a quorum.
+    ReadIndexResp {
+        /// Leader's term.
+        term: Term,
+        /// Read id echoed.
+        id: u64,
+        /// The read may be served once this index is applied.
+        index: LogIndex,
+        /// False when the leader could not confirm (stepped down): retry elsewhere.
+        ok: bool,
+    },
 }
 
 impl Message {
@@ -126,7 +144,9 @@ impl Message {
             | Message::Append { term, .. }
             | Message::AppendResp { term, .. }
             | Message::InstallSnapshot { term, .. }
-            | Message::SnapshotResp { term, .. } => *term,
+            | Message::SnapshotResp { term, .. }
+            | Message::ReadIndexReq { term, .. }
+            | Message::ReadIndexResp { term, .. } => *term,
         }
     }
 
@@ -200,6 +220,21 @@ impl Message {
             Message::SnapshotResp { term, index } => {
                 w.u8(8).u64(term.get()).u64(index.get());
             }
+            Message::ReadIndexReq { term, id } => {
+                w.u8(9).u64(term.get()).u64(*id);
+            }
+            Message::ReadIndexResp {
+                term,
+                id,
+                index,
+                ok,
+            } => {
+                w.u8(10)
+                    .u64(term.get())
+                    .u64(*id)
+                    .u64(index.get())
+                    .u8(u8::from(*ok));
+            }
         }
     }
 
@@ -268,6 +303,16 @@ impl Message {
             8 => Message::SnapshotResp {
                 term: Term(r.u64()?),
                 index: LogIndex(r.u64()?),
+            },
+            9 => Message::ReadIndexReq {
+                term: Term(r.u64()?),
+                id: r.u64()?,
+            },
+            10 => Message::ReadIndexResp {
+                term: Term(r.u64()?),
+                id: r.u64()?,
+                index: LogIndex(r.u64()?),
+                ok: r.u8()? != 0,
             },
             t => return Err(Error::corruption(format!("unknown raft message tag {t}"))),
         })

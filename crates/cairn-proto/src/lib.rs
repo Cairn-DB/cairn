@@ -272,6 +272,7 @@ fn enc_status(w: &mut Writer, s: &ReplicaStatus) {
         .u64(s.commit.get())
         .u64(s.applied.get())
         .u64(s.live_docs)
+        .u64(s.memtable_bytes)
         .u32(s.segments.len() as u32);
     for x in &s.segments {
         w.u64(*x);
@@ -294,6 +295,7 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
     let commit = LogIndex(r.u64()?);
     let applied = LogIndex(r.u64()?);
     let live_docs = r.u64()?;
+    let memtable_bytes = r.u64()?;
     let n = r.u32()? as usize;
     let mut segments = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -307,6 +309,7 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
         commit,
         applied,
         live_docs,
+        memtable_bytes,
         segments,
     })
 }
@@ -656,6 +659,7 @@ mod tests {
             commit: LogIndex(10),
             applied: LogIndex(9),
             live_docs: 3,
+            memtable_bytes: 4096,
             segments: vec![1, 2],
         };
         let resps = vec![
