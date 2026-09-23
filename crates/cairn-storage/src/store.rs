@@ -142,6 +142,8 @@ pub struct FlushJob {
     pub last: LogIndex,
     /// Id of the segment to create.
     pub id: SegmentId,
+    /// Store generation when the job began (see [`Store::job_is_current`]).
+    pub generation: u64,
 }
 
 /// A compaction in progress.
@@ -154,6 +156,8 @@ pub struct CompactJob {
     pub log_last: LogIndex,
     /// Id of the merged segment.
     pub id: SegmentId,
+    /// Store generation when the job began (see [`Store::job_is_current`]).
+    pub generation: u64,
 }
 
 /// Read-only view of one open segment for the query layer.
@@ -195,6 +199,10 @@ pub struct Store<R: Runtime> {
     masked_during_build: cairn_core::HashSet<DocId>,
     /// Whether a flush or compaction job is in progress.
     job_active: bool,
+    /// Bumped whenever the store's state is replaced (snapshot install): a build that began
+    /// before must be discarded, or it would publish pre-snapshot rows under a segment id the
+    /// snapshot may already use.
+    generation: u64,
     /// Bumped whenever the memtable changes.
     memtable_version: u64,
     /// Bumped whenever the segment list changes.
@@ -318,6 +326,7 @@ impl<R: Runtime> Store<R> {
             frozen: None,
             masked_during_build: cairn_core::HashSet::default(),
             job_active: false,
+            generation: 0,
             memtable_version: 0,
             segments_version: 0,
         };
@@ -551,6 +560,7 @@ impl<R: Runtime> Store<R> {
         self.masked_during_build.clear();
         self.memtable_version += 1;
         Some(FlushJob {
+            generation: self.generation,
             docs,
             last,
             id: SegmentId(self.manifest.next_segment_id),
@@ -567,13 +577,22 @@ impl<R: Runtime> Store<R> {
         indexer.sections(schema, &refs)
     }
 
-    /// Writes and publishes the segment of a flush job.
+    /// Whether a job that began at `generation` still applies (no snapshot was installed since).
+    pub fn job_is_current(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    /// Writes and publishes the segment of a flush job. A job that began before a snapshot was
+    /// installed is discarded (its rows are covered by the snapshot).
     pub async fn finish_flush(
         &mut self,
         job: FlushJob,
         docs: Vec<Document>,
         sections: Vec<(String, Vec<u8>)>,
     ) -> Result<()> {
+        if !self.job_is_current(job.generation) {
+            return Ok(());
+        }
         self.persist_dirty_deletions().await?;
         let mut new_manifest = self.manifest.clone();
         let mut new_segment = None;
@@ -748,6 +767,7 @@ impl<R: Runtime> Store<R> {
         self.job_active = true;
         self.masked_during_build.clear();
         Ok(CompactJob {
+            generation: self.generation,
             inputs: ids.to_vec(),
             docs,
             log_last,
@@ -761,6 +781,9 @@ impl<R: Runtime> Store<R> {
         job: CompactJob,
         sections: Vec<(String, Vec<u8>)>,
     ) -> Result<()> {
+        if !self.job_is_current(job.generation) {
+            return Ok(());
+        }
         let first = self
             .segments
             .iter()
@@ -981,6 +1004,7 @@ impl<R: Runtime> Store<R> {
         self.memtable.clear();
         self.frozen = None;
         self.job_active = false;
+        self.generation += 1;
         self.masked_during_build.clear();
         self.applied = self.manifest.applied_index;
         if self.log.first_index() != self.applied.next()
