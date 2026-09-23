@@ -1,6 +1,6 @@
 # Phase 3 simulation campaign
 
-- Date: 2026-09-23. Code: commit e6250b8 (run on its working tree before committing; parent f02f23d).
+- Date: 2026-09-23. Code: commit dfafc80 (run on its working tree before committing).
 - Scenario: crates/cairn-query/tests/chaos.rs (3 nodes, 3 clients, 12 keys, 40 fault rounds: partitions, 3% drops, crashes and restarts, flushes every ~3 KB, snapshots).
 - Seeds: 0..20000 in 8 processes; wall time 53 s.
 - Checks per run: every read against the per-key model with real-time bounds, read-your-takedown on Linearizable and ReadYourWrites reads, replica convergence (applied index and documents), determinism digest.
