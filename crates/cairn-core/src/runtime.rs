@@ -99,6 +99,12 @@ pub trait Network {
 
     /// This node's id.
     fn local_id(&self) -> NodeId;
+
+    /// Diagnostics: bytes queued for sending to peers, and messages received but not yet
+    /// consumed. Zero where the transport has no queues.
+    fn queue_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// Everything engine code may ask of its environment.

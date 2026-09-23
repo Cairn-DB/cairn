@@ -548,7 +548,19 @@ fn run(seed: u64) -> (usize, usize, u64) {
     });
     assert!(
         docs.iter().all(|d| *d == docs[0]),
-        "seed {seed}: replicas hold different documents: {docs:?}"
+        "seed {seed}: replicas hold different documents: {docs:?}\nstatuses: {:?}",
+        statuses
+            .iter()
+            .map(|s| (
+                s.id,
+                s.role,
+                s.term,
+                s.commit,
+                s.applied,
+                s.live_docs,
+                s.segments.clone()
+            ))
+            .collect::<Vec<_>>()
     );
     let hist = history.borrow();
     let (reads, checked) = check(&hist);

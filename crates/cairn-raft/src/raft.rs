@@ -53,12 +53,45 @@ struct Progress {
     matched: LogIndex,
     /// Highest heartbeat sequence acknowledged.
     acked_seq: u64,
-    /// Appends carrying entries sent and not yet answered (flow control).
-    inflight: u32,
+    /// Sequences of the entry-bearing appends sent and not yet answered (`inflight_n` of
+    /// them). A response echoes the sequence of the message it answers and settles exactly that
+    /// append; heartbeat responses settle nothing. (Letting any response free a slot drained
+    /// the window while appends were still in flight, and the leader re-sent the same
+    /// megabytes over and over: 42 GB queued on a real network.)
+    inflight_seqs: [u64; MAX_INFLIGHT as usize],
+    inflight_n: u32,
     /// Last index sent in an append carrying entries (pipelining point).
     sent: LogIndex,
-    /// Sequence of the latest append carrying entries.
-    sent_seq: u64,
+    /// Leader ticks since an append to this follower was last settled while some are in
+    /// flight; past an election timeout they are presumed lost and re-sent from `next`.
+    stalled_ticks: u32,
+}
+
+impl Progress {
+    /// Settles the append answered by a response with sequence `seq`, if it is one of ours.
+    fn settle(&mut self, seq: u64) {
+        let n = self.inflight_n as usize;
+        if let Some(i) = self.inflight_seqs[..n].iter().position(|s| *s == seq) {
+            self.inflight_seqs.copy_within(i + 1..n, i);
+            self.inflight_n -= 1;
+            self.stalled_ticks = 0;
+        }
+    }
+
+    /// Forgets everything in flight; the next append starts again from `next`.
+    fn reset_window(&mut self) {
+        self.inflight_n = 0;
+        self.stalled_ticks = 0;
+        self.sent = LogIndex(self.next.get() - 1);
+    }
+
+    fn push_inflight(&mut self, seq: u64) {
+        let n = self.inflight_n as usize;
+        if n < self.inflight_seqs.len() {
+            self.inflight_seqs[n] = seq;
+            self.inflight_n += 1;
+        }
+    }
 }
 
 /// Appends carrying entries allowed in flight per follower. Beyond it the leader only sends
@@ -151,6 +184,9 @@ pub struct Raft {
     snapshot: Option<Snapshot>,
     /// An accepted snapshot the driver has not finished installing.
     installing: bool,
+    /// Diagnostics: entries shipped in appends (counting re-sends) and follower rejections.
+    entries_sent: u64,
+    rejects: u64,
 }
 
 impl Raft {
@@ -200,6 +236,8 @@ impl Raft {
             read_states: Vec::new(),
             follower_reads: Vec::new(),
             failed_reads: Vec::new(),
+            entries_sent: 0,
+            rejects: 0,
             snapshot: None,
             installing: false,
             cfg,
@@ -407,9 +445,10 @@ impl Raft {
                     next,
                     matched: LogIndex(0),
                     acked_seq: 0,
-                    inflight: 0,
+                    inflight_seqs: [0; MAX_INFLIGHT as usize],
+                    inflight_n: 0,
                     sent: LogIndex(next.get() - 1),
-                    sent_seq: 0,
+                    stalled_ticks: 0,
                 },
             );
         }
@@ -473,6 +512,18 @@ impl Raft {
         }
         match self.role {
             Role::Leader => {
+                // Appends in flight with no answer for several election timeouts were lost (a
+                // broken connection drops queued messages): re-send from the follower's `next`.
+                // Generous on purpose: a follower that is merely slow must not be flooded.
+                let limit = self.cfg.election_ticks.max(1) * 6;
+                for p in self.progress.values_mut() {
+                    if p.inflight_n > 0 {
+                        p.stalled_ticks += 1;
+                        if p.stalled_ticks >= limit {
+                            p.reset_window();
+                        }
+                    }
+                }
                 self.heartbeat_elapsed += 1;
                 if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
                     self.heartbeat_elapsed = 0;
@@ -560,6 +611,31 @@ impl Raft {
             .filter(|(p, _)| **p != self.cfg.id)
             .map(|(_, x)| x.matched)
             .min()
+    }
+
+    /// Diagnostics: per follower `(next, matched, sent, in-flight sequences)`.
+    #[allow(clippy::type_complexity)]
+    pub fn debug_progress(&self) -> Vec<(NodeId, LogIndex, LogIndex, LogIndex, Vec<u64>)> {
+        let mut v: Vec<_> = self
+            .progress
+            .iter()
+            .map(|(n, p)| {
+                (
+                    *n,
+                    p.next,
+                    p.matched,
+                    p.sent,
+                    p.inflight_seqs[..p.inflight_n as usize].to_vec(),
+                )
+            })
+            .collect();
+        v.sort_by_key(|x| x.0);
+        v
+    }
+
+    /// Diagnostics: entries shipped in appends so far (re-sends included) and rejections received.
+    pub fn send_stats(&self) -> (u64, u64) {
+        (self.entries_sent, self.rejects)
     }
 
     /// Payload bytes of the entries held in memory.
@@ -727,22 +803,13 @@ impl Raft {
                     return;
                 };
                 p.acked_seq = p.acked_seq.max(seq);
-                // Flow control: a response to the latest entry-bearing append (or later) means
-                // every earlier one was processed or lost; otherwise one fewer is in flight.
-                if seq >= p.sent_seq {
-                    p.inflight = 0;
-                } else {
-                    p.inflight = p.inflight.saturating_sub(1);
-                }
+                // Flow control: settle exactly the appends this response covers.
+                p.settle(seq);
                 if success {
                     if index > p.matched {
                         p.matched = index;
                     }
                     p.next = p.matched.next().max(p.next);
-                    if p.inflight == 0 && p.sent > p.matched {
-                        // Something sent was lost: resend from `next`.
-                        p.sent = p.matched;
-                    }
                     let next = p.next;
                     self.maybe_commit();
                     self.check_reads();
@@ -750,11 +817,11 @@ impl Raft {
                         self.send_append(from);
                     }
                 } else {
+                    self.rejects += 1;
                     // Back off to the follower's hint, never below what it already matched.
                     let hint = index.max(p.matched.next());
                     p.next = hint.min(p.next.get().saturating_sub(1).max(1).into());
-                    p.inflight = 0;
-                    p.sent = LogIndex(p.next.get() - 1);
+                    p.reset_window();
                     self.send_append(from);
                 }
             }
@@ -984,12 +1051,12 @@ impl Raft {
         }
         // Pipeline after what is already in flight; when the window is full (or nothing is new),
         // send a heartbeat (no entries) anchored at `next`.
-        let from = if p.inflight > 0 {
+        let from = if p.inflight_n > 0 {
             p.next.max(p.sent.next())
         } else {
             p.next
         };
-        let with_entries = p.inflight < MAX_INFLIGHT && from <= self.last_index();
+        let with_entries = p.inflight_n < MAX_INFLIGHT && from <= self.last_index();
         let (prev_index, entries) = if with_entries {
             let start = (from.get() - self.first_index.get()) as usize;
             let mut end = start;
@@ -1014,10 +1081,10 @@ impl Raft {
             // covers (sequences stay monotonic, as ReadIndex needs).
             self.heartbeat_seq += 1;
             let seq = self.heartbeat_seq;
+            self.entries_sent += entries.len() as u64;
             if let Some(pm) = self.progress.get_mut(&to) {
-                pm.inflight += 1;
+                pm.push_inflight(seq);
                 pm.sent = entries.last().map_or(pm.sent, |e| e.index);
-                pm.sent_seq = seq;
             }
             seq
         };
@@ -1206,6 +1273,7 @@ mod tests {
         leaders_by_term: HashMap<Term, NodeId>,
         committed: HashMap<LogIndex, Entry>,
         blocked: HashSet<(NodeId, NodeId)>,
+        in_order: bool,
         proposed: u64,
         drop_prob: f64,
     }
@@ -1247,6 +1315,7 @@ mod tests {
                 leaders_by_term: HashMap::default(),
                 committed: HashMap::default(),
                 blocked: HashSet::default(),
+                in_order: false,
                 proposed: 0,
                 drop_prob,
             }
@@ -1344,13 +1413,40 @@ mod tests {
             self.step_all_ready();
         }
 
+        /// Delivers up to `max` messages in send order per link (like one TCP stream per
+        /// peer): the realistic transport, as opposed to `deliver_some`'s random reordering.
+        fn deliver_in_order(&mut self, max: usize) {
+            for _ in 0..max {
+                if self.inflight.is_empty() {
+                    break;
+                }
+                let (from, to, m) = self.inflight.remove(0);
+                let idx = (to.get() - 1) as usize;
+                if !self.nodes[idx].alive {
+                    continue;
+                }
+                self.nodes[idx].raft.step(from, m);
+                self.drain_ready(idx);
+            }
+        }
+
         fn deliver_some(&mut self, max: usize) {
             for _ in 0..max {
                 if self.inflight.is_empty() {
                     break;
                 }
-                let k = self.rng.below(self.inflight.len() as u64) as usize;
-                let (from, to, m) = self.inflight.swap_remove(k);
+                // In-order mode delivers each message in send order (one TCP stream per link,
+                // losses and partitions still apply); otherwise any message may overtake.
+                let k = if self.in_order {
+                    0
+                } else {
+                    self.rng.below(self.inflight.len() as u64) as usize
+                };
+                let (from, to, m) = if self.in_order {
+                    self.inflight.remove(k)
+                } else {
+                    self.inflight.swap_remove(k)
+                };
                 if self.blocked.contains(&(from, to)) || self.rng.chance(self.drop_prob) {
                     continue;
                 }
@@ -1597,6 +1693,60 @@ mod tests {
         assert!(index >= leader_commit, "{index} < {leader_commit}");
     }
 
+    /// Many proposals (each broadcasting heartbeats while the window is full) must not make
+    /// the leader re-send entries: every entry is shipped to each follower about once.
+    #[test]
+    fn heartbeats_do_not_drain_the_append_window() {
+        let mut c = Cluster::new(3, 21, 0.0);
+        for _ in 0..40 {
+            c.tick();
+            c.deliver_some(50);
+        }
+        let li = c
+            .nodes
+            .iter()
+            .position(|n| n.raft.role() == Role::Leader)
+            .unwrap();
+        let proposed = 200 * 5;
+        for round in 0..200 {
+            // Several proposals per round: each broadcasts to both followers.
+            for _ in 0..5 {
+                c.nodes[li]
+                    .raft
+                    .propose(Bytes::from(vec![round as u8; 64]))
+                    .unwrap();
+            }
+            c.drain_ready(li);
+            // Deliver slowly, in order (one TCP stream per peer), so appends stay in flight while
+            // heartbeats pile up.
+            c.deliver_in_order(3);
+        }
+        for _ in 0..2000 {
+            c.tick();
+            c.deliver_in_order(100);
+            if c.nodes
+                .iter()
+                .all(|n| n.raft.commit_index() > LogIndex(proposed as u64))
+            {
+                break;
+            }
+        }
+        let (shipped, _) = c.nodes[li].raft.send_stats();
+        let commits: Vec<LogIndex> = c.nodes.iter().map(|n| n.raft.commit_index()).collect();
+        assert!(
+            c.nodes
+                .iter()
+                .all(|n| n.raft.commit_index() > LogIndex(proposed as u64)),
+            "{commits:?}"
+        );
+        // Each entry goes to each of the two followers once (the old window let heartbeat
+        // responses free slots and re-sent batches many times over).
+        assert!(
+            shipped as usize <= proposed * 2 + 64,
+            "entries shipped {shipped} for {proposed} proposals to 2 followers"
+        );
+    }
+
     #[test]
     fn follower_read_fails_when_the_leader_goes_away() {
         let mut c = Cluster::new(3, 9, 0.0);
@@ -1628,7 +1778,12 @@ mod tests {
     }
 
     fn chaos(seed: u64, nodes: u32, steps: usize) {
+        chaos_with(seed, nodes, steps, false);
+    }
+
+    fn chaos_with(seed: u64, nodes: u32, steps: usize, in_order: bool) {
         let mut c = Cluster::new(nodes, seed, 0.05);
+        c.in_order = in_order;
         let mut crashed: Vec<(usize, u32)> = Vec::new();
         for step in 0..steps {
             let r = c.rng.below(100);
@@ -1701,6 +1856,13 @@ mod tests {
         for n in &c.nodes {
             assert_eq!(n.disk.applied.len(), a.len(), "seed {seed}");
             assert_eq!(&n.disk.applied, a, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn chaos_three_nodes_in_order_delivery() {
+        for seed in 0..500u64 {
+            chaos_with(seed, 3, 600, true);
         }
     }
 

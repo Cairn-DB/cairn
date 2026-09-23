@@ -124,6 +124,12 @@ pub struct ReplicaStatus {
     pub live_docs: u64,
     /// Bytes in the active memtable (bounded by write backpressure).
     pub memtable_bytes: u64,
+    /// Diagnostics: payload bytes of the in-memory Raft log.
+    pub raft_log_bytes: u64,
+    /// Diagnostics: proposals held back by backpressure, awaiting commit, events in the inbox.
+    pub queued: [u32; 3],
+    /// Diagnostics: this node's bytes queued for peers and messages not yet consumed.
+    pub net: (u64, u64),
     /// Segment ids in manifest order.
     pub segments: Vec<u64>,
 }
@@ -598,6 +604,13 @@ impl<R: Runtime> Replica<R> {
                     applied: st.applied_index(),
                     live_docs: st.approx_live_docs(),
                     memtable_bytes: st.memtable_bytes() as u64,
+                    raft_log_bytes: self.raft.log_bytes() as u64,
+                    queued: [
+                        self.deferred.len() as u32,
+                        self.waiting_commit.len() as u32,
+                        self.inbox.len() as u32,
+                    ],
+                    net: self.rt.network().queue_stats(),
                     segments: st.segments().map(|s| s.id.get()).collect(),
                 });
             }
@@ -752,10 +765,11 @@ impl<R: Runtime> Replica<R> {
             if ready.is_empty() {
                 return Ok(());
             }
-            if let Some(hs) = ready.hard_state {
-                self.state.hs = hs;
-                self.state_store.store(&self.state).await?;
-            }
+            // Entries before the hard state: the hard state carries the commit index, and a
+            // crash between the two writes must leave a commit index that is too low (harmless:
+            // Raft re-sends), never one that covers a stale entry still on disk. Writing the hard
+            // state first let a restart replay a conflicting entry from an earlier term as
+            // committed (chaos seed 2227).
             if let Some(t) = ready.truncate_from {
                 self.engine.store_mut().log_mut().truncate_suffix(t).await?;
             }
@@ -780,6 +794,10 @@ impl<R: Runtime> Replica<R> {
                 }
                 log.append(&entries).await?;
                 log.sync().await?;
+            }
+            if let Some(hs) = ready.hard_state {
+                self.state.hs = hs;
+                self.state_store.store(&self.state).await?;
             }
             for (to, m) in ready.messages {
                 self.send(to, FrameBody::Raft(m)).await;

@@ -273,6 +273,12 @@ fn enc_status(w: &mut Writer, s: &ReplicaStatus) {
         .u64(s.applied.get())
         .u64(s.live_docs)
         .u64(s.memtable_bytes)
+        .u64(s.raft_log_bytes)
+        .u32(s.queued[0])
+        .u32(s.queued[1])
+        .u32(s.queued[2])
+        .u64(s.net.0)
+        .u64(s.net.1)
         .u32(s.segments.len() as u32);
     for x in &s.segments {
         w.u64(*x);
@@ -296,6 +302,9 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
     let applied = LogIndex(r.u64()?);
     let live_docs = r.u64()?;
     let memtable_bytes = r.u64()?;
+    let raft_log_bytes = r.u64()?;
+    let queued = [r.u32()?, r.u32()?, r.u32()?];
+    let net = (r.u64()?, r.u64()?);
     let n = r.u32()? as usize;
     let mut segments = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -310,6 +319,9 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
         applied,
         live_docs,
         memtable_bytes,
+        raft_log_bytes,
+        queued,
+        net,
         segments,
     })
 }
@@ -660,6 +672,9 @@ mod tests {
             applied: LogIndex(9),
             live_docs: 3,
             memtable_bytes: 4096,
+            raft_log_bytes: 8192,
+            queued: [1, 2, 3],
+            net: (100, 4),
             segments: vec![1, 2],
         };
         let resps = vec![

@@ -126,6 +126,15 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Polls every node's status (diagnostics: memtable, Raft log, queues) until interrupted.
+    Status {
+        /// Nodes as `id=addr` (repeatable).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Seconds between polls (0: once).
+        #[arg(long, default_value_t = 10)]
+        every: u64,
+    },
     /// Scale benchmark (10M-50M rows) against a running cluster, with recall.
     ClusterScale {
         /// Dataset.
@@ -571,6 +580,57 @@ fn main() -> anyhow::Result<()> {
             disk::disk_sweep(
                 &dataset, &dir, n, queries, &ls, r, l_build, passes, &tmp, &out,
             )
+        }
+        Cmd::Status { nodes, every } => {
+            let nodes: Vec<(u32, std::net::SocketAddr)> = nodes
+                .iter()
+                .map(|s| {
+                    let (i, a) = s.split_once('=').expect("node must be id=addr");
+                    (i.parse().expect("node id"), a.parse().expect("addr"))
+                })
+                .collect();
+            loop {
+                for (i, a) in &nodes {
+                    let mut c = cairn_client::Client::new(
+                        [(cairn_core::NodeId(*i), *a)].into_iter().collect(),
+                    );
+                    c.max_attempts = 1;
+                    c.timeout = std::time::Duration::from_secs(5);
+                    match c.status() {
+                        Ok(st) => {
+                            let mb = |b: u64| b as f64 / 1e6;
+                            let lead = st
+                                .iter()
+                                .filter(|s| format!("{:?}", s.role) == "Leader")
+                                .count();
+                            let (mem, log): (u64, u64) = st.iter().fold((0, 0), |a, s| {
+                                (a.0 + s.memtable_bytes, a.1 + s.raft_log_bytes)
+                            });
+                            let q: Vec<String> = st
+                                .iter()
+                                .map(|s| format!("{}/{}/{}", s.queued[0], s.queued[1], s.queued[2]))
+                                .collect();
+                            let net = st.first().map_or((0, 0), |s| s.net);
+                            println!(
+                                "{} node {i}: leads {lead}/{} memtables {:.0} MB raftlog {:.0} MB net-out {:.0} MB net-in {} segs {} deferred/commit/inbox {}",
+                                chrono_free_date(),
+                                st.len(),
+                                mb(mem),
+                                mb(log),
+                                mb(net.0),
+                                net.1,
+                                st.iter().map(|s| s.segments.len()).sum::<usize>(),
+                                q.join(" ")
+                            );
+                        }
+                        Err(e) => println!("node {i}: {e}"),
+                    }
+                }
+                if every == 0 {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(every));
+            }
         }
         Cmd::ClusterScale {
             dataset,

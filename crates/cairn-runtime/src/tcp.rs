@@ -95,7 +95,19 @@ pub struct TcpNetworkConfig {
     pub drop_prob: f64,
 }
 
-type PeerQueue = Arc<(Mutex<VecDeque<Bytes>>, std::sync::Condvar)>;
+/// Bytes a peer's send queue may hold. Beyond it messages are dropped: node traffic is Raft
+/// and file shipping, which both retry, and an unbounded queue turned a sender-side bug into
+/// an out-of-memory kill (65 GB on a real network).
+const PEER_QUEUE_MAX_BYTES: usize = 256 << 20;
+
+/// A peer's pending messages and their total size.
+#[derive(Default)]
+struct PendingOut {
+    items: VecDeque<Bytes>,
+    bytes: usize,
+}
+
+type PeerQueue = Arc<(Mutex<PendingOut>, std::sync::Condvar)>;
 
 struct Shared {
     node_inbox: Mutex<Inbox<(NodeId, Bytes)>>,
@@ -218,7 +230,7 @@ impl TcpNetwork {
         if let Some(q) = qs.get(&to) {
             return q.clone();
         }
-        let q = Arc::new((Mutex::new(VecDeque::new()), std::sync::Condvar::new()));
+        let q = Arc::new((Mutex::new(PendingOut::default()), std::sync::Condvar::new()));
         qs.insert(to, q.clone());
         let shared = self.shared.clone();
         let q2 = q.clone();
@@ -227,11 +239,7 @@ impl TcpNetwork {
     }
 
     /// Connects (retrying) and drains the peer's queue.
-    fn writer_loop(
-        shared: Arc<Shared>,
-        to: NodeId,
-        q: Arc<(Mutex<VecDeque<Bytes>>, std::sync::Condvar)>,
-    ) {
+    fn writer_loop(shared: Arc<Shared>, to: NodeId, q: PeerQueue) {
         let Some(addr) = shared.cfg.peers.get(&to).copied() else {
             return;
         };
@@ -243,7 +251,7 @@ impl TcpNetwork {
             let msg = {
                 let (m, cv) = &*q;
                 let mut g = m.lock().expect("peer queue");
-                while g.is_empty() {
+                while g.items.is_empty() {
                     let (g2, _) = cv
                         .wait_timeout(g, StdDuration::from_millis(200))
                         .expect("peer queue");
@@ -252,7 +260,9 @@ impl TcpNetwork {
                         return;
                     }
                 }
-                g.pop_front().expect("non-empty")
+                let msg = g.items.pop_front().expect("non-empty");
+                g.bytes -= msg.len();
+                msg
             };
             for _attempt in 0..2 {
                 if stream.is_none() {
@@ -320,6 +330,20 @@ impl TcpNetwork {
 }
 
 impl Network for TcpNetwork {
+    fn queue_stats(&self) -> (u64, u64) {
+        let out: u64 = self
+            .shared
+            .peer_queues
+            .lock()
+            .expect("queues")
+            .values()
+            .map(|q| q.0.lock().expect("peer queue").bytes as u64)
+            .sum();
+        let inbound = self.shared.node_inbox.lock().expect("inbox").items.len()
+            + self.shared.client_inbox.lock().expect("inbox").items.len();
+        (out, inbound as u64)
+    }
+
     fn send(&self, to: NodeId, message: Bytes) -> impl Future<Output = Result<()>> {
         let result = if to == self.shared.cfg.id {
             Self::wake_inbox(&self.shared, &self.shared.node_inbox, (to, message));
@@ -338,8 +362,13 @@ impl Network for TcpNetwork {
             if !drop {
                 let q = self.peer_queue(to);
                 let (m, cv) = &*q;
-                m.lock().expect("peer queue").push_back(message);
-                cv.notify_one();
+                let mut g = m.lock().expect("peer queue");
+                if g.bytes + message.len() <= PEER_QUEUE_MAX_BYTES {
+                    g.bytes += message.len();
+                    g.items.push_back(message);
+                    std::mem::drop(g);
+                    cv.notify_one();
+                }
             }
             Ok(())
         };
