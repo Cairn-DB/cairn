@@ -10,6 +10,7 @@ mod cluster;
 mod datasets;
 mod kmeans;
 mod msmarco;
+mod scale;
 mod yfcc;
 
 use anyhow::Context;
@@ -87,6 +88,51 @@ enum Cmd {
         /// Takedowns to time.
         #[arg(long, default_value_t = 200)]
         takedowns: usize,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Scale benchmark (10M-50M rows) against a running cluster, with recall.
+    ClusterScale {
+        /// Dataset.
+        #[arg(long, value_enum)]
+        dataset: scale::Dataset,
+        /// Dataset directory.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Nodes as `id=addr` (repeatable).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Rows to ingest (prefix).
+        #[arg(long)]
+        n: usize,
+        /// Documents per upsert batch.
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+        /// Writer threads.
+        #[arg(long, default_value_t = 8)]
+        writers: usize,
+        /// Queries.
+        #[arg(long, default_value_t = 10_000)]
+        queries: usize,
+        /// Query threads.
+        #[arg(long, default_value_t = 8)]
+        query_threads: usize,
+        /// Search ef.
+        #[arg(long, default_value_t = 128)]
+        ef: u32,
+        /// Takedowns to time.
+        #[arg(long, default_value_t = 200)]
+        takedowns: usize,
+        /// Seconds without segment changes that count as settled.
+        #[arg(long, default_value_t = 60)]
+        settle_secs: u64,
+        /// Skip ingest (cluster already loaded).
+        #[arg(long)]
+        skip_ingest: bool,
+        /// File with server pids, for memory reporting.
+        #[arg(long)]
+        pids: Option<PathBuf>,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -469,6 +515,43 @@ fn main() -> anyhow::Result<()> {
                 &out,
             )
         }
+        Cmd::ClusterScale {
+            dataset,
+            dir,
+            nodes,
+            n,
+            batch,
+            writers,
+            queries,
+            query_threads,
+            ef,
+            takedowns,
+            settle_secs,
+            skip_ingest,
+            pids,
+            out,
+        } => scale::scale_bench(scale::ScaleArgs {
+            dataset,
+            dir,
+            nodes: nodes
+                .iter()
+                .map(|s| {
+                    let (i, a) = s.split_once('=').expect("node must be id=addr");
+                    (i.parse().expect("node id"), a.parse().expect("addr"))
+                })
+                .collect(),
+            n,
+            batch,
+            writers,
+            queries,
+            query_threads,
+            ef,
+            takedowns,
+            settle_secs,
+            skip_ingest,
+            pids,
+            out,
+        }),
         Cmd::Msmarco {
             dir,
             limit,

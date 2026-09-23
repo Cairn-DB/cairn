@@ -36,6 +36,8 @@ pub struct NodeConfig {
     pub schema: Schema,
     /// Memtable flush threshold.
     pub memtable_max_bytes: usize,
+    /// Compact a shard once it holds more than this many segments.
+    pub max_segments: usize,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -210,6 +212,7 @@ impl Node {
                 engine: EngineConfig {
                     store: StoreConfig {
                         memtable_max_bytes: cfg.memtable_max_bytes,
+                        max_segments: cfg.max_segments,
                         log: LogConfig::default(),
                         ..StoreConfig::default()
                     },

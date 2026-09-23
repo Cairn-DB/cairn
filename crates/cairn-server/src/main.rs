@@ -35,6 +35,9 @@ struct Cli {
     /// Memtable flush threshold in bytes.
     #[arg(long, default_value_t = 64 << 20)]
     memtable_bytes: usize,
+    /// Compact a shard once it holds more than this many segments.
+    #[arg(long, default_value_t = 8)]
+    max_segments: usize,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -65,6 +68,7 @@ fn main() -> anyhow::Result<()> {
         cores: cli.cores,
         schema,
         memtable_max_bytes: cli.memtable_bytes,
+        max_segments: cli.max_segments,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

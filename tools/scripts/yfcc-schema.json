@@ -1,0 +1,6 @@
+{
+ "fields": [
+  { "name": "img", "kind": { "Vector": { "dims": 192, "metric": "L2" } } },
+  { "name": "tags", "kind": "Set" }
+ ]
+}
