@@ -214,7 +214,12 @@ impl VectorIndex {
             // Disk-resident: PQ codes in RAM, blocks mapped; the f32 column is never read.
             let pq = reader.read_section(&format!("pq.{field}")).await?;
             let blocks = reader.map_section(&vamana_name).await?;
-            let disk = DiskAnn::load_with(metric, dims, n, &pq, blocks, reader.prefetcher())?;
+            // Validation scans every block: off the core.
+            let prefetch = reader.prefetcher();
+            let disk = reader
+                .runtime()
+                .offload(move || DiskAnn::load_with(metric, dims, n, &pq, blocks, prefetch))
+                .await?;
             let mut present = Bitmap::empty(n);
             for (i, &p) in nulls.iter().enumerate() {
                 if p != 0 {

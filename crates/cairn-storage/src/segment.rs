@@ -264,6 +264,11 @@ impl<R: Runtime> SegmentReader<R> {
         Ok(data)
     }
 
+    /// The runtime (for offloading work on this segment's data).
+    pub fn runtime(&self) -> &R {
+        &self.rt
+    }
+
     /// The runtime's readahead hint for mapped sections (see `Disk::prefetcher`).
     pub fn prefetcher(&self) -> Option<fn(&[u8])> {
         self.rt.disk().prefetcher()
@@ -283,7 +288,11 @@ impl<R: Runtime> SegmentReader<R> {
             .filter(|e| *e <= file.len() as u64)
             .ok_or_else(|| Error::corruption(format!("section {name:?} beyond mapped file")))?;
         let data = file.slice(meta.offset as usize..end as usize);
-        if xxh3(&data) != meta.hash {
+        // Hashing a large mapped section reads it all: off the core, so a loading replica keeps
+        // answering Raft (a stalled follower made its leader re-send appends).
+        let (d, hash) = (data.clone(), meta.hash);
+        let ok = self.rt.offload(move || xxh3(&d) == hash).await;
+        if !ok {
             return Err(Error::corruption(format!(
                 "section {name:?} checksum mismatch"
             )));
