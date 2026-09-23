@@ -133,6 +133,14 @@ impl Disk for BlockingDisk {
         o.open(&p).map(Rc::new).map_err(map_io)
     }
 
+    fn prefetcher(&self) -> Option<fn(&[u8])> {
+        Some(crate::will_need)
+    }
+
+    async fn map(&self, file: &Self::File) -> Result<Bytes> {
+        crate::mapped(file)
+    }
+
     async fn read_at(&self, file: &Self::File, offset: u64, len: usize) -> Result<Bytes> {
         let mut buf = vec![0u8; len];
         file.read_exact_at(&mut buf, offset).map_err(map_io)?;

@@ -249,6 +249,15 @@ impl Disk for PoolDisk {
         })
     }
 
+    fn prefetcher(&self) -> Option<fn(&[u8])> {
+        Some(crate::will_need)
+    }
+
+    fn map(&self, file: &Self::File) -> impl Future<Output = Result<Bytes>> {
+        let f = file.clone();
+        offload(&self.completer, move || crate::mapped(&f))
+    }
+
     fn write_at(
         &self,
         file: &Self::File,

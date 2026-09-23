@@ -69,6 +69,18 @@ fn doc(r: &mut SeededRng, id: u64) -> Document {
     d
 }
 
+fn disk_cfg(memtable_max_bytes: usize) -> EngineConfig {
+    let mut c = cfg(memtable_max_bytes);
+    c.vector.disk = true;
+    c.vector.vamana = cairn_index::diskann::VamanaParams {
+        r: 16,
+        l_build: 32,
+        pq_sample: 2_000,
+        ..Default::default()
+    };
+    c
+}
+
 fn cfg(memtable_max_bytes: usize) -> EngineConfig {
     EngineConfig {
         store: StoreConfig {
@@ -216,6 +228,18 @@ async fn check(
     deleted_set: &HashSet<u64>,
     r: &mut SeededRng,
 ) {
+    check_with(engine, model, deleted_set, r, true).await;
+}
+
+/// `exact`: vector-only queries must match the reference ranking exactly; otherwise (PQ
+/// scoring) at least 80% of the reference results must come back.
+async fn check_with(
+    engine: &mut ShardEngine<cairn_sim::SimRuntime>,
+    model: &[Document],
+    deleted_set: &HashSet<u64>,
+    r: &mut SeededRng,
+    exact: bool,
+) {
     for (qi, q) in queries(r, 40).iter().enumerate() {
         let got = engine.query(q).await.unwrap();
         let got_ids = ids(&got);
@@ -232,10 +256,17 @@ async fn check(
         }
         let want = ShardEngine::<cairn_sim::SimRuntime>::reference(&schema(), model, q);
         let want_ids: Vec<u64> = want.iter().map(|d| d.get()).collect();
-        if q.text.is_none() {
+        if q.text.is_none() && exact {
             // Vector legs merge exactly across segments; text legs use per-segment statistics,
             // so only the vector/filter-only cases are exact.
             assert_eq!(got_ids, want_ids, "query {qi}: {q:?}");
+        } else if q.text.is_none() {
+            let overlap = got_ids.iter().filter(|i| want_ids.contains(i)).count();
+            assert!(
+                overlap * 5 >= want_ids.len() * 4,
+                "query {qi}: vector overlap {overlap}/{}",
+                want_ids.len()
+            );
         } else {
             let overlap = got_ids.iter().filter(|i| want_ids.contains(i)).count();
             assert!(
@@ -290,5 +321,56 @@ fn multi_segment_with_memtable_and_takedowns() {
             .await
             .unwrap();
         check(&mut engine, &model, &deleted_set, &mut r).await;
+    });
+}
+
+#[test]
+fn disk_resident_segments_with_memtable_and_takedowns() {
+    let (sim, mut ex) = Simulation::new(3, SimConfig::default());
+    let rt = sim.runtime(NodeId(1), &ex.handle());
+    ex.block_on(async move {
+        let mut r = SeededRng::from_seed(13);
+        let mut model: Vec<Document> = Vec::new();
+        let mut engine = ShardEngine::open(rt.clone(), "shard", schema(), disk_cfg(6000))
+            .await
+            .unwrap();
+        for i in 1..=600u64 {
+            let d = doc(&mut r, i);
+            model.push(d.clone());
+            engine.write(&Command::Upsert(vec![d])).await.unwrap();
+        }
+        assert!(engine.store().segments().count() >= 2);
+        let updated: Vec<Document> = (1..=30).map(|i| doc(&mut r, i * 7)).collect();
+        for d in &updated {
+            model.retain(|m| m.id != d.id);
+            model.push(d.clone());
+        }
+        engine.write(&Command::Upsert(updated)).await.unwrap();
+        let deleted: Vec<DocId> = (1..=40).map(|i| DocId(i * 13)).collect();
+        model.retain(|m| !deleted.contains(&m.id));
+        engine
+            .write(&Command::Delete(deleted.clone()))
+            .await
+            .unwrap();
+        let deleted_set: HashSet<u64> = deleted.iter().map(|d| d.get()).collect();
+        check_with(&mut engine, &model, &deleted_set, &mut r, false).await;
+        engine.flush().await.unwrap();
+        check_with(&mut engine, &model, &deleted_set, &mut r, false).await;
+        drop(engine);
+        // Reopen: segments load their Vamana sections through Disk::map.
+        let mut engine = ShardEngine::open(rt.clone(), "shard", schema(), disk_cfg(6000))
+            .await
+            .unwrap();
+        let ids: Vec<_> = engine.store().segments().map(|m| m.id).collect();
+        assert!(!ids.is_empty());
+        for id in ids {
+            let view = engine.store().segment(id).unwrap();
+            assert!(
+                view.reader.has_section("vamana.0"),
+                "segment {id:?} is disk-resident"
+            );
+            assert!(!view.reader.has_section("hnsw.0"));
+        }
+        check_with(&mut engine, &model, &deleted_set, &mut r, false).await;
     });
 }

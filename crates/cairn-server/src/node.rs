@@ -44,6 +44,8 @@ pub struct NodeConfig {
     pub max_segments: usize,
     /// Keep only SQ8 codes and graphs of loaded segments in memory (no f32 rerank).
     pub sq8_only: bool,
+    /// Build disk-resident vector indexes (Vamana + PQ, ADR 0014) for new segments.
+    pub disk_index: bool,
     /// Tiered compaction target (live rows per merged segment; 0: pairwise policy only).
     pub target_segment_rows: u32,
     /// Concurrent compactions allowed on this node, across all its shards.
@@ -262,6 +264,7 @@ impl Node {
                     },
                     vector: cairn_index::VectorIndexParams {
                         keep_f32: !cfg.sq8_only,
+                        disk: cfg.disk_index,
                         ..cairn_index::VectorIndexParams::default()
                     },
                 },

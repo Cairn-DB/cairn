@@ -153,6 +153,8 @@ dependencies = [
  "clap",
  "flate2",
  "hdrhistogram",
+ "libc",
+ "memmap2",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -262,7 +264,9 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "cairn-core",
+ "libc",
  "loom",
+ "memmap2",
  "proptest",
  "slab",
  "thiserror",

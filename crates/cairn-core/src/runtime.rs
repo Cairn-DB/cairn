@@ -44,6 +44,18 @@ pub trait Disk {
         len: usize,
     ) -> impl Future<Output = Result<Bytes>>;
 
+    /// A read-only view of the whole file, for random access without copying (the real
+    /// runtimes map it into memory; the simulator returns its bytes). The file must not change
+    /// while a view is alive: only write-once files (published segments) may be mapped.
+    fn map(&self, file: &Self::File) -> impl Future<Output = Result<Bytes>>;
+
+    /// A function that hints the OS to start reading a range of a view returned by
+    /// [`Disk::map`] (asynchronous readahead), so that several random reads proceed in
+    /// parallel instead of one page fault at a time. `None` when views are plain memory.
+    fn prefetcher(&self) -> Option<fn(&[u8])> {
+        None
+    }
+
     /// Writes all of `data` at `offset`, extending the file if needed.
     fn write_at(
         &self,

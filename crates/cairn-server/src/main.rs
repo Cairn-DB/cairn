@@ -44,6 +44,9 @@ struct Cli {
     /// Keep only SQ8 codes and graphs of loaded segments in memory (no exact f32 rerank).
     #[arg(long)]
     sq8_only: bool,
+    /// Build disk-resident vector indexes (Vamana + PQ in RAM, blocks on disk; ADR 0014).
+    #[arg(long)]
+    disk_index: bool,
     /// Tiered compaction target in live rows per merged segment (0: pairwise policy only).
     #[arg(long, default_value_t = 0)]
     target_segment_rows: u32,
@@ -86,6 +89,7 @@ fn main() -> anyhow::Result<()> {
         memtable_max_bytes: cli.memtable_bytes,
         max_segments: cli.max_segments,
         sq8_only: cli.sq8_only,
+        disk_index: cli.disk_index,
         target_segment_rows: cli.target_segment_rows,
         compaction_slots: cli.compaction_slots,
         idle_flush_ms: cli.idle_flush_ms,

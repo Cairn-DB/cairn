@@ -2,6 +2,7 @@
 //! dispatch of ADR 0003.
 
 use crate::bitmap::Bitmap;
+use crate::diskann::{DiskAnn, DiskScratch, DiskSearch, VamanaParams};
 use crate::hnsw::{Hnsw, HnswBuilder, HnswParams, SearchOptions, SearchScratch};
 use crate::scan::{TopK, exact_scan};
 use crate::vectors::Vectors;
@@ -26,6 +27,11 @@ pub struct VectorIndexParams {
     /// is on), only the SQ8 codes and the graph stay resident: about a quarter of the memory,
     /// at the cost of SQ8-only scoring. Builds always use f32.
     pub keep_f32: bool,
+    /// Build the disk-resident index (Vamana + PQ, ADR 0014) instead of SQ8 + HNSW. Segments
+    /// built this way keep only PQ codes in memory once loaded.
+    pub disk: bool,
+    /// Parameters of the disk-resident index.
+    pub vamana: VamanaParams,
 }
 
 impl Default for VectorIndexParams {
@@ -39,6 +45,8 @@ impl Default for VectorIndexParams {
             // (bench-results/phase2-sift1m.md); disabled unless forced.
             two_hop_below_fraction: 0.0,
             keep_f32: true,
+            disk: false,
+            vamana: VamanaParams::default(),
         }
     }
 }
@@ -91,8 +99,10 @@ pub struct VectorIndex {
     vectors: Vectors,
     present: Bitmap,
     hnsw: Option<Hnsw>,
+    disk: Option<DiskAnn>,
     params: VectorIndexParams,
     scratch: RefCell<SearchScratch>,
+    disk_scratch: RefCell<DiskScratch>,
 }
 
 impl VectorIndex {
@@ -107,6 +117,21 @@ impl VectorIndex {
         doc_ids: &[u64],
         params: VectorIndexParams,
     ) -> Self {
+        if params.disk {
+            let n = (rows.len() / dims) as u32;
+            let normalized = Vectors::from_rows(metric, dims, rows, false).into_rows();
+            let disk = DiskAnn::build(metric, dims, normalized, &params.vamana);
+            return VectorIndex {
+                field,
+                vectors: Vectors::header_only(metric, dims, n),
+                present,
+                hnsw: None,
+                disk: Some(disk),
+                params,
+                scratch: RefCell::new(SearchScratch::new(0)),
+                disk_scratch: RefCell::new(DiskScratch::default()),
+            };
+        }
         let vectors = Vectors::from_rows(metric, dims, rows, params.sq8);
         let hnsw = if vectors.is_empty() {
             None
@@ -119,8 +144,10 @@ impl VectorIndex {
             vectors,
             present,
             hnsw,
+            disk: None,
             params,
             scratch: RefCell::new(SearchScratch::new(n)),
+            disk_scratch: RefCell::new(DiskScratch::default()),
         }
     }
 
@@ -141,8 +168,10 @@ impl VectorIndex {
             vectors,
             present,
             hnsw: None,
+            disk: None,
             params,
             scratch: RefCell::new(SearchScratch::new(n)),
+            disk_scratch: RefCell::new(DiskScratch::default()),
         }
     }
 
@@ -154,6 +183,12 @@ impl VectorIndex {
     /// Sections to add to the segment: `sq8.<field>` (if any) and `hnsw.<field>`.
     pub fn sections(&self) -> Vec<(String, Vec<u8>)> {
         let mut v = Vec::new();
+        if let Some(d) = &self.disk {
+            let (pq, vamana) = d.sections();
+            v.push((format!("pq.{}", self.field), pq));
+            v.push((format!("vamana.{}", self.field), vamana));
+            return v;
+        }
         if let Some(b) = self.vectors.encode_sq8() {
             v.push((format!("sq8.{}", self.field), b));
         }
@@ -172,9 +207,32 @@ impl VectorIndex {
         dims: usize,
         params: VectorIndexParams,
     ) -> Result<Self> {
-        let col = reader.read_section(&format!("col.{field}")).await?;
         let nulls = reader.read_section(&format!("nulls.{field}")).await?;
         let n = nulls.len() as u32;
+        let vamana_name = format!("vamana.{field}");
+        if reader.has_section(&vamana_name) {
+            // Disk-resident: PQ codes in RAM, blocks mapped; the f32 column is never read.
+            let pq = reader.read_section(&format!("pq.{field}")).await?;
+            let blocks = reader.map_section(&vamana_name).await?;
+            let disk = DiskAnn::load_with(metric, dims, n, &pq, blocks, reader.prefetcher())?;
+            let mut present = Bitmap::empty(n);
+            for (i, &p) in nulls.iter().enumerate() {
+                if p != 0 {
+                    present.set(i as u32);
+                }
+            }
+            return Ok(VectorIndex {
+                field,
+                vectors: Vectors::header_only(metric, dims, n),
+                present,
+                hnsw: None,
+                disk: Some(disk),
+                params,
+                scratch: RefCell::new(SearchScratch::new(0)),
+                disk_scratch: RefCell::new(DiskScratch::default()),
+            });
+        }
+        let col = reader.read_section(&format!("col.{field}")).await?;
         if col.len() != n as usize * dims * 4 {
             return Err(cairn_core::Error::corruption(format!(
                 "vector column {field} length"
@@ -215,8 +273,10 @@ impl VectorIndex {
             vectors,
             present,
             hnsw,
+            disk: None,
             params,
             scratch: RefCell::new(SearchScratch::new(n)),
+            disk_scratch: RefCell::new(DiskScratch::default()),
         })
     }
 
@@ -235,6 +295,11 @@ impl VectorIndex {
         &self.vectors
     }
 
+    /// The disk-resident index, if this segment has one.
+    pub fn disk(&self) -> Option<&DiskAnn> {
+        self.disk.as_ref()
+    }
+
     /// The graph, if built.
     pub fn hnsw(&self) -> Option<&Hnsw> {
         self.hnsw.as_ref()
@@ -249,7 +314,7 @@ impl VectorIndex {
     pub fn choose(&self, count: u32) -> Strategy {
         let n = self.vectors.len().max(1);
         let frac = count as f32 / n as f32;
-        if self.hnsw.is_none()
+        if (self.hnsw.is_none() && self.disk.is_none())
             || count <= self.params.scan_max_rows
             || frac <= self.params.scan_max_fraction
         {
@@ -284,6 +349,25 @@ impl VectorIndex {
         };
         let count = eff.map_or(self.vectors.len(), Bitmap::count);
         let strategy = q.force.unwrap_or_else(|| self.choose(count));
+        if let Some(d) = &self.disk {
+            let opts = DiskSearch {
+                k: q.k,
+                l: (q.ef as usize).max(q.k),
+                rerank: q.rerank.max(q.k),
+                max_expansions: if q.max_visits == u32::MAX {
+                    0
+                } else {
+                    (q.max_visits as usize / 32).max(q.ef as usize)
+                },
+                beam: 4,
+            };
+            let mut s = self.disk_scratch.borrow_mut();
+            let res = match strategy {
+                Strategy::Scan => d.search_scan(&qv, eff, opts, &mut s),
+                _ => d.search_graph(&qv, eff, opts, &mut s),
+            };
+            return Ok((res, strategy));
+        }
         let res = match strategy {
             Strategy::Scan => exact_scan(&self.vectors, &qv, q.k, eff, q.exact, q.rerank),
             Strategy::Hnsw | Strategy::HnswTwoHop => {

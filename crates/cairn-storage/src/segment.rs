@@ -264,6 +264,33 @@ impl<R: Runtime> SegmentReader<R> {
         Ok(data)
     }
 
+    /// The runtime's readahead hint for mapped sections (see `Disk::prefetcher`).
+    pub fn prefetcher(&self) -> Option<fn(&[u8])> {
+        self.rt.disk().prefetcher()
+    }
+
+    /// Maps a whole section read-only (see `Disk::map`) after verifying its checksum; the
+    /// verification reads the section once, sequentially. Sections start on a page boundary,
+    /// so page-aligned offsets inside the section stay page-aligned in the file.
+    pub async fn map_section(&self, name: &str) -> Result<Bytes> {
+        let meta = self
+            .section(name)
+            .ok_or_else(|| Error::corruption(format!("missing section {name:?}")))?;
+        let file = self.rt.disk().map(&self.file).await?;
+        let end = meta
+            .offset
+            .checked_add(meta.len)
+            .filter(|e| *e <= file.len() as u64)
+            .ok_or_else(|| Error::corruption(format!("section {name:?} beyond mapped file")))?;
+        let data = file.slice(meta.offset as usize..end as usize);
+        if xxh3(&data) != meta.hash {
+            return Err(Error::corruption(format!(
+                "section {name:?} checksum mismatch"
+            )));
+        }
+        Ok(data)
+    }
+
     /// Reads `len` bytes at `offset` within a section, without verification.
     pub async fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Bytes> {
         let meta = self

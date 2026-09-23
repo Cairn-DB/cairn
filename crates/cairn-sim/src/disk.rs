@@ -395,6 +395,19 @@ impl Disk for SimDisk {
         .await
     }
 
+    async fn map(&self, file: &Self::File) -> Result<Bytes> {
+        let id = file.inode;
+        self.deferred(Some(id), "disk.map", move |d, _| {
+            d.reads += 1;
+            let inode = d
+                .inodes
+                .get(&id)
+                .ok_or_else(|| Error::io(IoErrorKind::NotFound, "unlinked file"))?;
+            Ok(Bytes::from(inode.content.to_vec()))
+        })
+        .await
+    }
+
     async fn read_at(&self, file: &Self::File, offset: u64, len: usize) -> Result<Bytes> {
         let id = file.inode;
         let cfg = self.sim.inner.config.disk.clone();

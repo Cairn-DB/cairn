@@ -1,6 +1,7 @@
 //! Vector (filtered ANN), full-text and structured indexes over immutable segments.
 
 pub mod bitmap;
+pub mod diskann;
 pub mod hnsw;
 pub mod indexer;
 pub mod kernels;

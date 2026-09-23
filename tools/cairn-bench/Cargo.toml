@@ -24,3 +24,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 flate2 = "1"
 serde_json = "1"
+memmap2.workspace = true
+libc = "0.2"

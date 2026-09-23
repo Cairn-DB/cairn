@@ -8,6 +8,7 @@
 
 mod cluster;
 mod datasets;
+mod disk;
 mod kmeans;
 mod msmarco;
 mod scale;
@@ -32,6 +33,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Disk-resident index (Vamana + PQ) on one segment: build, recall, warm/cold latency.
+    DiskSweep {
+        /// `sift` (fvecs in --dir) or `bigann` (base.50M.u8bin prefix in --dir).
+        #[arg(long, default_value = "sift")]
+        dataset: String,
+        /// Dataset directory.
+        #[arg(long, default_value = "data/sift")]
+        dir: PathBuf,
+        /// Rows (prefix).
+        #[arg(long, default_value_t = 1_000_000)]
+        n: usize,
+        /// Queries.
+        #[arg(long, default_value_t = 1000)]
+        queries: usize,
+        /// Search list sizes (comma separated).
+        #[arg(long, default_value = "32,64,100,128,200")]
+        l: String,
+        /// Max degree.
+        #[arg(long, default_value_t = 48)]
+        r: u32,
+        /// Build list size.
+        #[arg(long, default_value_t = 96)]
+        l_build: u32,
+        /// Build passes.
+        #[arg(long, default_value_t = 2)]
+        passes: u32,
+        /// Directory for the temporary index file (must be on the disk being measured).
+        #[arg(long, default_value = "data/bench-tmp")]
+        tmp: PathBuf,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Filtered-search sweep on SIFT1M (texmex format) with synthetic attributes.
     SiftSweep {
         /// Directory holding sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs.
@@ -513,6 +547,26 @@ fn main() -> anyhow::Result<()> {
                 query_threads,
                 takedowns,
                 &out,
+            )
+        }
+        Cmd::DiskSweep {
+            dataset,
+            dir,
+            n,
+            queries,
+            l,
+            r,
+            l_build,
+            passes,
+            tmp,
+            out,
+        } => {
+            let ls = l
+                .split(',')
+                .map(|s| s.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()?;
+            disk::disk_sweep(
+                &dataset, &dir, n, queries, &ls, r, l_build, passes, &tmp, &out,
             )
         }
         Cmd::ClusterScale {

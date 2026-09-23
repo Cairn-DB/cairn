@@ -55,6 +55,23 @@ impl Vectors {
         }
     }
 
+    /// Metadata only: `n` rows of `dims` with no values in memory (the rows live in a
+    /// disk-resident index, ADR 0014). Only `len`, `dims`, `metric` and `prepare_query` apply.
+    pub fn header_only(metric: Metric, dims: usize, n: u32) -> Self {
+        Vectors {
+            dims,
+            n,
+            metric,
+            f32: Vec::new(),
+            sq8: None,
+        }
+    }
+
+    /// The (normalized for cosine) rows, consuming the vectors.
+    pub fn into_rows(self) -> Vec<f32> {
+        self.f32
+    }
+
     /// Number of rows.
     pub fn len(&self) -> u32 {
         self.n
