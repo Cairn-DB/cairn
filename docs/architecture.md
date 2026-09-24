@@ -211,3 +211,6 @@ Deviations from the sketch above, all recorded in the ADR outcomes:
   incompatible peers are refused. Nodes write the newest segment format all peers read. With
   `--tls-ca/--tls-cert/--tls-key`, all traffic is mutual TLS (rustls); a node proves its id with
   a certificate for `node-<id>.cairn` from the cluster CA.
+- **Parallel builds** (ADR 0019, 2026-09-24): HNSW and Vamana graphs build in batches on a
+  `Parallel` (thread pool in the server, sequential in the simulator); the graph depends only on
+  the rows, not on the thread count. `--build-threads` sets the threads per build.

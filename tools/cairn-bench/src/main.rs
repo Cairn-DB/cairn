@@ -6,6 +6,7 @@
     clippy::needless_range_loop
 )]
 
+mod build;
 mod cluster;
 mod datasets;
 mod disk;
@@ -71,6 +72,9 @@ enum Cmd {
         /// Directory for the temporary index file (must be on the disk being measured).
         #[arg(long, default_value = "data/bench-tmp")]
         tmp: PathBuf,
+        /// Threads for the graph build (ADR 0019; same graph for any count).
+        #[arg(long, default_value_t = 1)]
+        build_threads: usize,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -101,6 +105,33 @@ enum Cmd {
         /// Number of k-means clusters for the correlated attributes.
         #[arg(long, default_value_t = 1000)]
         clusters: usize,
+        /// Output markdown path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// HNSW build time and recall: row-at-a-time vs batched on several thread counts (ADR 0019).
+    BuildSweep {
+        /// Directory holding sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs.
+        #[arg(long, default_value = "data/sift")]
+        dir: PathBuf,
+        /// Base vectors (prefix).
+        #[arg(long, default_value_t = 1_000_000)]
+        n: usize,
+        /// Queries.
+        #[arg(long, default_value_t = 1000)]
+        queries: usize,
+        /// HNSW M.
+        #[arg(long, default_value_t = 16)]
+        m: u32,
+        /// HNSW efConstruction.
+        #[arg(long, default_value_t = 100)]
+        ef_construction: u32,
+        /// Thread counts for the batched builder (comma separated).
+        #[arg(long, default_value = "1,4,16")]
+        threads: String,
+        /// Skip the row-at-a-time reference build.
+        #[arg(long)]
+        no_reference: bool,
         /// Output markdown path.
         #[arg(long)]
         out: PathBuf,
@@ -531,6 +562,31 @@ fn main() -> anyhow::Result<()> {
         ));
     }
     match cli.cmd {
+        Cmd::BuildSweep {
+            dir,
+            n,
+            queries,
+            m,
+            ef_construction,
+            threads,
+            no_reference,
+            out,
+        } => {
+            let threads: Vec<usize> = threads
+                .split(',')
+                .map(|t| t.trim().parse())
+                .collect::<Result<_, _>>()?;
+            build::build_sweep(
+                &dir,
+                n,
+                queries,
+                m,
+                ef_construction,
+                &threads,
+                !no_reference,
+                &out,
+            )
+        }
         Cmd::SiftSweep {
             dir,
             n,
@@ -588,6 +644,7 @@ fn main() -> anyhow::Result<()> {
             l_build,
             passes,
             tmp,
+            build_threads,
             out,
         } => {
             let ls = l
@@ -595,7 +652,17 @@ fn main() -> anyhow::Result<()> {
                 .map(|s| s.trim().parse::<usize>())
                 .collect::<Result<Vec<_>, _>>()?;
             disk::disk_sweep(
-                &dataset, &dir, n, queries, &ls, r, l_build, passes, &tmp, &out,
+                &dataset,
+                &dir,
+                n,
+                queries,
+                &ls,
+                r,
+                l_build,
+                passes,
+                &tmp,
+                build_threads,
+                &out,
             )
         }
         Cmd::Status { nodes, every } => {

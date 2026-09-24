@@ -213,11 +213,23 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Limits (ADR 0018): no revocation (CRL) or hot rotation, no authorization, no connection
     limits, no feature gating by cluster protocol version yet.
 
+- Step 3 of ADR 0016 (2026-09-24, owner: "vas-y pour l'etape 3"): ADR 0019, parallel
+  deterministic builds (batched HNSW and Vamana on a `Parallel` trait; ThreadParallel in the
+  runtime; `--build-threads`, default all hardware threads).
+  - SIFT1M: HNSW 185.5 s -> 35.6 s on 16 threads (5.2x), same recall, graphs byte-identical on
+    1/4/16 threads; Vamana 1 pass 323.5 s -> 86.1 s (3.8x), same recall.
+  - Cluster (2M, one host): builds settle < 50 s (was up to 117 s); ingest no clear change;
+    +60% CPU-seconds (SMT, 3 nodes on 16 threads). Query latency during builds NOT measured.
+  - FINDING: the bench's settle test (30 s without segment change) can pass during a long
+    compaction; one single-thread run measured queries against a compacting node (1.2 s p99).
+  - Evidence: bench-results/phase4-adr0019-builds.md; campaign 20k zero violations; 102 tests.
+
 ## Next step
-ADR 0016 steps 1-2 and 6 delivered 2026-09-24. Remaining toward production, in order:
-step 3 (parallel build on the leader), step 5 (leader balancing: build load concentrates on
-leaders), step 4 (compaction through the log); from ADR 0018: CRL / certificate rotation,
-authorization, connection limits. Other levers: scan threshold for large segments (filtered
+ADR 0016 steps 1-3 and 6 delivered 2026-09-24. Remaining toward production, in order:
+step 5 (leader balancing: build load concentrates on leaders), step 4 (compaction through the
+log); from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR
+0019: measure query latency during parallel builds, fix the bench settle test (wait for build
+completion, not segment quiet). Other levers: scan threshold for large segments (filtered
 linearizable p99 missed by 8% at 50M), segment publication off the actor, dynamic membership.
 
 ## Old next step

@@ -108,6 +108,9 @@ pub struct ReplicaConfig {
     /// Followers fetch the segments the leader built instead of building them (ADR 0016). With
     /// `false`, every replica builds every flush itself (the flush still goes through the log).
     pub ship_segments: bool,
+    /// Threads for index builds (flushes and compactions); `None`: the build thread alone.
+    /// Builds are identical either way (ADR 0019).
+    pub build_parallel: Option<std::sync::Arc<dyn cairn_core::Parallel>>,
 }
 
 /// Snapshot of a replica's state for diagnostics and checkers.
@@ -1287,6 +1290,7 @@ impl<R: Runtime> Replica<R> {
         let schema = self.engine.schema().clone();
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,
+            parallel: self.cfg.build_parallel.clone(),
         };
         let inbox = self.inbox.clone();
         let rt = self.rt.clone();
@@ -1466,6 +1470,7 @@ impl<R: Runtime> Replica<R> {
         let schema = self.engine.schema().clone();
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,
+            parallel: self.cfg.build_parallel.clone(),
         };
         let inbox = self.inbox.clone();
         let rt = self.rt.clone();

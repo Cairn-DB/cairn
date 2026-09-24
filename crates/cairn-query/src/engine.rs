@@ -64,7 +64,10 @@ impl<R: Runtime> ShardEngine<R> {
     ) -> Result<Self> {
         let mut store =
             Store::open_with_limit(rt, dir, schema, cfg.store.clone(), replay_limit).await?;
-        store.set_indexer(Box::new(DefaultIndexer { vector: cfg.vector }));
+        store.set_indexer(Box::new(DefaultIndexer {
+            vector: cfg.vector,
+            parallel: None,
+        }));
         let mut engine = ShardEngine {
             store,
             cfg,

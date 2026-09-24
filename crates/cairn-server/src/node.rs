@@ -58,6 +58,8 @@ pub struct NodeConfig {
     pub ship_segments: bool,
     /// mTLS for all connections (ADR 0018); `None`: plaintext (development only).
     pub tls: Option<cairn_runtime::tls::NodeTls>,
+    /// Threads per index build (ADR 0019); 0: all hardware threads.
+    pub build_threads: usize,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -286,6 +288,11 @@ impl Node {
                 idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
                 compaction_slots: Some(slots.clone()),
                 ship_segments: cfg.ship_segments,
+                build_parallel: Some(std::sync::Arc::new(if cfg.build_threads == 0 {
+                    cairn_runtime::ThreadParallel::available()
+                } else {
+                    cairn_runtime::ThreadParallel::new(cfg.build_threads)
+                })),
             };
             match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
                 Ok(h) => {

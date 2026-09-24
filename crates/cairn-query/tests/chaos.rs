@@ -88,6 +88,7 @@ fn config(node: NodeId) -> ReplicaConfig {
         idle_flush_ticks: 0,
         compaction_slots: None,
         ship_segments: true,
+        build_parallel: None,
     }
 }
 

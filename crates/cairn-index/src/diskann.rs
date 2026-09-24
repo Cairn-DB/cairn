@@ -433,9 +433,157 @@ fn robust_prune(
     kept
 }
 
+/// Rows inserted one at a time in the first pass before batching starts (ADR 0019).
+const SEED_ROWS: usize = 1024;
+/// Largest batch, and at most a 32nd of the rows already linked in the first pass. Vamana
+/// relies more than HNSW on each row seeing the edges added just before it: batches of up to
+/// 1024 (an eighth) lost 5 points of graph recall in the unit test, 256 (a 32nd) lost none.
+const MAX_BATCH: usize = 256;
+
+/// Batched Vamana build (ADR 0019): same passes, alphas, slack and final pruning as the
+/// row-at-a-time build, but each batch searches the graph as it was at the batch start (plus
+/// the batch's earlier rows by exact distance) on `par`, and back edges merge once per target.
+/// The result depends only on the input, not on the thread count.
+fn build_graph_parallel(
+    vectors: &[f32],
+    dims: usize,
+    params: &VamanaParams,
+    par: &dyn cairn_core::Parallel,
+) -> (u32, Vec<Vec<u32>>) {
+    use std::sync::Mutex;
+    let n = vectors.len() / dims;
+    if n == 0 {
+        return (0, Vec::new());
+    }
+    let row = |i: usize| &vectors[i * dims..(i + 1) * dims];
+    let mut mean = vec![0f64; dims];
+    for i in 0..n {
+        for (m, &x) in mean.iter_mut().zip(row(i)) {
+            *m += f64::from(x);
+        }
+    }
+    let mean: Vec<f32> = mean.iter().map(|m| (m / n as f64) as f32).collect();
+    let medoid = (0..n)
+        .map(|i| (l2(&mean, row(i)), i))
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        .map_or(0, |x| x.1) as u32;
+    let r = params.r as usize;
+    let slack = r + r / 3;
+    let l_build = params.l_build as usize;
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let visited: Vec<Mutex<Visited>> = (0..par.threads().max(1))
+        .map(|_| {
+            Mutex::new(Visited {
+                marks: vec![0u32; n],
+                epoch: 0,
+            })
+        })
+        .collect();
+    let order: Vec<u32> = (0..n as u32).collect();
+    for pass in 0..params.passes.max(1) {
+        let alpha = if pass == 0 && params.passes > 1 {
+            1.0
+        } else {
+            params.alpha
+        };
+        let rows: Vec<u32> = order
+            .iter()
+            .copied()
+            .filter(|&p| !(p == medoid && pass == 0))
+            .collect();
+        let mut done = 0usize;
+        while done < rows.len() {
+            let size = if pass == 0 {
+                if done < SEED_ROWS {
+                    1
+                } else {
+                    (done / 32).clamp(1, MAX_BATCH)
+                }
+            } else {
+                MAX_BATCH
+            }
+            .min(rows.len() - done);
+            let batch = &rows[done..done + size];
+            // 1. Candidates and pruned out-lists against the frozen graph.
+            let outs: Vec<Mutex<Vec<u32>>> = (0..size).map(|_| Mutex::new(Vec::new())).collect();
+            let frozen = &adj;
+            par.run(size, &|w, i| {
+                let p = batch[i];
+                let q = row(p as usize);
+                let mut vis = visited[w].lock().expect("visited");
+                let mut cand = greedy_ram((vectors, dims), frozen, medoid, q, l_build, &mut vis);
+                cand.extend(
+                    frozen[p as usize]
+                        .iter()
+                        .map(|&c| (l2(q, row(c as usize)), c)),
+                );
+                cand.extend(batch[..i].iter().map(|&e| (l2(q, row(e as usize)), e)));
+                *outs[i].lock().expect("out") = robust_prune(vectors, dims, p, cand, alpha, r);
+            });
+            // 2. Out-lists in row order; back edges grouped by target.
+            let mut back: Vec<(u32, u32)> = Vec::new();
+            for (i, out) in outs.into_iter().enumerate() {
+                let p = batch[i];
+                let out = out.into_inner().expect("out");
+                back.extend(out.iter().map(|&j| (j, p)));
+                adj[p as usize] = out;
+            }
+            back.sort_unstable();
+            back.dedup();
+            let mut groups: Vec<(usize, usize)> = Vec::new();
+            let mut g0 = 0;
+            for k in 1..=back.len() {
+                if k == back.len() || back[k].0 != back[g0].0 {
+                    groups.push((g0, k));
+                    g0 = k;
+                }
+            }
+            // 3. Each target takes its new back edges once, pruned past the slack.
+            let merged: Vec<Mutex<Option<Vec<u32>>>> =
+                (0..groups.len()).map(|_| Mutex::new(None)).collect();
+            let current = &adj;
+            par.run(groups.len(), &|_, g| {
+                let (a, b) = groups[g];
+                let j = back[a].0;
+                let mut list = current[j as usize].clone();
+                for &(_, p) in &back[a..b] {
+                    if !list.contains(&p) {
+                        list.push(p);
+                    }
+                }
+                if list.len() > slack {
+                    let cand: Vec<(f32, u32)> = list
+                        .iter()
+                        .map(|&c| (l2(row(j as usize), row(c as usize)), c))
+                        .collect();
+                    list = robust_prune(vectors, dims, j, cand, alpha, r);
+                }
+                *merged[g].lock().expect("merged") = Some(list);
+            });
+            for (g, list) in merged.into_iter().enumerate() {
+                let j = back[groups[g].0].0;
+                adj[j as usize] = list.into_inner().expect("merged").expect("set");
+            }
+            done += size;
+        }
+    }
+    for (j, list) in adj.iter_mut().enumerate() {
+        if list.len() > r {
+            let cand: Vec<(f32, u32)> = list
+                .iter()
+                .map(|&c| (l2(row(j), row(c as usize)), c))
+                .collect();
+            *list = robust_prune(vectors, dims, j as u32, cand, params.alpha, r);
+        }
+    }
+    (medoid, adj)
+}
+
 /// Builds the graph over row-major `vectors` (already normalized for cosine). Rows are
 /// inserted in order; ties break on row ids, so the result depends only on the input.
-/// Returns the medoid and the adjacency lists.
+/// Returns the medoid and the adjacency lists. The row-at-a-time reference for
+/// [`build_graph_parallel`] (tests compare their recall).
+#[cfg(test)]
 fn build_graph(vectors: &[f32], dims: usize, params: &VamanaParams) -> (u32, Vec<Vec<u32>>) {
     let n = vectors.len() / dims;
     if n == 0 {
@@ -610,6 +758,18 @@ impl DiskAnn {
     /// Builds from row-major `vectors` (normalized for cosine). The build keeps everything in
     /// RAM; [`DiskAnn::sections`] produces the on-disk form.
     pub fn build(metric: Metric, dims: usize, vectors: Vec<f32>, params: &VamanaParams) -> Self {
+        Self::build_with(metric, dims, vectors, params, &cairn_core::Sequential)
+    }
+
+    /// Like [`DiskAnn::build`], with the graph built on `par` (ADR 0019); the result does not
+    /// depend on the thread count.
+    pub fn build_with(
+        metric: Metric,
+        dims: usize,
+        vectors: Vec<f32>,
+        params: &VamanaParams,
+        par: &dyn cairn_core::Parallel,
+    ) -> Self {
         let n = vectors.len() / dims;
         let pq = Pq::train(&vectors, dims, params);
         let mut codes = vec![0u8; n * pq.code_len()];
@@ -619,7 +779,7 @@ impl DiskAnn {
                 &mut codes[i * pq.m..(i + 1) * pq.m],
             );
         }
-        let (medoid, adj) = build_graph(&vectors, dims, params);
+        let (medoid, adj) = build_graph_parallel(&vectors, dims, params, par);
         DiskAnn {
             metric,
             dims,
@@ -1050,6 +1210,54 @@ mod tests {
         let q = &v[7 * dims..8 * dims];
         let got = idx.search_graph(q, None, opts(1), &mut DiskScratch::default());
         assert_eq!(got[0].1, 7, "a stored vector finds itself first");
+    }
+
+    /// ADR 0019: the batched build is identical for any thread count and matches the
+    /// row-at-a-time build's recall (graph-only search with a small beam).
+    #[test]
+    fn batched_build_is_thread_independent_and_keeps_recall() {
+        let dims = 24;
+        let n = 12_000;
+        let v = blobs(11, n, dims, 300);
+        let params = VamanaParams {
+            r: 16,
+            l_build: 32,
+            passes: 2,
+            ..VamanaParams::default()
+        };
+        let seq = build_graph_parallel(&v, dims, &params, &cairn_core::Sequential);
+        for t in [3, 8] {
+            let par =
+                build_graph_parallel(&v, dims, &params, &cairn_runtime::ThreadParallel::new(t));
+            assert!(par == seq, "{t} threads differ from 1");
+        }
+        let reference = build_graph(&v, dims, &params);
+        let graph_recall = |(medoid, adj): &(u32, Vec<Vec<u32>>)| {
+            let mut vis = Visited {
+                marks: vec![0; n],
+                epoch: 0,
+            };
+            let mut total = 0.0;
+            for qi in 0..200usize {
+                let (a, b) = ((qi * 7919) % n, (qi * 104_729 + 3) % n);
+                let q: Vec<f32> = v[a * dims..(a + 1) * dims]
+                    .iter()
+                    .zip(&v[b * dims..(b + 1) * dims])
+                    .map(|(x, y)| (x + y) / 2.0)
+                    .collect();
+                let mut got = greedy_ram((&v, dims), adj, *medoid, &q, 12, &mut vis);
+                got.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+                got.truncate(10);
+                total += recall(&got, &brute(&v, dims, &q, 10, None));
+            }
+            total / 200.0
+        };
+        let (r_new, r_old) = (graph_recall(&seq), graph_recall(&reference));
+        eprintln!("vamana graph recall@10 batched {r_new:.4} row-at-a-time {r_old:.4}");
+        assert!(
+            r_new >= r_old - 0.01,
+            "batched {r_new} vs row-at-a-time {r_old}"
+        );
     }
 
     #[test]

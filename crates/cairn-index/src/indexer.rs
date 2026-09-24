@@ -13,6 +13,9 @@ use cairn_storage::SegmentIndexer;
 pub struct DefaultIndexer {
     /// Vector index parameters.
     pub vector: VectorIndexParams,
+    /// Threads for graph builds (`None`: the calling thread). The sections are identical
+    /// either way (ADR 0019).
+    pub parallel: Option<std::sync::Arc<dyn cairn_core::Parallel>>,
 }
 
 /// Extracts a vector field as a dense matrix (zero rows for nulls) plus its presence bitmap.
@@ -41,8 +44,20 @@ impl SegmentIndexer for DefaultIndexer {
         for (i, f) in schema.fields.iter().enumerate() {
             if let FieldKind::Vector { dims, metric } = f.kind {
                 let (rows, present) = vector_column(docs, i, dims as usize);
-                let idx =
-                    VectorIndex::build(i, metric, dims as usize, rows, present, &ids, self.vector);
+                let par: &dyn cairn_core::Parallel = match &self.parallel {
+                    Some(p) => p.as_ref(),
+                    None => &cairn_core::Sequential,
+                };
+                let idx = VectorIndex::build_with(
+                    i,
+                    metric,
+                    dims as usize,
+                    rows,
+                    present,
+                    &ids,
+                    self.vector,
+                    par,
+                );
                 out.extend(idx.sections());
             }
         }

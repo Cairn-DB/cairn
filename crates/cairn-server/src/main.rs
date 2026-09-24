@@ -76,6 +76,10 @@ struct Cli {
     /// Let application clients connect without a certificate (peers always need one).
     #[arg(long)]
     tls_anonymous_clients: bool,
+    /// Threads per index build, flush or compaction (0: all hardware threads). Builds give the
+    /// same segments whatever the count (ADR 0019); --compaction-slots bounds concurrent builds.
+    #[arg(long, default_value_t = 0)]
+    build_threads: usize,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -130,6 +134,7 @@ fn main() -> anyhow::Result<()> {
         idle_flush_ms: cli.idle_flush_ms,
         ship_segments: !cli.no_ship_segments,
         tls,
+        build_threads: cli.build_threads,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

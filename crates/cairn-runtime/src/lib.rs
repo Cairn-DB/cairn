@@ -7,6 +7,7 @@
 pub mod blocking;
 pub mod cross;
 pub mod executor;
+pub mod parallel;
 pub mod pool;
 pub mod reactor;
 pub mod tcp;
@@ -14,6 +15,7 @@ pub mod tls;
 
 pub use cross::{CrossQueue, CrossReceiver, CrossSender, cross_oneshot};
 pub use executor::{Executor, Handle, RunOutcome};
+pub use parallel::ThreadParallel;
 pub use pool::{PoolDisk, PoolRuntime, ThreadReactor};
 pub use reactor::Reactor;
 pub use tcp::{TcpNetwork, TcpNetworkConfig};

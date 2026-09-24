@@ -3,7 +3,7 @@
 
 use crate::bitmap::Bitmap;
 use crate::diskann::{DiskAnn, DiskScratch, DiskSearch, VamanaParams};
-use crate::hnsw::{Hnsw, HnswBuilder, HnswParams, SearchOptions, SearchScratch};
+use crate::hnsw::{Hnsw, HnswParams, SearchOptions, SearchScratch};
 use crate::scan::{TopK, exact_scan};
 use crate::vectors::Vectors;
 use cairn_core::{Metric, Result, Runtime};
@@ -107,7 +107,8 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     /// Builds the index for schema field `field` from row-major `rows`; `present` marks rows
-    /// with a non-null vector. Synchronous (see [`VectorIndex::builder`] for chunked builds).
+    /// with a non-null vector. Synchronous, on the calling thread (same result as
+    /// [`VectorIndex::build_with`] with any number of threads).
     pub fn build(
         field: usize,
         metric: Metric,
@@ -117,10 +118,35 @@ impl VectorIndex {
         doc_ids: &[u64],
         params: VectorIndexParams,
     ) -> Self {
+        Self::build_with(
+            field,
+            metric,
+            dims,
+            rows,
+            present,
+            doc_ids,
+            params,
+            &cairn_core::Sequential,
+        )
+    }
+
+    /// Like [`VectorIndex::build`], with the graph built on `par` (ADR 0019). The result does
+    /// not depend on the thread count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with(
+        field: usize,
+        metric: Metric,
+        dims: usize,
+        rows: Vec<f32>,
+        present: Bitmap,
+        doc_ids: &[u64],
+        params: VectorIndexParams,
+        par: &dyn cairn_core::Parallel,
+    ) -> Self {
         if params.disk {
             let n = (rows.len() / dims) as u32;
             let normalized = Vectors::from_rows(metric, dims, rows, false).into_rows();
-            let disk = DiskAnn::build(metric, dims, normalized, &params.vamana);
+            let disk = DiskAnn::build_with(metric, dims, normalized, &params.vamana, par);
             return VectorIndex {
                 field,
                 vectors: Vectors::header_only(metric, dims, n),
@@ -136,7 +162,12 @@ impl VectorIndex {
         let hnsw = if vectors.is_empty() {
             None
         } else {
-            Some(HnswBuilder::new(&vectors, doc_ids, params.hnsw).finish())
+            Some(crate::hnsw::build_parallel(
+                &vectors,
+                doc_ids,
+                params.hnsw,
+                par,
+            ))
         };
         let n = vectors.len();
         VectorIndex {

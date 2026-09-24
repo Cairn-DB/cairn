@@ -81,6 +81,7 @@ pub fn disk_sweep(
     l_build: u32,
     passes: u32,
     tmp: &Path,
+    build_threads: usize,
     out: &Path,
 ) -> anyhow::Result<()> {
     let t0 = Instant::now();
@@ -129,9 +130,18 @@ pub fn disk_sweep(
         ..VamanaParams::default()
     };
     let t = Instant::now();
-    let idx = DiskAnn::build(Metric::L2, dims, base.clone(), &params);
+    let idx = DiskAnn::build_with(
+        Metric::L2,
+        dims,
+        base.clone(),
+        &params,
+        &cairn_runtime::ThreadParallel::new(build_threads),
+    );
     let build_s = t.elapsed().as_secs_f64();
-    eprintln!("built in {build_s:.1}s ({:.0} rows/s)", n as f64 / build_s);
+    eprintln!(
+        "built in {build_s:.1}s ({:.0} rows/s, {build_threads} threads)",
+        n as f64 / build_s
+    );
     let (pq, vam) = idx.sections();
     drop(idx);
     std::fs::create_dir_all(tmp)?;
@@ -197,12 +207,12 @@ pub fn disk_sweep(
     )?;
     writeln!(
         md,
-        "- Rows: {n} × {dims}-d, queries: {nq}, k = 10, single thread; R = {r}, L_build = {l_build}, alpha = {}, passes = {passes}",
+        "- Rows: {n} × {dims}-d, queries: {nq}, k = 10, single-thread queries; R = {r}, L_build = {l_build}, alpha = {}, passes = {passes}",
         params.alpha
     )?;
     writeln!(
         md,
-        "- Build: {build_s:.1} s ({:.0} rows/s, one thread, includes PQ training)",
+        "- Build: {build_s:.1} s ({:.0} rows/s, {build_threads} build threads, includes PQ training)",
         n as f64 / build_s
     )?;
     writeln!(

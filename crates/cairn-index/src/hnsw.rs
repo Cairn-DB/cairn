@@ -13,9 +13,10 @@
 use crate::bitmap::Bitmap;
 use crate::vectors::Vectors;
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::{Error, Result};
+use cairn_core::{Error, Parallel, Result};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Mutex;
 
 const NONE: u32 = u32::MAX;
 
@@ -508,6 +509,48 @@ impl Hnsw {
     }
 }
 
+/// Rows inserted one at a time before batched insertion starts: batches search the graph as it
+/// was when the batch started, so the graph must already be well connected.
+const SEED_ROWS: u32 = 1024;
+/// Largest batch. A batch is at most an eighth of the rows already inserted, so a new row
+/// always searches a graph at least eight times larger than its batch.
+const MAX_BATCH: usize = 1024;
+
+/// Builds the graph in batches, using `par` for the searches and the neighbor pruning
+/// (ADR 0019). The result depends only on the rows and their ids, not on the thread count:
+/// every task reads the graph as it was at the start of its batch, and writes are applied in
+/// row order.
+pub fn build_parallel(
+    vectors: &Vectors,
+    doc_ids: &[u64],
+    params: HnswParams,
+    par: &dyn Parallel,
+) -> Hnsw {
+    let mut b = HnswBuilder::new(vectors, doc_ids, params);
+    let n = vectors.len();
+    b.insert_batch(SEED_ROWS.min(n) as usize);
+    if b.is_done() {
+        return b.graph;
+    }
+    let scratches: Vec<Mutex<SearchScratch>> = (0..par.threads().max(1))
+        .map(|_| Mutex::new(SearchScratch::new(n)))
+        .collect();
+    while !b.is_done() {
+        let inserted = b.next as usize;
+        let size = (inserted / 8)
+            .clamp(1, MAX_BATCH)
+            .min((n - b.next) as usize);
+        b.insert_parallel_batch(size, par, &scratches);
+    }
+    b.graph
+}
+
+/// The links one row gets when inserted: its level and, per level, its selected neighbors.
+struct Plan {
+    level: u32,
+    per_level: Vec<(u32, Vec<u32>)>,
+}
+
 /// Incremental builder.
 pub struct HnswBuilder<'a> {
     vectors: &'a Vectors,
@@ -637,6 +680,171 @@ impl<'a> HnswBuilder<'a> {
         }
         self.graph.n = row + 1;
         true
+    }
+
+    /// Inserts the next `size` rows as one batch (see [`build_parallel`]).
+    fn insert_parallel_batch(
+        &mut self,
+        size: usize,
+        par: &dyn Parallel,
+        scratches: &[Mutex<SearchScratch>],
+    ) {
+        let start = self.next;
+        let m = self.graph.params.m as usize;
+        let efc = self.graph.params.ef_construction as usize;
+        let (graph, vectors, doc_ids) = (&self.graph, self.vectors, self.doc_ids);
+        let (entry, top) = (graph.entry, graph.max_level);
+        // 1. Every row searches the graph as of the batch start and selects its neighbors.
+        let plans: Vec<Mutex<Option<Plan>>> = (0..size).map(|_| Mutex::new(None)).collect();
+        par.run(size, &|w, i| {
+            let row = start + i as u32;
+            let level = level_for(doc_ids[row as usize], graph.params.m);
+            let mut sc = scratches[w].lock().expect("scratch");
+            let q = vectors.row_f32(row).to_vec();
+            let mut dbuf = Vec::new();
+            Hnsw::dists(vectors, &q, &[entry], true, &mut sc, &mut dbuf);
+            let mut ep = vec![Cand {
+                dist: dbuf[0],
+                row: entry,
+            }];
+            for l in ((level + 1)..=top).rev() {
+                let r = graph.search_layer(
+                    vectors,
+                    &q,
+                    &ep,
+                    l,
+                    1,
+                    &|_| true,
+                    false,
+                    u32::MAX,
+                    true,
+                    &mut sc,
+                );
+                if let Some(&c) = r.first() {
+                    ep = vec![c];
+                }
+            }
+            // Earlier rows of the same batch are not in the graph yet: they compete as
+            // candidates by exact distance, so rows of one batch still link to each other.
+            let earlier: Vec<u32> = (start..row).collect();
+            let mut intra: Vec<(Cand, u32)> = Vec::new();
+            if !earlier.is_empty() {
+                Hnsw::dists(vectors, &q, &earlier, true, &mut sc, &mut dbuf);
+                intra = earlier
+                    .iter()
+                    .zip(&dbuf)
+                    .map(|(&r, &d)| {
+                        let lv = level_for(doc_ids[r as usize], graph.params.m);
+                        (Cand { dist: d, row: r }, lv)
+                    })
+                    .collect();
+            }
+            let mut per_level = Vec::new();
+            for l in (0..=level).rev() {
+                let mut cands = if l <= top {
+                    let c = graph.search_layer(
+                        vectors,
+                        &q,
+                        &ep,
+                        l,
+                        efc,
+                        &|_| true,
+                        false,
+                        u32::MAX,
+                        true,
+                        &mut sc,
+                    );
+                    ep = c.clone();
+                    c
+                } else {
+                    Vec::new()
+                };
+                cands.extend(intra.iter().filter(|(_, lv)| *lv >= l).map(|(c, _)| *c));
+                cands.sort();
+                cands.truncate(efc);
+                if cands.is_empty() {
+                    continue;
+                }
+                let cap = if l == 0 { 2 * m } else { m };
+                per_level.push((l, Hnsw::select_neighbors(vectors, &cands, cap, &mut sc)));
+            }
+            *plans[i].lock().expect("plan") = Some(Plan { level, per_level });
+        });
+        // 2. Forward links, in row order; back links collected per (level, target).
+        let mut back: Vec<(u32, u32, u32)> = Vec::new();
+        for (i, plan) in plans.into_iter().enumerate() {
+            let row = start + i as u32;
+            let plan = plan.into_inner().expect("plan").expect("planned");
+            self.graph.levels[row as usize] = plan.level as u8;
+            while self.graph.upper.len() < plan.level as usize {
+                self.graph.upper.push(cairn_core::HashMap::default());
+            }
+            for l in 1..=plan.level {
+                self.graph.neighbors_mut(row, l);
+            }
+            for (l, selected) in plan.per_level {
+                let slots = self.graph.neighbors_mut(row, l);
+                for (k, s) in slots.iter_mut().enumerate() {
+                    *s = selected.get(k).copied().unwrap_or(NONE);
+                }
+                back.extend(selected.iter().map(|&nb| (l, nb, row)));
+            }
+        }
+        back.sort_unstable();
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut g0 = 0;
+        for k in 1..=back.len() {
+            if k == back.len() || back[k].0 != back[g0].0 || back[k].1 != back[g0].1 {
+                groups.push((g0, k));
+                g0 = k;
+            }
+        }
+        // 3. Each target merges its new back links once, pruning if over capacity.
+        let graph = &self.graph;
+        let lists: Vec<Mutex<Vec<u32>>> =
+            (0..groups.len()).map(|_| Mutex::new(Vec::new())).collect();
+        par.run(groups.len(), &|w, g| {
+            let (a, b) = groups[g];
+            let (level, target) = (back[a].0, back[a].1);
+            let cap = if level == 0 { 2 * m } else { m };
+            let mut all: Vec<u32> = graph.neighbors(target, level).to_vec();
+            all.extend(back[a..b].iter().map(|x| x.2));
+            let new = if all.len() <= cap {
+                all
+            } else {
+                let mut sc = scratches[w].lock().expect("scratch");
+                let tv = vectors.row_f32(target).to_vec();
+                let mut dbuf = Vec::new();
+                Hnsw::dists(vectors, &tv, &all, true, &mut sc, &mut dbuf);
+                let mut cands: Vec<Cand> = all
+                    .iter()
+                    .zip(&dbuf)
+                    .map(|(&r, &d)| Cand { dist: d, row: r })
+                    .collect();
+                cands.sort();
+                Hnsw::select_neighbors(vectors, &cands, cap, &mut sc)
+            };
+            *lists[g].lock().expect("list") = new;
+        });
+        for (g, list) in lists.into_iter().enumerate() {
+            let (level, target) = (back[groups[g].0].0, back[groups[g].0].1);
+            let list = list.into_inner().expect("list");
+            let slots = self.graph.neighbors_mut(target, level);
+            for (k, s) in slots.iter_mut().enumerate() {
+                *s = list.get(k).copied().unwrap_or(NONE);
+            }
+        }
+        // 4. The highest new level becomes the entry point (first such row on ties).
+        for i in 0..size as u32 {
+            let row = start + i;
+            let level = u32::from(self.graph.levels[row as usize]);
+            if level > self.graph.max_level {
+                self.graph.max_level = level;
+                self.graph.entry = row;
+            }
+        }
+        self.next = start + size as u32;
+        self.graph.n = self.next;
     }
 
     /// Adds `row` to `nb`'s list at `level`, pruning with the heuristic when full.
