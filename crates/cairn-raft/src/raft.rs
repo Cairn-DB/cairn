@@ -645,6 +645,16 @@ impl Raft {
         Ok(())
     }
 
+    /// Index of the first entry of this leader's term (its no-op); `LogIndex(0)` when not
+    /// leader. Once it is applied, every entry of earlier terms is applied too.
+    pub fn lead_start(&self) -> LogIndex {
+        if self.role == Role::Leader {
+            self.lead_start
+        } else {
+            LogIndex(0)
+        }
+    }
+
     /// Target of the leadership transfer in progress, if any.
     pub fn transferring_to(&self) -> Option<NodeId> {
         self.transfer.map(|t| t.to)
@@ -834,7 +844,7 @@ impl Raft {
                             from,
                             Message::SnapshotResp {
                                 term: self.term,
-                                index: self.last_index(),
+                                index: self.commit,
                             },
                         ),
                         _ => {}
@@ -967,7 +977,11 @@ impl Raft {
                 self.leader = Some(from);
                 self.reset_election_timer();
                 if snapshot.last_index <= self.commit {
-                    let idx = self.last_index();
+                    // Already covered: report the committed prefix only. Entries past the
+                    // commit index may be from another term and conflict with the leader's; a
+                    // leader that took them as matched committed entries without a majority
+                    // (chaos seed 11892, a safety violation).
+                    let idx = self.commit;
                     self.send(
                         from,
                         Message::SnapshotResp {
@@ -1974,6 +1988,60 @@ mod tests {
         }
         c.check_log_matching();
         c.check_leader_completeness();
+    }
+
+    /// A follower whose log holds uncommitted entries from an older term, and that receives a
+    /// snapshot it already covers, must not report those entries as matched (seed 11892).
+    #[test]
+    fn snapshot_response_reports_only_the_committed_prefix() {
+        let old_entries: Vec<Entry> = (1..=10u64)
+            .map(|i| Entry {
+                index: LogIndex(i),
+                term: Term(if i <= 6 { 1 } else { 3 }),
+                payload: Bytes::from_static(b"x"),
+            })
+            .collect();
+        let mut f = Raft::new(
+            config(NodeId(3), 3, 1),
+            InitialState {
+                hard_state: HardState {
+                    term: Term(3),
+                    vote: None,
+                    commit: LogIndex(6),
+                },
+                entries: old_entries,
+                snapshot: (LogIndex(0), Term(0)),
+                applied: LogIndex(6),
+                installing: false,
+                vote_barrier: (LogIndex(0), Term(0)),
+            },
+        );
+        let _ = f.ready();
+        f.step(
+            NodeId(1),
+            Message::InstallSnapshot {
+                term: Term(5),
+                snapshot: Snapshot {
+                    last_index: LogIndex(5),
+                    last_term: Term(1),
+                    data: Bytes::new(),
+                },
+            },
+        );
+        let resp = f
+            .ready()
+            .messages
+            .into_iter()
+            .find_map(|(_, m)| match m {
+                Message::SnapshotResp { index, .. } => Some(index),
+                _ => None,
+            })
+            .expect("a snapshot response");
+        assert_eq!(
+            resp,
+            LogIndex(6),
+            "only the committed prefix may count as matched"
+        );
     }
 
     #[test]
