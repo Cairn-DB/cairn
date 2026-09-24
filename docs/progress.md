@@ -237,13 +237,33 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     (2/1/1 split reached in both runs; takedown p99 higher with balancing, 134-155 vs
     116-117 ms, not established, OPEN).
 
+- Step 4 of ADR 0016 (2026-09-24/25, owner: "vas-y pour l'etape 4", then "trouve la cause
+  de la regression CPU"): ADR 0021, compaction through the log (leader decides and builds,
+  `CompactCommit`, everyone installs on commit, fetch from the builder, pending compactions in
+  the manifest, log-defined segment list, retired files kept 30 s). Protocol 4 (3 refused).
+  - First A/B: +45..105% CPU vs local compaction. ROOT CAUSE: segment I/O on the replica actor
+    stalled heartbeats -> leadership churn (37 handovers/run) -> uncommitted merges lost and
+    rebuilt by the next leader (31 builds for 20 proposals, 6.2M vs 4.8M rows merged). Fixed:
+    reads/writes in their own task, lost merges re-proposed, fetch from the builder.
+    Final A/B (3 runs each): CPU -40% (2,923 vs 4,903 s), settle 128 vs 224 s, ingest +13%.
+  - A segment-list check added to chaos found: a RAFT SAFETY BUG (pre-existing, commit
+    34601fe): a snapshot response reported uncommitted entries of another term as matched, so
+    a leader committed without a majority. Also fixed: replay against a later list
+    (`compacted_through`), late local build overwriting an installed file (`.built` side name),
+    duplicate merges after a leadership change, compaction id reuse after snapshot install,
+    snapshot files fetched from the wrong node, fallback retry loop.
+  - Evidence: campaign 0..60000 zero violations (4.70M segments built, 5.04M fetched); 108
+    workspace tests; bench-results/phase4-adr0021-compaction.md.
+  - Chaos test settle window 5 s -> 15 s: a replica that comes back late fetches the merges it
+    missed one at a time (was instant in simulated time). Pipelined fetches: follow-up.
+
 ## Next step
-ADR 0016 steps 1, 2, 3, 5 and 6 delivered 2026-09-24. Remaining toward production, in order:
-step 4 (compaction through the log); check the takedown p99 with balancing (log handovers,
-per-node timings); from ADR 0018: CRL / certificate rotation, authorization, connection
-limits; from ADR 0019: query latency during parallel builds, fix the bench settle test.
-Other levers: scan threshold for large segments (filtered linearizable p99 missed by 8% at
-50M), segment publication off the actor, dynamic membership.
+ADR 0016 is complete (steps 1-6, 2026-09-25). Remaining toward production: pipelined segment
+fetches (a late replica catches up one merge at a time); flush publication and compaction
+install still read section headers on the actor; takedown p99 with balancing (open);
+from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
+query latency during parallel builds, the bench settle test. Other levers: scan threshold for
+large segments (filtered linearizable p99 missed by 8% at 50M), dynamic membership.
 
 ## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
