@@ -155,14 +155,19 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   account's dedicated-core quota (nothing created there except a free key/network/firewall
   labelled project=cairn); Azure 10 vCPU, AWS 5 vCPU; the GCP project allows 30.
   Fleet: cairn-node1..3 n2-highmem-8 + cairn-bench e2-standard-4, europe-west1-b, labelled
-  project=cairn, scripts tools/scripts/gcp/ (teardown.sh deletes only cairn-*). STILL RUNNING
-  (billed ~1.7 USD/h) until the post-load compaction measurement is done; then teardown.
+  project=cairn, scripts tools/scripts/gcp/ (teardown.sh deletes only cairn-*). TORN DOWN
+  2026-09-24 ~04:50 (verified: no cairn instances, disks, firewall rules or network).
   - GCP exposed: flow-control window drained by heartbeat responses (42 GB queued, OOM kill),
     held-back proposals stuck after leadership loss (client timeouts). Fixed (6320891, 4fb4977).
     Chasing a campaign failure exposed the hard-state-before-entries durability bug (fixed).
-  - Result before compaction: bench-results/phase4-gcp-bigann50m.md (recall 0.985/0.990, p99
-    118 ms stale, 154 ms linearizable, takedown 107 ms). Post-load compaction to ~3M-row
-    segments in progress, then --skip-ingest re-measure.
+  - Results: bench-results/phase4-gcp-bigann50m.md (before compaction: p99 118/154 ms) and
+    phase4-gcp-bigann50m-compacted.md (3 segs/shard: unfiltered p99 36/48 ms, 1% filter
+    82/108 ms -> filtered linearizable MISSES 100 ms by 8%; recall 0.983/0.991; takedown
+    107 ms). Report: docs/reports/phase-4-scale.md part 3.
+  - Next levers: scan threshold for large segments (filtered path), segment publication off
+    the actor (ingest stalls, elections under load), dynamic membership, Hetzner once the
+    owner's dedicated-core quota is raised (free key/network/firewall labelled project=cairn
+    still exist there).
   - Decisions: ADR 0015 (placement, follower reads, flow control, write ordering).
 
 ## Next step

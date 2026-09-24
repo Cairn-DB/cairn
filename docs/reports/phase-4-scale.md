@@ -264,3 +264,37 @@ those, and anonymous memory stayed around 8 GB. The watchdog now measures anonym
 Verification after the fixes: `cargo test --workspace` (83 tests), the Raft harness with
 in-order delivery (500 seeds), and a new test that bounds re-sends. The simulation campaign
 passed 60,000 seeds with zero violations.
+
+## 50M through a real 3-machine cluster (GCP)
+
+Hetzner refused the dedicated-core servers (account quota), and Azure and AWS allow 10 and 5
+vCPU. The run therefore used GCP, within its 30-vCPU quota: three `n2-highmem-8` nodes (8
+vCPU, 64 GB, pd-ssd) and an `e2-standard-4` client in europe-west1-b, on a private network.
+The scripts are in `tools/scripts/gcp/`. The fleet was deleted after the run, and no `cairn-*`
+resource remains.
+
+| 50M rows, BigANN 128-d, 8 shards × 3 replicas | before compaction (11-19 segments/shard) | after compaction (3 segments/shard) |
+|---|---|---|
+| unfiltered recall@10 | 0.985 | 0.983 |
+| unfiltered p99, stale / linearizable | 118 / 154 ms | **36 / 48 ms** |
+| 1% filter recall@10 | 0.990 | 0.991 |
+| 1% filter p99, stale / linearizable | 163 / 157 ms | **82 / 108 ms** |
+| takedown visible on all three machines, p99 | 107 ms | 107 ms |
+| memory per node | about 34 GB | 26-30 GB |
+
+Files: `bench-results/phase4-gcp-bigann50m.md` and
+`bench-results/phase4-gcp-bigann50m-compacted.md`.
+
+- **SPEC section 8 at 50M on a real cluster:** recall is met, as is the takedown target
+  (107 ms, well under 1 s). The p99 target is met for unfiltered queries at both consistency
+  levels and for filtered stale reads. It is **missed by 8% for filtered linearizable reads**
+  (108 ms). With 2M-row segments, a 1% filter passes about 20k rows per segment, which is under
+  the 50k-row scan threshold, so every segment scans and evaluates the filter over 2M rows.
+  Lowering the scan threshold for large segments, so that they use the filtered graph, is
+  the next lever. It was not measured.
+- **Ingest:** about 8.7k docs/s for rows 15M to 50M. The first 15M rows went through a client
+  run that was stopped to deploy the held-back-proposal fix; the nodes restarted on their data,
+  which exercised crash recovery on the real cluster. Post-load compaction to 3 segments per
+  shard took about 1 h 50 min with 3 to 6 merges per node on 8 vCPU.
+- **Cost:** about 6 h of four VMs, roughly 10 USD. This is an estimate from list prices; it
+  was not checked on the billing console.
