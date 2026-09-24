@@ -151,6 +151,20 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     `pkill -f <pattern>` kills the calling shell when the pattern is in its own command line
     (use pids); the BigANN CDN stalls over IPv6 (curl -4).
 
+- 50M through a real cluster (GCP, owner approved 2026-09-23 night): Hetzner blocked by the
+  account's dedicated-core quota (nothing created there except a free key/network/firewall
+  labelled project=cairn); Azure 10 vCPU, AWS 5 vCPU; the GCP project allows 30.
+  Fleet: cairn-node1..3 n2-highmem-8 + cairn-bench e2-standard-4, europe-west1-b, labelled
+  project=cairn, scripts tools/scripts/gcp/ (teardown.sh deletes only cairn-*). STILL RUNNING
+  (billed ~1.7 USD/h) until the post-load compaction measurement is done; then teardown.
+  - GCP exposed: flow-control window drained by heartbeat responses (42 GB queued, OOM kill),
+    held-back proposals stuck after leadership loss (client timeouts). Fixed (6320891, 4fb4977).
+    Chasing a campaign failure exposed the hard-state-before-entries durability bug (fixed).
+  - Result before compaction: bench-results/phase4-gcp-bigann50m.md (recall 0.985/0.990, p99
+    118 ms stale, 154 ms linearizable, takedown 107 ms). Post-load compaction to ~3M-row
+    segments in progress, then --skip-ingest re-measure.
+  - Decisions: ADR 0015 (placement, follower reads, flow control, write ordering).
+
 ## Next step
 Scale runs delivered 2026-09-23; owner wants to discuss concepts next. Scale-specific levers:
 fewer, larger segments (post-load compaction), per-query fixed cost (filter evaluation per
