@@ -214,3 +214,6 @@ Deviations from the sketch above, all recorded in the ADR outcomes:
 - **Parallel builds** (ADR 0019, 2026-09-24): HNSW and Vamana graphs build in batches on a
   `Parallel` (thread pool in the server, sequential in the simulator); the graph depends only on
   the rows, not on the thread count. `--build-threads` sets the threads per build.
+- **Leader balancing** (ADR 0020, 2026-09-24): Raft leadership transfer (`TimeoutNow`); each
+  shard's first host in the placement is its preferred leader, and a leader hands over to it
+  once it is caught up. The shard manifest records the term of its applied index.

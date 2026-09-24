@@ -80,6 +80,9 @@ struct Cli {
     /// same segments whatever the count (ADR 0019); --compaction-slots bounds concurrent builds.
     #[arg(long, default_value_t = 0)]
     build_threads: usize,
+    /// Do not move shard leaderships to their preferred replicas (ADR 0020).
+    #[arg(long)]
+    no_leader_balancing: bool,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -135,6 +138,7 @@ fn main() -> anyhow::Result<()> {
         ship_segments: !cli.no_ship_segments,
         tls,
         build_threads: cli.build_threads,
+        leader_balancing: !cli.no_leader_balancing,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

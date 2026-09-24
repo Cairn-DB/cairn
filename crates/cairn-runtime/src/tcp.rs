@@ -35,8 +35,10 @@ const MAX_FRAME: usize = 64 << 20;
 
 /// Wire protocol version this build speaks: node and client frames, Raft messages, commands in
 /// the log, file shipping. Bump on any incompatible change (ADR 0018). Version 1 was the
-/// unversioned protocol (4-byte hello) before ADR 0018.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// unversioned protocol (4-byte hello) before ADR 0018. Version 3 adds the Raft `TimeoutNow`
+/// message (ADR 0020); a version-2 node ignores it (its leadership transfer times out), so
+/// version 2 stays accepted.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Oldest protocol version this build still accepts from peers and clients.
 pub const PROTOCOL_MIN: u32 = 2;
 

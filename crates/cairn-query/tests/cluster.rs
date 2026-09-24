@@ -83,6 +83,7 @@ fn config(node: NodeId, memtable_max_bytes: usize) -> ReplicaConfig {
         compaction_slots: None,
         ship_segments: true,
         build_parallel: None,
+        preferred_leader: None,
     }
 }
 
@@ -632,5 +633,91 @@ fn flushes_through_the_log_without_shipping() {
             assert!(s.flushes[0] >= 2 && s.flushes[1] == 0, "{:?}", s.flushes);
         }
         check_all_docs(&hs, 90, &[]).await;
+    });
+}
+
+/// Waits until `want` leads (as seen by every live replica), for up to `ms` simulated ms.
+async fn wait_leader_is(rt: &SimRuntime, handles: &[ReplicaHandle], want: NodeId, ms: u64) -> bool {
+    for _ in 0..ms / 10 {
+        let mut ok = true;
+        for h in handles {
+            match h.status().await {
+                Some(s) if s.leader == Some(want) => {}
+                _ => ok = false,
+            }
+        }
+        if ok {
+            return true;
+        }
+        rt.sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// ADR 0020: leadership moves to the preferred replica, away from it while it is down, and
+/// back once it has restarted and caught up; no acknowledged write is lost on the way.
+#[test]
+fn leadership_follows_the_preferred_replica() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(31, SimConfig::default());
+    let pref = NodeId(3);
+    let spawn = |ex: &mut cairn_runtime::Executor<cairn_sim::SimReactor>, n: u32| {
+        let mut cfg = config(NodeId(n), 1 << 30);
+        cfg.preferred_leader = Some(pref);
+        let (sim, hh) = (sim.clone(), ex.handle());
+        ex.block_on(async move {
+            Replica::spawn(sim.runtime(NodeId(n), &hh), cfg, schema())
+                .await
+                .unwrap()
+        })
+    };
+    let mut handles: Vec<ReplicaHandle> = (1..=3).map(|n| spawn(&mut ex, n)).collect();
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move {
+            wait_leader(&rt, &hs).await;
+            for i in 1..=20u64 {
+                propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            }
+            assert!(
+                wait_leader_is(&rt, &hs, pref, 5_000).await,
+                "leadership did not move to the preferred replica"
+            );
+        }
+    });
+    // The preferred replica goes down: another replica leads meanwhile.
+    sim.crash(pref, &mut ex);
+    let survivors: Vec<ReplicaHandle> = handles[..2].to_vec();
+    ex.block_on({
+        let (rt, hs) = (rt.clone(), survivors.clone());
+        async move {
+            let li = wait_leader(&rt, &hs).await;
+            assert_ne!(hs[li].id(), pref);
+            for i in 21..=40u64 {
+                propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            }
+        }
+    });
+    // Back up: once caught up, it leads again.
+    handles[2] = spawn(&mut ex, 3);
+    ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move {
+            assert!(
+                wait_leader_is(&rt, &hs, pref, 10_000).await,
+                "leadership did not return to the preferred replica"
+            );
+            propose(&rt, &hs, Command::Upsert(vec![doc(41)])).await;
+            wait_converged(&rt, &hs, 41).await;
+            for h in &hs {
+                for i in [1u64, 20, 40, 41] {
+                    assert_eq!(
+                        h.get(DocId(i), Consistency::Stale).await.unwrap(),
+                        Some(doc(i))
+                    );
+                }
+            }
+        }
     });
 }

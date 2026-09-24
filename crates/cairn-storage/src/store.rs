@@ -77,6 +77,10 @@ pub struct ShardManifest {
     pub segments: Vec<SegmentMeta>,
     /// Next segment id to allocate.
     pub next_segment_id: u64,
+    /// Term of the log entry at `applied_index` (0 when unknown: manifests written before it
+    /// was recorded). Stored with the index in one atomic write, so a restart never pairs a
+    /// new snapshot index with the term of an older one (ADR 0020, chaos seed 34367).
+    pub applied_term: Term,
 }
 
 impl Manifest for ShardManifest {
@@ -92,6 +96,7 @@ impl Manifest for ShardManifest {
                 .u64(s.file_len)
                 .u64(s.file_hash);
         }
+        w.u64(self.applied_term.get());
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
@@ -109,11 +114,13 @@ impl Manifest for ShardManifest {
                 file_hash: r.u64()?,
             });
         }
+        let applied_term = Term(if r.remaining() > 0 { r.u64()? } else { 0 });
         Ok(ShardManifest {
             schema,
             applied_index,
             segments,
             next_segment_id,
+            applied_term,
         })
     }
 }
@@ -292,6 +299,7 @@ impl<R: Runtime> Store<R> {
                     applied_index: LogIndex(0),
                     segments: Vec::new(),
                     next_segment_id: 1,
+                    applied_term: Term(0),
                 };
                 manifest_store.store(&m).await?;
                 m
@@ -785,7 +793,11 @@ impl<R: Runtime> Store<R> {
                     deletions_dirty: false,
                 });
             }
-            new_manifest.applied_index = p.last.max(new_manifest.applied_index);
+            if p.last > new_manifest.applied_index {
+                new_manifest.applied_index = p.last;
+                // The entry is still in the log: it is truncated only after this manifest.
+                new_manifest.applied_term = self.log.read(p.last).await?.term;
+            }
             self.manifest_store.store(&new_manifest).await?;
             self.manifest = new_manifest;
             if let Some(seg) = new_segment {

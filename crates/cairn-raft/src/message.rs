@@ -135,6 +135,12 @@ pub enum Message {
         /// False when the leader could not confirm (stepped down): retry elsewhere.
         ok: bool,
     },
+    /// Leadership transfer (Raft thesis 3.10): the leader tells a caught-up follower to start
+    /// an election now, without waiting for its election timeout or asking for pre-votes.
+    TimeoutNow {
+        /// Leader's term.
+        term: Term,
+    },
 }
 
 impl Message {
@@ -150,7 +156,8 @@ impl Message {
             | Message::InstallSnapshot { term, .. }
             | Message::SnapshotResp { term, .. }
             | Message::ReadIndexReq { term, .. }
-            | Message::ReadIndexResp { term, .. } => *term,
+            | Message::ReadIndexResp { term, .. }
+            | Message::TimeoutNow { term } => *term,
         }
     }
 
@@ -246,6 +253,9 @@ impl Message {
                     .u64(index.get())
                     .u8(u8::from(*ok));
             }
+            Message::TimeoutNow { term } => {
+                w.u8(11).u64(term.get());
+            }
         }
     }
 
@@ -325,6 +335,9 @@ impl Message {
                 id: r.u64()?,
                 index: LogIndex(r.u64()?),
                 ok: r.u8()? != 0,
+            },
+            11 => Message::TimeoutNow {
+                term: Term(r.u64()?),
             },
             t => return Err(Error::corruption(format!("unknown raft message tag {t}"))),
         })

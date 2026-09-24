@@ -1,8 +1,8 @@
 # ADR 0016: The leader builds segments, followers fetch them
 
 - Status: accepted (owner approved the direction 2026-09-24; design delegated). Steps 1 and 2
-  of the plan below are implemented with this ADR, step 3 with ADR 0019, step 6 with
-  ADR 0018; steps 4 and 5 are not. Validating it exposed bugs in the older snapshot path, fixed under ADR 0017.
+  of the plan below are implemented with this ADR, step 3 with ADR 0019, step 5 with
+  ADR 0020, step 6 with ADR 0018; step 4 is not. Validating it exposed bugs in the older snapshot path, fixed under ADR 0017.
 - Date: 2026-09-24
 
 ## Context
@@ -102,5 +102,5 @@ file, with a local build as fallback.**
 2. Followers fetch, with fallback. **(done with this ADR)**
 3. Parallel build on the leader. **(done: ADR 0019)**
 4. Compaction through the log (`CompactBegin`/`CompactCommit`) and shipped.
-5. Leader balancing.
+5. Leader balancing. **(done: ADR 0020)**
 6. Versioned segment-format contract and mTLS between nodes. **(done: ADR 0018)**

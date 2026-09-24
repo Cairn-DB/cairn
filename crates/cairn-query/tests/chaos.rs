@@ -89,6 +89,8 @@ fn config(node: NodeId) -> ReplicaConfig {
         compaction_slots: None,
         ship_segments: true,
         build_parallel: None,
+        // Leader balancing on (ADR 0020): leadership transfers run under the faults too.
+        preferred_leader: Some(NodeId(1)),
     }
 }
 

@@ -60,6 +60,8 @@ pub struct NodeConfig {
     pub tls: Option<cairn_runtime::tls::NodeTls>,
     /// Threads per index build (ADR 0019); 0: all hardware threads.
     pub build_threads: usize,
+    /// Hand each shard's leadership to its first host in the placement (ADR 0020).
+    pub leader_balancing: bool,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -288,6 +290,10 @@ impl Node {
                 idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
                 compaction_slots: Some(slots.clone()),
                 ship_segments: cfg.ship_segments,
+                preferred_leader: cfg
+                    .leader_balancing
+                    .then(|| placement(&cfg, shard).first().copied())
+                    .flatten(),
                 build_parallel: Some(std::sync::Arc::new(if cfg.build_threads == 0 {
                     cairn_runtime::ThreadParallel::available()
                 } else {

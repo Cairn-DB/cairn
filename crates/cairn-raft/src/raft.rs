@@ -49,11 +49,14 @@ pub struct InitialState {
     /// restart: nothing is applied until the driver reports it installed (via
     /// [`Raft::advance`]).
     pub installing: bool,
-    /// Highest log index this node ever acknowledged, when it had to drop part of its log (an
-    /// accepted snapshot that could no longer be fetched). Until its log reaches this index
-    /// again it neither votes nor campaigns: an entry committed with its acknowledgement may
-    /// now lack a majority of copies, and a vote from it could elect a leader without it.
-    pub vote_barrier: LogIndex,
+    /// Last log position (index, term) this node ever acknowledged, when it had to drop part
+    /// of its log (an accepted snapshot that could no longer be fetched). Until its log
+    /// reaches that index again it does not campaign, and it votes only for candidates whose
+    /// log is at least as up to date as that remembered position: an entry committed with its
+    /// acknowledgement may now lack a majority of copies, and a vote judged on the shortened
+    /// log could elect a leader without it (ADR 0017; refined in ADR 0020, because refusing
+    /// every vote could leave a shard with no possible majority).
+    pub vote_barrier: (LogIndex, Term),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,6 +158,16 @@ impl Ready {
     }
 }
 
+/// A leadership transfer in progress.
+#[derive(Debug, Clone, Copy)]
+struct Transfer {
+    to: NodeId,
+    /// Ticks since it started; abandoned after one election timeout.
+    elapsed: u32,
+    /// `TimeoutNow` sent (once the target had every entry).
+    sent: bool,
+}
+
 /// The state machine of one group member.
 pub struct Raft {
     cfg: Config,
@@ -194,7 +207,9 @@ pub struct Raft {
     /// An accepted snapshot the driver has not finished installing.
     installing: bool,
     /// See [`InitialState::vote_barrier`].
-    vote_barrier: LogIndex,
+    vote_barrier: (LogIndex, Term),
+    /// Leadership transfer in progress (leader only).
+    transfer: Option<Transfer>,
     /// Diagnostics: entries shipped in appends (counting re-sends) and follower rejections.
     entries_sent: u64,
     rejects: u64,
@@ -252,6 +267,7 @@ impl Raft {
             snapshot: None,
             installing: init.installing,
             vote_barrier: init.vote_barrier,
+            transfer: None,
             cfg,
         }
     }
@@ -357,6 +373,7 @@ impl Raft {
     // ------------------------------------------------------------------ role changes
 
     fn become_follower(&mut self, term: Term, leader: Option<NodeId>) {
+        self.transfer = None;
         if term > self.term {
             self.term = term;
             self.vote = None;
@@ -500,9 +517,22 @@ impl Raft {
         }
     }
 
-    /// Whether this node may vote or campaign (see [`InitialState::vote_barrier`]).
+    /// Whether this node may campaign (see [`InitialState::vote_barrier`]).
     fn may_vote(&self) -> bool {
-        self.last_index() >= self.vote_barrier
+        self.last_index() >= self.vote_barrier.0
+    }
+
+    /// Whether a candidate's log is up to date enough for this node's vote: compared with this
+    /// node's log, and, while the vote barrier holds, with the position it once acknowledged.
+    fn votable(&self, last_index: LogIndex, last_term: Term) -> bool {
+        let (bi, bt) = self.vote_barrier;
+        self.up_to_date(last_index, last_term)
+            && (self.last_index() >= bi || last_term > bt || (last_term == bt && last_index >= bi))
+    }
+
+    /// Term of the last entry in the log (or of the snapshot point).
+    pub fn last_log_term(&self) -> Term {
+        self.last_term()
     }
 
     fn up_to_date(&self, last_index: LogIndex, last_term: Term) -> bool {
@@ -529,6 +559,13 @@ impl Raft {
         }
         match self.role {
             Role::Leader => {
+                if let Some(t) = self.transfer.as_mut() {
+                    t.elapsed += 1;
+                    if t.elapsed > self.cfg.election_ticks.max(1) {
+                        self.transfer = None;
+                    }
+                }
+                self.maybe_send_timeout_now();
                 // Appends in flight with no answer for several election timeouts were lost (a
                 // broken connection drops queued messages): re-send from the follower's `next`.
                 // Generous on purpose: a follower that is merely slow must not be flooded.
@@ -568,9 +605,72 @@ impl Raft {
                 leader_hint: self.leader,
             });
         }
+        if let Some(t) = self.transfer {
+            // No new entries while handing over: the target must catch up with a fixed log.
+            return Err(Error::NotLeader {
+                shard: cairn_core::ShardId(0),
+                leader_hint: Some(t.to),
+            });
+        }
         let index = self.append_local(payload);
         self.broadcast_append();
         Ok(index)
+    }
+
+    /// Starts handing leadership to `to` (Raft thesis 3.10): no new proposals are accepted,
+    /// `to` is brought up to date, then told to start an election at once. Abandoned after one
+    /// election timeout if `to` has not taken over. Fails if this node is not the leader or
+    /// `to` is not a peer.
+    pub fn transfer_leadership(&mut self, to: NodeId) -> Result<()> {
+        if self.role != Role::Leader {
+            return Err(Error::NotLeader {
+                shard: cairn_core::ShardId(0),
+                leader_hint: self.leader,
+            });
+        }
+        if to == self.cfg.id || !self.progress.contains_key(&to) {
+            return Err(Error::InvalidRequest(format!(
+                "cannot transfer leadership to {to}"
+            )));
+        }
+        self.transfer = Some(Transfer {
+            to,
+            elapsed: 0,
+            sent: false,
+        });
+        self.maybe_send_timeout_now();
+        if self.transfer.is_some_and(|t| !t.sent) {
+            self.send_append(to);
+        }
+        Ok(())
+    }
+
+    /// Target of the leadership transfer in progress, if any.
+    pub fn transferring_to(&self) -> Option<NodeId> {
+        self.transfer.map(|t| t.to)
+    }
+
+    /// Replication progress of peer `to` as seen by the leader: its matched index.
+    pub fn matched_index(&self, to: NodeId) -> Option<LogIndex> {
+        self.progress.get(&to).map(|p| p.matched)
+    }
+
+    fn maybe_send_timeout_now(&mut self) {
+        let Some(t) = self.transfer else { return };
+        if t.sent {
+            return;
+        }
+        if self
+            .progress
+            .get(&t.to)
+            .is_some_and(|p| p.matched >= self.last_index())
+        {
+            let term = self.term;
+            self.send(t.to, Message::TimeoutNow { term });
+            if let Some(t) = self.transfer.as_mut() {
+                t.sent = true;
+            }
+        }
     }
 
     /// Requests a linearizable read point. On the leader, a heartbeat round confirms
@@ -752,10 +852,7 @@ impl Raft {
                 // Grant if the log is up to date and no live leader is known.
                 let no_leader =
                     self.leader.is_none() || self.election_elapsed >= self.election_timeout;
-                let granted = term > self.term
-                    && no_leader
-                    && self.may_vote()
-                    && self.up_to_date(last_index, last_term);
+                let granted = term > self.term && no_leader && self.votable(last_index, last_term);
                 let current = self.term;
                 self.send(
                     from,
@@ -793,10 +890,8 @@ impl Raft {
                 ..
             } => {
                 let can = self.vote.is_none_or(|v| v == from);
-                let granted = can
-                    && self.role != Role::Leader
-                    && self.may_vote()
-                    && self.up_to_date(last_index, last_term);
+                let granted =
+                    can && self.role != Role::Leader && self.votable(last_index, last_term);
                 if granted {
                     self.vote = Some(from);
                     self.hs_dirty = true;
@@ -855,6 +950,7 @@ impl Raft {
                     let next = p.next;
                     self.maybe_commit();
                     self.check_reads();
+                    self.maybe_send_timeout_now();
                     if next <= self.last_index() {
                         self.send_append(from);
                     }
@@ -899,6 +995,17 @@ impl Raft {
                         index: snapshot.last_index,
                     },
                 );
+            }
+            Message::TimeoutNow { .. } => {
+                // Only from the current leader, and only if this node may take over.
+                // Not while installing a snapshot: this node could not serve as leader.
+                if self.role == Role::Follower
+                    && self.leader == Some(from)
+                    && self.may_vote()
+                    && !self.installing
+                {
+                    self.become_candidate();
+                }
             }
             Message::ReadIndexReq { id, .. } => {
                 if self.role == Role::Leader {
@@ -1343,7 +1450,7 @@ mod tests {
                             snapshot: (LogIndex(0), Term(0)),
                             applied: LogIndex(0),
                             installing: false,
-                            vote_barrier: LogIndex(0),
+                            vote_barrier: (LogIndex(0), Term(0)),
                         },
                     ),
                     disk: Disk::default(),
@@ -1534,7 +1641,7 @@ mod tests {
                     snapshot: disk.snapshot,
                     applied,
                     installing: false,
-                    vote_barrier: LogIndex(0),
+                    vote_barrier: (LogIndex(0), Term(0)),
                 },
             );
             self.nodes[i].alive = true;
@@ -1793,6 +1900,82 @@ mod tests {
         );
     }
 
+    fn stable_leader(c: &mut Cluster) -> usize {
+        for _ in 0..200 {
+            c.tick();
+            c.deliver_some(50);
+            if let Some(li) = c.nodes.iter().position(|n| n.raft.role() == Role::Leader) {
+                return li;
+            }
+        }
+        panic!("no leader");
+    }
+
+    #[test]
+    fn leadership_transfer_hands_over_and_keeps_the_log() {
+        let mut c = Cluster::new(3, 21, 0.0);
+        let li = stable_leader(&mut c);
+        for _ in 0..5 {
+            c.propose();
+        }
+        for _ in 0..20 {
+            c.tick();
+            c.deliver_some(100);
+        }
+        let to = (0..3).find(|i| *i != li).unwrap();
+        let term = c.nodes[li].raft.term();
+        c.nodes[li]
+            .raft
+            .transfer_leadership(NodeId(to as u32 + 1))
+            .unwrap();
+        // No new entries while handing over.
+        assert!(c.nodes[li].raft.propose(Bytes::from_static(b"x")).is_err());
+        c.drain_ready(li);
+        for _ in 0..30 {
+            c.deliver_some(100);
+            if c.nodes[to].raft.role() == Role::Leader {
+                break;
+            }
+        }
+        assert_eq!(c.nodes[to].raft.role(), Role::Leader);
+        assert_eq!(c.nodes[to].raft.term(), Term(term.get() + 1));
+        assert_ne!(c.nodes[li].raft.role(), Role::Leader);
+        for _ in 0..20 {
+            c.tick();
+            c.deliver_some(100);
+        }
+        c.check_log_matching();
+        c.check_leader_completeness();
+        assert!(c.nodes[to].raft.commit_index() >= LogIndex(6));
+    }
+
+    #[test]
+    fn leadership_transfer_to_an_unreachable_peer_is_abandoned() {
+        let mut c = Cluster::new(3, 22, 0.0);
+        let li = stable_leader(&mut c);
+        let to = (0..3).find(|i| *i != li).unwrap();
+        let (a, b) = (NodeId(li as u32 + 1), NodeId(to as u32 + 1));
+        c.blocked.insert((a, b));
+        c.blocked.insert((b, a));
+        c.nodes[li].raft.transfer_leadership(b).unwrap();
+        assert!(c.nodes[li].raft.transferring_to().is_some());
+        for _ in 0..40 {
+            c.tick();
+            c.deliver_some(100);
+        }
+        // The other follower kept the old leader in place; the transfer timed out.
+        assert_eq!(c.nodes[li].raft.role(), Role::Leader);
+        assert!(c.nodes[li].raft.transferring_to().is_none());
+        assert!(c.nodes[li].raft.propose(Bytes::from_static(b"y")).is_ok());
+        c.blocked.clear();
+        for _ in 0..60 {
+            c.tick();
+            c.deliver_some(100);
+        }
+        c.check_log_matching();
+        c.check_leader_completeness();
+    }
+
     #[test]
     fn follower_read_fails_when_the_leader_goes_away() {
         let mut c = Cluster::new(3, 9, 0.0);
@@ -1838,8 +2021,19 @@ mod tests {
             } else if r < 80 {
                 let n = 1 + c.rng.below(10) as usize;
                 c.deliver_some(n);
-            } else if r < 90 {
+            } else if r < 88 {
                 c.propose();
+            } else if r < 90 {
+                // Leadership transfer to a random peer (it may be down or partitioned).
+                if let Some(li) = c
+                    .nodes
+                    .iter()
+                    .position(|n| n.alive && n.raft.role() == Role::Leader)
+                {
+                    let to = NodeId(1 + c.rng.below(u64::from(nodes)) as u32);
+                    let _ = c.nodes[li].raft.transfer_leadership(to);
+                    c.drain_ready(li);
+                }
             } else if r < 94 {
                 // Crash a node (keep a majority alive).
                 let alive = c.nodes.iter().filter(|n| n.alive).count();
@@ -1950,6 +2144,7 @@ mod tests {
                 granted: true,
                 current: Term(2),
             },
+            Message::TimeoutNow { term: Term(8) },
             Message::Vote {
                 term: Term(3),
                 last_index: LogIndex(9),

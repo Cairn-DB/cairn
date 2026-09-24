@@ -224,13 +224,26 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     compaction; one single-thread run measured queries against a compacting node (1.2 s p99).
   - Evidence: bench-results/phase4-adr0019-builds.md; campaign 20k zero violations; 102 tests.
 
+- Step 5 of ADR 0016 (2026-09-24, owner: "vas-y pour l'etape 5"): ADR 0020, leader
+  balancing (Raft leadership transfer with TimeoutNow; preferred leader = first host in the
+  placement; `--no-leader-balancing`; protocol version 3, version 2 still accepted).
+  - The campaign with balancing on found 4 problems, all fixed (ADR 0020): vote-barrier
+    deadlock (barrier now votes by remembered position), snapshot term persisted after
+    install, manifest index and term persisted separately (SAFETY: a crash could let a
+    replica vote with an older term and elect a leader missing committed entries; the
+    manifest now records applied_term), compaction snapshot-term fallback.
+  - Evidence: campaign seeds 0..60000 zero violations with balancing on; Raft chaos harness
+    with random transfers; 105 workspace tests; bench-results/phase4-adr0020-balance.md
+    (2/1/1 split reached in both runs; takedown p99 higher with balancing, 134-155 vs
+    116-117 ms, not established, OPEN).
+
 ## Next step
-ADR 0016 steps 1-3 and 6 delivered 2026-09-24. Remaining toward production, in order:
-step 5 (leader balancing: build load concentrates on leaders), step 4 (compaction through the
-log); from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR
-0019: measure query latency during parallel builds, fix the bench settle test (wait for build
-completion, not segment quiet). Other levers: scan threshold for large segments (filtered
-linearizable p99 missed by 8% at 50M), segment publication off the actor, dynamic membership.
+ADR 0016 steps 1, 2, 3, 5 and 6 delivered 2026-09-24. Remaining toward production, in order:
+step 4 (compaction through the log); check the takedown p99 with balancing (log handovers,
+per-node timings); from ADR 0018: CRL / certificate rotation, authorization, connection
+limits; from ADR 0019: query latency during parallel builds, fix the bench settle test.
+Other levers: scan threshold for large segments (filtered linearizable p99 missed by 8% at
+50M), segment publication off the actor, dynamic membership.
 
 ## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,

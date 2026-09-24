@@ -111,6 +111,9 @@ pub struct ReplicaConfig {
     /// Threads for index builds (flushes and compactions); `None`: the build thread alone.
     /// Builds are identical either way (ADR 0019).
     pub build_parallel: Option<std::sync::Arc<dyn cairn_core::Parallel>>,
+    /// The replica that should lead this shard when it is up and caught up (ADR 0020). A
+    /// leader that is not it hands leadership over. `None`: no balancing.
+    pub preferred_leader: Option<NodeId>,
 }
 
 /// Snapshot of a replica's state for diagnostics and checkers.
@@ -283,8 +286,9 @@ struct RaftState {
     /// reflect entries up to it (compactions and deletion checkpoints taken after the
     /// snapshot point), and the state is not a consistent prefix before they are replayed.
     read_floor: LogIndex,
-    /// See `cairn_raft::InitialState::vote_barrier`.
+    /// See `cairn_raft::InitialState::vote_barrier` (index, term).
     vote_barrier: LogIndex,
+    vote_barrier_term: Term,
 }
 
 impl Manifest for RaftState {
@@ -294,7 +298,8 @@ impl Manifest for RaftState {
             .u64(self.hs.commit.get())
             .u64(self.snapshot_term.get())
             .u64(self.read_floor.get())
-            .u64(self.vote_barrier.get());
+            .u64(self.vote_barrier.get())
+            .u64(self.vote_barrier_term.get());
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
@@ -308,11 +313,13 @@ impl Manifest for RaftState {
         // Absent in state files written before the read floor existed.
         let read_floor = LogIndex(if r.remaining() > 0 { r.u64()? } else { 0 });
         let vote_barrier = LogIndex(if r.remaining() > 0 { r.u64()? } else { 0 });
+        let vote_barrier_term = Term(if r.remaining() > 0 { r.u64()? } else { 0 });
         Ok(RaftState {
             hs: HardState { term, vote, commit },
             snapshot_term,
             read_floor,
             vote_barrier,
+            vote_barrier_term,
         })
     }
 }
@@ -347,6 +354,7 @@ impl Manifest for PendingSnapshot {
 struct SnapshotFetch {
     manifest: Bytes,
     last_index: LogIndex,
+    last_term: Term,
     from: NodeId,
     needed: Vec<String>,
     /// Files completely fetched (streamed to their staging files and synced).
@@ -434,6 +442,12 @@ struct FlushState {
     announce: std::collections::BTreeMap<SegmentId, ((u64, u64), Option<Term>)>,
     built: u64,
     fetched: u64,
+    /// Leader balancing (ADR 0020): tick since which this replica leads, and the earliest tick
+    /// for the next handover attempt.
+    lead_since: Option<u64>,
+    next_handover: u64,
+    /// Handovers started by this replica (diagnostics).
+    handovers: u64,
 }
 
 impl<R: Runtime> Replica<R> {
@@ -473,9 +487,14 @@ impl<R: Runtime> Replica<R> {
             .load::<PendingSnapshot>()
             .await?
             .filter(|p| p.last_index > manifest_index);
+        // The manifest records the term of its index; older manifests fall back to the state.
+        let manifest_term = match engine.store().manifest().applied_term {
+            Term(0) => state.snapshot_term,
+            t => t,
+        };
         let (snapshot_index, snapshot_term) = match &pending {
             Some(p) => (p.last_index, p.last_term),
-            None => (manifest_index, state.snapshot_term),
+            None => (manifest_index, manifest_term),
         };
         let log = engine.store_mut().log_mut();
         if pending.is_some() && log.first_index() != snapshot_index.next() {
@@ -517,13 +536,13 @@ impl<R: Runtime> Replica<R> {
                 snapshot: (snapshot_index, snapshot_term),
                 applied,
                 installing: pending.is_some(),
-                vote_barrier: state.vote_barrier,
+                vote_barrier: (state.vote_barrier, state.vote_barrier_term),
             },
         );
         if pending.is_none() && snapshot_index > LogIndex(0) {
             raft.compact(Snapshot {
                 last_index: snapshot_index,
-                last_term: state.snapshot_term,
+                last_term: manifest_term,
                 data: engine.store().manifest_bytes(),
             });
         }
@@ -743,10 +762,7 @@ impl<R: Runtime> Replica<R> {
                 // the snapshot Raft offers them.
                 let up_to = self.engine.store().manifest().applied_index;
                 if up_to > LogIndex(0) {
-                    let term = self
-                        .raft
-                        .term_at(up_to)
-                        .unwrap_or(self.raft.snapshot_term());
+                    let term = self.manifest_term();
                     self.compact_raft_log(Snapshot {
                         last_index: up_to,
                         last_term: term,
@@ -1263,6 +1279,53 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
+    /// Leader balancing (ADR 0020): a leader that is not the shard's preferred leader hands
+    /// leadership to it once it is caught up. Not while this replica builds or holds an
+    /// unpublished freeze (the new leader would redo the build), not within a few election
+    /// timeouts of winning leadership, and at most once per cooldown.
+    fn maybe_hand_over_leadership(&mut self) {
+        let leader = self.raft.role() == Role::Leader;
+        match (leader, self.flush.lead_since) {
+            (true, None) => self.flush.lead_since = Some(self.ticks),
+            (false, Some(_)) => self.flush.lead_since = None,
+            _ => {}
+        }
+        let Some(pref) = self.cfg.preferred_leader else {
+            return;
+        };
+        let election = u64::from(self.cfg.election_ticks.max(1));
+        let settled = self
+            .flush
+            .lead_since
+            .is_some_and(|t| self.ticks - t >= 3 * election);
+        if !leader
+            || !settled
+            || pref == self.cfg.id
+            || !self.cfg.peers.contains(&pref)
+            || self.raft.transferring_to().is_some()
+            || self.ticks < self.flush.next_handover
+            || self.flush.building.is_some()
+            || self.fetch.is_some()
+            || !self.engine.store().pending_flushes().is_empty()
+        {
+            return;
+        }
+        // The preferred replica must hold everything committed: a replica that is down or
+        // lagging is not handed the shard (it gets it once it has caught up).
+        if self
+            .raft
+            .matched_index(pref)
+            .is_none_or(|m| m < self.raft.commit_index())
+        {
+            return;
+        }
+        self.flush.next_handover = self.ticks + 10 * election;
+        if self.raft.transfer_leadership(pref).is_ok() {
+            self.flush.handovers += 1;
+            tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, to = %pref, "handing leadership to the preferred replica");
+        }
+    }
+
     /// Abandons the current segment fetch: the freeze is built here instead.
     fn fetch_failed(&mut self, why: &str) {
         if let Some(f) = self.flush.fetch.take() {
@@ -1352,13 +1415,25 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
+    /// Term of the entry at the manifest's applied index: recorded in the manifest itself,
+    /// else (older manifests) Raft's view of it, else the persisted state.
+    fn manifest_term(&self) -> Term {
+        let m = self.engine.store().manifest();
+        match m.applied_term {
+            Term(0) => self
+                .raft
+                .term_at(m.applied_index)
+                .unwrap_or(self.state.snapshot_term),
+            t => t,
+        }
+    }
+
     async fn after_publish(&mut self) -> Result<()> {
         self.engine.refresh().await?;
         let up_to = self.engine.store().manifest().applied_index;
         tracing::info!(node = %self.cfg.id, applied = %up_to, segments = ?self.engine.store().segments().map(|s| s.id.get()).collect::<Vec<_>>(), "flushed");
-        if up_to > LogIndex(0)
-            && let Some(term) = self.raft.term_at(up_to)
-        {
+        if up_to > LogIndex(0) {
+            let term = self.manifest_term();
             let snap = Snapshot {
                 last_index: up_to,
                 last_term: term,
@@ -1414,6 +1489,7 @@ impl<R: Runtime> Replica<R> {
             self.propose_flush_begin();
         }
         self.retry_stalled_snapshot_fetch().await;
+        self.maybe_hand_over_leadership();
         // A stalled segment fetch falls back to a local build.
         let stall = FETCH_STALL_ELECTIONS * u64::from(self.cfg.election_ticks.max(1));
         if self
@@ -1504,6 +1580,7 @@ impl<R: Runtime> Replica<R> {
         let mut fetch = SnapshotFetch {
             manifest: s.data.clone(),
             last_index: s.last_index,
+            last_term: s.last_term,
             from,
             needed: needed.clone(),
             got: Vec::new(),
@@ -1566,7 +1643,10 @@ impl<R: Runtime> Replica<R> {
             // it, and reopen from disk so the leader ships a fresh one. The entries after it
             // were acknowledged: until the log is back to them, this node must not vote (Raft's
             // vote barrier).
-            self.state.vote_barrier = self.state.vote_barrier.max(self.raft.last_index());
+            if self.raft.last_index() > self.state.vote_barrier {
+                self.state.vote_barrier = self.raft.last_index();
+                self.state.vote_barrier_term = self.raft.last_log_term();
+            }
             self.state_store.store(&self.state).await?;
             let pending = format!("{}/SNAPSHOT", self.cfg.dir);
             if self.rt.disk().exists(&pending).await? {
@@ -1689,9 +1769,12 @@ impl<R: Runtime> Replica<R> {
         let Some(f) = self.fetch.take() else {
             return Ok(());
         };
-        // Persist the read floor before the files become the shard state: a crash right after
-        // the install must not serve reads from them early either.
+        // Persist the read floor and the snapshot's term before the files become the shard
+        // state: a crash right after the install must neither serve reads early nor restart
+        // Raft with the term of an older snapshot point at the new one (chaos seed 19929: a
+        // follower then refused every append at that index, forever).
         self.state.read_floor = self.state.read_floor.max(f.floor);
+        self.state.snapshot_term = f.last_term;
         self.state_store.store(&self.state).await?;
         let files: Vec<String> = f
             .needed
