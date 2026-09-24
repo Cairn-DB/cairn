@@ -340,14 +340,19 @@ Files: `bench-results/phase4-adr0016-bigann2m-ship.md` and `...-noship.md`.
 - **Build CPU** falls to 42% of the no-shipping total. Local compaction is still in both
   totals. CPU follows leadership: node 3 led 3 of 4 shards and did the most work. That is
   why leader balancing (ADR 0016, step 5) matters.
-- **Ingest** is 46% faster on this host, where the three nodes share 16 threads. On separate
-  machines, expect the gain to show in CPU headroom rather than raw throughput.
+- **Ingest** is faster on this host, where the three nodes share 16 threads: 16.7k vs 13.7k
+  docs/s averaged over 4 runs per mode (+22%). The +46% of the table above came from a single
+  pair and the slowest no-shipping run. On separate machines, expect the gain to show in CPU
+  headroom rather than raw throughput.
 - **One fallback build** was logged: a follower found the file missing on the leader, which had
   probably compacted it away already. The other builds on nodes that did not lead at the end
   most likely come from leadership changes during the run. The servers log at warn level, so
   leadership changes are not recorded, and this is not verified.
-- **Takedown p99 is worse with shipping on** (177 vs 102 ms, 100 samples, one run each). The
-  cause is not established. Candidates are a follower waiting on its read floor after a
-  snapshot, and fetch traffic sharing the peer connection with Raft. This needs a repeated
-  measurement before any conclusion.
+- **Takedown latency: no regression established.** The first pair showed p99 177 vs 102 ms
+  (100 takedowns each). Re-measured with 3 alternating runs per mode and 500 takedowns each,
+  p99 is 118-129 ms with shipping and 104-143 ms without. The ranges overlap and the worst run
+  is a no-shipping one. A small residual may remain at the median (83 and 88 ms in two of
+  three shipping runs, 70-71 ms in all no-shipping runs). It is not established, and a
+  per-node breakdown would be needed to explain it. See
+  `bench-results/phase4-adr0016-takedown-rerun.md`.
 - Query latency and recall are unchanged within noise.
