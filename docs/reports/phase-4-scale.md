@@ -298,3 +298,56 @@ Files: `bench-results/phase4-gcp-bigann50m.md` and
   shard took about 1 h 50 min with 3 to 6 merges per node on 8 vCPU.
 - **Cost:** about 6 h of four VMs, roughly 10 USD. This is an estimate from list prices; it
   was not checked on the billing console.
+
+# Part 4 (2026-09-24): leader-built segments (ADR 0016, steps 1 and 2)
+
+## What changed
+
+A flush is now two log entries. `FlushBegin` freezes the same rows on every replica, the
+leader builds, `FlushCommit` announces the file, and followers fetch and verify it, with a
+local build as fallback. Compaction is still local to each replica. Validating the change
+found that the chaos campaign had never flushed. Once it did, it exposed eight bugs in the
+snapshot and flush paths. ADR 0017 lists them, and they are fixed.
+
+## Correctness evidence
+
+- Campaign: seeds 0 to 60,000 with zero violations. Every run flushes, ships, compacts and
+  installs snapshots. See `bench-results/phase4-adr0016-campaign.md`.
+- `cargo test --workspace`: 89 passed, 0 failed, 1 ignored (the campaign runner).
+- New tests cover shipping with zero follower builds, the fallback when a follower cannot reach
+  the leader's file server, shipping turned off, ordered publication, masking after a freeze,
+  rejection of a corrupt fetch, and replay of pending freezes after a restart.
+
+## A/B on the development machine
+
+Same 2M-row BigANN ingest, 3 server processes on one host, 4 shards, 64 MB memtables,
+`--sq8-only`, one run each. Command: `MODE=ship|noship data/run-adr0016.sh`.
+
+| metric | shipping on | shipping off |
+|---|---|---|
+| CPU seconds, nodes 1 / 2 / 3 | 238 / 107 / 361 | 560 / 546 / 560 |
+| CPU seconds, total | 706 | 1666 |
+| ingest throughput | 16.6k docs/s | 11.3k docs/s |
+| builds settled after ingest | 83 s | 133 s |
+| RSS per node after settling | 2.2-2.5 GB | 2.7-3.0 GB |
+| flushes built / fetched, summed over nodes | 20 / 34 | 48 / 0 |
+| unfiltered p99, stale / linearizable | 8.9 / 10.7 ms | 7.8 / 10.1 ms |
+| 1% filter recall | 0.9925 | 0.9924 |
+| takedown visible on all nodes, p99 | 177 ms | 102 ms |
+
+Files: `bench-results/phase4-adr0016-bigann2m-ship.md` and `...-noship.md`.
+
+- **Build CPU** falls to 42% of the no-shipping total. Local compaction is still in both
+  totals. CPU follows leadership: node 3 led 3 of 4 shards and did the most work. That is
+  why leader balancing (ADR 0016, step 5) matters.
+- **Ingest** is 46% faster on this host, where the three nodes share 16 threads. On separate
+  machines, expect the gain to show in CPU headroom rather than raw throughput.
+- **One fallback build** was logged: a follower found the file missing on the leader, which had
+  probably compacted it away already. The other builds on nodes that did not lead at the end
+  most likely come from leadership changes during the run. The servers log at warn level, so
+  leadership changes are not recorded, and this is not verified.
+- **Takedown p99 is worse with shipping on** (177 vs 102 ms, 100 samples, one run each). The
+  cause is not established. Candidates are a follower waiting on its read floor after a
+  snapshot, and fetch traffic sharing the peer connection with Raft. This needs a repeated
+  measurement before any conclusion.
+- Query latency and recall are unchanged within noise.

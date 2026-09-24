@@ -170,14 +170,34 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     still exist there).
   - Decisions: ADR 0015 (placement, follower reads, flow control, write ordering).
 
+- Leader-built segments (2026-09-24, owner: "write the ADR and run steps 1 and 2"; the owner
+  also intends to take Cairn to production):
+  - ADR 0016 steps 1-2 DONE (commit 3d928e2): FlushBegin/FlushCommit through the log, immutable
+    freezes published in order, followers fetch and verify the leader's file, local-build
+    fallback (fetch stall, missing file, hash mismatch, no commit), `--no-ship-segments`,
+    `ReplicaStatus::flushes`. Steps 3-6 (parallel leader build, compaction through the log,
+    leader balancing, format versioning + mTLS) NOT done.
+  - FINDING: the chaos campaign had never flushed (12 keys x 176 B never filled a 3 KB
+    memtable). Every campaign before 2026-09-24 (incl. the 60k seeds of ADR 0015) covered Raft,
+    memtable and reads only, not flushes, compaction or snapshot installs. Chaos memtable is now
+    800 B; the campaign line prints segments built/fetched so this cannot recur silently.
+  - With flushing on, ~10% of seeds failed. Seven snapshot-path bugs (pre-existing) and one
+    ADR 0016 bug fixed; ADR 0017 lists them with the seeds. Raft changed twice: vote barrier
+    (a replica that dropped acknowledged entries does not vote until it has them again) and
+    pre-vote responses carrying the responder's term.
+  - Evidence: bench-results/phase4-adr0016-campaign.md (seeds 0..60000, zero violations,
+    ~19 segments built and ~16 fetched per run); 89 workspace tests.
+  - On-disk/wire changes: RAFT file +2 fields (old files decode), new SNAPSHOT file, compaction
+    ids carry the node id, FileChunk and PreVoteResp gained a field. Old shard dirs must be
+    reloaded (flush ids are log indexes now).
+
 ## Next step
-Scale runs delivered 2026-09-23; owner wants to discuss concepts next. Scale-specific levers:
-fewer, larger segments (post-load compaction), per-query fixed cost (filter evaluation per
-segment), linearizable leg forwarding, and a disk-resident index for 50M on one host.
-Earlier candidate follow-ups, by value: (1) move segment publication and compaction input
-reads off the actor (ingest p99); (2) group commit across proposals; (3) io_uring reactor;
-(4) BM25 scoring loop (term-at-a-time accumulators or block-max WAND); (5) membership changes;
-(6) fuzz targets + Miri on the scalar kernel paths; (7) 10M-row end-to-end ingest run.
+ADR 0016 steps 1-2 delivered 2026-09-24. Before production (owner's goal), in order: step 6
+(versioned segment-format contract + mTLS between nodes; required for rolling upgrades and
+for accepting files from peers), step 3 (parallel build on the leader), step 5 (leader
+balancing: build load now concentrates on leaders), step 4 (compaction through the log).
+Other open levers: scan threshold for large segments (filtered linearizable p99 missed by 8% at
+50M), segment publication off the actor, dynamic membership.
 
 ## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
@@ -198,7 +218,12 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
 - Disk trait: data ops take effect at completion (after latency); directory ops at issue.
 
 ## Open problems
-(none yet)
+- Vote barrier liveness (ADR 0017): a replica that dropped a stale snapshot cannot vote until
+  it catches up; if another replica of the shard is down at the same time, the shard has no
+  leader until it returns. Safe, but a double fault stalls the shard.
+- Build load concentrates on leaders (ADR 0016); no leader balancing yet.
+- The segment format is now a cluster contract with no version negotiation: all nodes must run
+  the same build.
 
 ## Log
 - 2026-09-22 (end): Phases 3 and 4 closed. Real-cluster bugs: cross-thread wake did not
