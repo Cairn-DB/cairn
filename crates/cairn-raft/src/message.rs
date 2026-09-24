@@ -56,6 +56,10 @@ pub enum Message {
         term: Term,
         /// Whether the vote would be granted.
         granted: bool,
+        /// The responder's current term. A pre-candidate behind it adopts it: otherwise a
+        /// node whose term fell behind (its pre-votes rejected as stale by the others) could
+        /// never catch up without a third node's help (chaos seed 607).
+        current: Term,
     },
     /// Vote request.
     Vote {
@@ -163,8 +167,15 @@ impl Message {
                     .u64(last_index.get())
                     .u64(last_term.get());
             }
-            Message::PreVoteResp { term, granted } => {
-                w.u8(2).u64(term.get()).u8(u8::from(*granted));
+            Message::PreVoteResp {
+                term,
+                granted,
+                current,
+            } => {
+                w.u8(2)
+                    .u64(term.get())
+                    .u8(u8::from(*granted))
+                    .u64(current.get());
             }
             Message::Vote {
                 term,
@@ -249,6 +260,7 @@ impl Message {
             2 => Message::PreVoteResp {
                 term: Term(r.u64()?),
                 granted: r.u8()? != 0,
+                current: Term(r.u64()?),
             },
             3 => Message::Vote {
                 term: Term(r.u64()?),

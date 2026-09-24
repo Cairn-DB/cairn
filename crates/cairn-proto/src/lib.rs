@@ -283,6 +283,9 @@ fn enc_status(w: &mut Writer, s: &ReplicaStatus) {
     for x in &s.segments {
         w.u64(*x);
     }
+    for x in s.flushes {
+        w.u64(x);
+    }
 }
 
 fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
@@ -310,6 +313,7 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
     for _ in 0..n {
         segments.push(r.u64()?);
     }
+    let flushes = [r.u64()?, r.u64()?, r.u64()?];
     Ok(ReplicaStatus {
         id,
         role,
@@ -323,6 +327,7 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
         queued,
         net,
         segments,
+        flushes,
     })
 }
 
@@ -676,6 +681,7 @@ mod tests {
             queued: [1, 2, 3],
             net: (100, 4),
             segments: vec![1, 2],
+            flushes: [5, 6, 1],
         };
         let resps = vec![
             Response::Ack(vec![token]),

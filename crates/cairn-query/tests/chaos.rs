@@ -63,7 +63,9 @@ fn config(node: NodeId) -> ReplicaConfig {
         heartbeat_ticks: 2,
         engine: EngineConfig {
             store: StoreConfig {
-                memtable_max_bytes: 3000,
+                // About four documents: every run flushes, ships, compacts and snapshots (at
+                // 3000 bytes the 12 keys never filled a memtable, so no flush ever ran).
+                memtable_max_bytes: 800,
                 log: LogConfig {
                     max_file_bytes: 1 << 14,
                 },
@@ -85,6 +87,7 @@ fn config(node: NodeId) -> ReplicaConfig {
         own_receiver: true,
         idle_flush_ticks: 0,
         compaction_slots: None,
+        ship_segments: true,
     }
 }
 
@@ -562,6 +565,15 @@ fn run(seed: u64) -> (usize, usize, u64) {
             ))
             .collect::<Vec<_>>()
     );
+    // Flushes built and fetched since each replica's last restart (a lower bound for the run).
+    FLUSHES.with(|f| {
+        let mut t = f.get();
+        for s in &statuses {
+            t[0] += s.flushes[0];
+            t[1] += s.flushes[1];
+        }
+        f.set(t);
+    });
     let hist = history.borrow();
     let (reads, checked) = check(&hist);
     let writes = hist
@@ -578,6 +590,11 @@ fn run(seed: u64) -> (usize, usize, u64) {
         "seed {seed}: too little activity: {writes} writes, {reads} reads"
     );
     (reads, checked, sim.digest())
+}
+
+thread_local! {
+    /// Campaign diagnostics: segments built locally and fetched from a leader (ADR 0016).
+    static FLUSHES: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0, 0]) };
 }
 
 #[test]
@@ -620,8 +637,9 @@ fn campaign() {
             eprintln!("campaign progress seed={seed}");
         }
     }
+    let [built, fetched] = FLUSHES.with(|f| f.get());
     eprintln!(
-        "CAMPAIGN OK seeds={}..{} runs={writes} reads_checked={reads}",
+        "CAMPAIGN OK seeds={}..{} runs={writes} reads_checked={reads} segments_built={built} segments_fetched={fetched}",
         a, b
     );
 }

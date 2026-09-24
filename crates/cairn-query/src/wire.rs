@@ -29,6 +29,9 @@ pub enum FrameBody {
         offset: u64,
         /// Total file length (`u64::MAX` if the file does not exist).
         total: u64,
+        /// The server's applied index when it read the chunk: the file cannot reflect entries
+        /// beyond it (a follower installing a snapshot waits for that index before serving).
+        applied: u64,
         /// Bytes.
         data: Bytes,
     },
@@ -61,6 +64,7 @@ impl Frame {
                 path,
                 offset,
                 total,
+                applied,
                 data,
             } => {
                 w.u8(3)
@@ -68,6 +72,7 @@ impl Frame {
                     .str(path)
                     .u64(*offset)
                     .u64(*total)
+                    .u64(*applied)
                     .bytes(data);
             }
         }
@@ -90,6 +95,7 @@ impl Frame {
                 path: r.str()?.to_owned(),
                 offset: r.u64()?,
                 total: r.u64()?,
+                applied: r.u64()?,
                 data: Bytes::copy_from_slice(r.bytes()?),
             },
             t => return Err(Error::corruption(format!("unknown frame tag {t}"))),

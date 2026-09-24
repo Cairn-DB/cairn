@@ -59,6 +59,10 @@ struct Cli {
     /// Flush an idle memtable after this many milliseconds without writes (0: never).
     #[arg(long, default_value_t = 5000)]
     idle_flush_ms: u64,
+    /// Every replica builds every flushed segment itself instead of fetching the leader's
+    /// (ADR 0016).
+    #[arg(long)]
+    no_ship_segments: bool,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -97,6 +101,7 @@ fn main() -> anyhow::Result<()> {
         target_segment_rows: cli.target_segment_rows,
         compaction_slots: cli.compaction_slots,
         idle_flush_ms: cli.idle_flush_ms,
+        ship_segments: !cli.no_ship_segments,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

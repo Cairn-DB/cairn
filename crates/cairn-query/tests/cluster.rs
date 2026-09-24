@@ -81,6 +81,7 @@ fn config(node: NodeId, memtable_max_bytes: usize) -> ReplicaConfig {
         own_receiver: true,
         idle_flush_ticks: 0,
         compaction_slots: None,
+        ship_segments: true,
     }
 }
 
@@ -481,4 +482,154 @@ fn held_back_proposals_fail_over_when_leadership_is_lost() {
     for s in &slots {
         s.release();
     }
+}
+
+/// Spawns three replicas with a small memtable and no compaction (ADR 0016 tests).
+fn spawn_three(
+    sim: &Simulation,
+    ex: &mut cairn_runtime::Executor<cairn_sim::SimReactor>,
+    memtable: usize,
+    ship: bool,
+) -> Vec<ReplicaHandle> {
+    (1..=3u32)
+        .map(|n| {
+            let mut cfg = config(NodeId(n), memtable);
+            cfg.engine.store.max_segments = 1000;
+            cfg.ship_segments = ship;
+            let (sim, hh) = (sim.clone(), ex.handle());
+            ex.block_on(async move {
+                Replica::spawn(sim.runtime(NodeId(n), &hh), cfg, schema())
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect()
+}
+
+/// Waits until no replica holds an unpublished freeze and all agree on the segment list.
+async fn wait_flushed(
+    rt: &SimRuntime,
+    handles: &[ReplicaHandle],
+) -> Vec<cairn_query::ReplicaStatus> {
+    for _ in 0..3000 {
+        let mut st = Vec::new();
+        for h in handles {
+            st.push(h.status().await.unwrap());
+        }
+        if st
+            .iter()
+            .all(|s| s.flushes[2] == 0 && s.segments == st[0].segments)
+            && !st[0].segments.is_empty()
+        {
+            return st;
+        }
+        rt.sleep(Duration::from_millis(10)).await;
+    }
+    let mut st = Vec::new();
+    for h in handles {
+        st.push(h.status().await);
+    }
+    panic!("flushes did not settle: {st:#?}");
+}
+
+async fn check_all_docs(handles: &[ReplicaHandle], n: u64, deleted: &[u64]) {
+    for h in handles {
+        for i in 1..=n {
+            let got = h.get(DocId(i), Consistency::Stale).await.unwrap();
+            let want = (!deleted.contains(&i)).then(|| doc(i));
+            assert_eq!(got, want, "node {} doc {i}", h.id());
+        }
+    }
+}
+
+/// ADR 0016: the leader builds each flushed segment once; followers fetch and install it, and
+/// a takedown applied after the freeze is still masked in the fetched segment.
+#[test]
+fn followers_install_leader_built_segments() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(21, SimConfig::default());
+    let handles = spawn_three(&sim, &mut ex, 6000, true);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    ex.block_on(async move {
+        let li = wait_leader(&rt, &hs).await;
+        for i in 1..=120u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            if i == 60 {
+                // Right after a flush may have frozen these rows.
+                propose(&rt, &hs, Command::Delete(vec![DocId(10), DocId(55)])).await;
+            }
+        }
+        wait_converged(&rt, &hs, 118).await;
+        let st = wait_flushed(&rt, &hs).await;
+        let leader = &st[li];
+        assert!(leader.flushes[0] >= 3, "leader built: {:?}", leader.flushes);
+        assert_eq!(leader.flushes[1], 0);
+        for (i, s) in st.iter().enumerate() {
+            if i != li {
+                assert_eq!(s.flushes[0], 0, "follower {} built locally", s.id);
+                assert_eq!(s.flushes[1], leader.flushes[0], "follower {} fetched", s.id);
+            }
+        }
+        check_all_docs(&hs, 120, &[10, 55]).await;
+    });
+}
+
+/// ADR 0016 fallback: a follower that cannot reach the leader's file server (its requests are
+/// dropped, while it still receives the log) builds its segments itself.
+#[test]
+fn follower_builds_locally_when_the_fetch_stalls() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(22, SimConfig::default());
+    let handles = spawn_three(&sim, &mut ex, 6000, true);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let li = ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move { wait_leader(&rt, &hs).await }
+    });
+    let leader = NodeId(li as u32 + 1);
+    let cut = NodeId(((li + 1) % 3) as u32 + 1);
+    sim.block(cut, leader);
+    let hs = handles.clone();
+    let st = ex.block_on({
+        let rt = rt.clone();
+        async move {
+            for i in 1..=90u64 {
+                propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            }
+            wait_converged(&rt, &hs, 90).await;
+            wait_flushed(&rt, &hs).await
+        }
+    });
+    sim.unblock(cut, leader);
+    let c = &st[(cut.get() - 1) as usize];
+    assert_eq!(c.leader, Some(leader), "no election expected");
+    assert!(c.flushes[0] >= 2, "cut-off follower built: {:?}", c.flushes);
+    assert_eq!(c.flushes[1], 0);
+    let other = st.iter().find(|s| s.id != leader && s.id != cut).unwrap();
+    assert_eq!(other.flushes[0], 0);
+    assert!(other.flushes[1] >= 2);
+    ex.block_on(async move { check_all_docs(&handles, 90, &[]).await });
+}
+
+/// With shipping off, every replica builds every flush, still cut by the log.
+#[test]
+fn flushes_through_the_log_without_shipping() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(23, SimConfig::default());
+    let handles = spawn_three(&sim, &mut ex, 6000, false);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    ex.block_on(async move {
+        wait_leader(&rt, &hs).await;
+        for i in 1..=90u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+        }
+        wait_converged(&rt, &hs, 90).await;
+        let st = wait_flushed(&rt, &hs).await;
+        for s in &st {
+            assert!(s.flushes[0] >= 2 && s.flushes[1] == 0, "{:?}", s.flushes);
+        }
+        check_all_docs(&hs, 90, &[]).await;
+    });
 }

@@ -19,10 +19,10 @@ fail=0
 for p in "${pids[@]}"; do wait "$p" || fail=1; done
 END="$(date +%s)"
 {
-  echo "# Phase 3 simulation campaign"
+  echo "# Simulation campaign"
   echo
   echo "- Date: $(date +%F). Commit: $(git rev-parse --short HEAD)."
-  echo "- Scenario: crates/cairn-query/tests/chaos.rs (3 nodes, 3 clients, 12 keys, 40 fault rounds: partitions, 3% drops, crashes and restarts, flushes every ~3 KB, snapshots)."
+  echo "- Scenario: crates/cairn-query/tests/chaos.rs (3 nodes, 3 clients, 12 keys, 40 fault rounds: partitions, 3% drops, crashes and restarts; 800-byte memtables, so flushes (ADR 0016 shipping), compactions and snapshot installs happen in every run; segments built and fetched are counted per process)."
   echo "- Seeds: 0..$TOTAL in $PROCS processes; wall time $((END-START)) s."
   echo "- Checks per run: every read against the per-key model with real-time bounds, read-your-takedown on Linearizable and ReadYourWrites reads, replica convergence (applied index and documents), determinism digest."
   echo

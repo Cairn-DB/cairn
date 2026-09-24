@@ -45,6 +45,15 @@ pub struct InitialState {
     pub snapshot: (LogIndex, Term),
     /// Index applied to the state machine.
     pub applied: LogIndex,
+    /// The snapshot at `snapshot` was accepted but its installation did not finish before the
+    /// restart: nothing is applied until the driver reports it installed (via
+    /// [`Raft::advance`]).
+    pub installing: bool,
+    /// Highest log index this node ever acknowledged, when it had to drop part of its log (an
+    /// accepted snapshot that could no longer be fetched). Until its log reaches this index
+    /// again it neither votes nor campaigns: an entry committed with its acknowledgement may
+    /// now lack a majority of copies, and a vote from it could elect a leader without it.
+    pub vote_barrier: LogIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,6 +193,8 @@ pub struct Raft {
     snapshot: Option<Snapshot>,
     /// An accepted snapshot the driver has not finished installing.
     installing: bool,
+    /// See [`InitialState::vote_barrier`].
+    vote_barrier: LogIndex,
     /// Diagnostics: entries shipped in appends (counting re-sends) and follower rejections.
     entries_sent: u64,
     rejects: u64,
@@ -239,7 +250,8 @@ impl Raft {
             entries_sent: 0,
             rejects: 0,
             snapshot: None,
-            installing: false,
+            installing: init.installing,
+            vote_barrier: init.vote_barrier,
             cfg,
         }
     }
@@ -488,6 +500,11 @@ impl Raft {
         }
     }
 
+    /// Whether this node may vote or campaign (see [`InitialState::vote_barrier`]).
+    fn may_vote(&self) -> bool {
+        self.last_index() >= self.vote_barrier
+    }
+
     fn up_to_date(&self, last_index: LogIndex, last_term: Term) -> bool {
         last_term > self.last_term()
             || (last_term == self.last_term() && last_index >= self.last_index())
@@ -533,7 +550,11 @@ impl Raft {
             _ => {
                 self.election_elapsed += 1;
                 if self.election_elapsed >= self.election_timeout {
-                    self.become_pre_candidate();
+                    if self.may_vote() {
+                        self.become_pre_candidate();
+                    } else {
+                        self.reset_election_timer();
+                    }
                 }
             }
         }
@@ -731,11 +752,30 @@ impl Raft {
                 // Grant if the log is up to date and no live leader is known.
                 let no_leader =
                     self.leader.is_none() || self.election_elapsed >= self.election_timeout;
-                let granted =
-                    term > self.term && no_leader && self.up_to_date(last_index, last_term);
-                self.send(from, Message::PreVoteResp { term, granted });
+                let granted = term > self.term
+                    && no_leader
+                    && self.may_vote()
+                    && self.up_to_date(last_index, last_term);
+                let current = self.term;
+                self.send(
+                    from,
+                    Message::PreVoteResp {
+                        term,
+                        granted,
+                        current,
+                    },
+                );
             }
-            Message::PreVoteResp { term, granted } => {
+            Message::PreVoteResp {
+                term,
+                granted,
+                current,
+            } => {
+                if current > self.term {
+                    // A real term we missed (not a prospective one): adopt it.
+                    self.become_follower(current, None);
+                    return;
+                }
                 if self.role == Role::PreCandidate && term.get() == self.term.get() + 1 {
                     self.votes.insert(from, granted);
                     let yes = self.votes.values().filter(|g| **g).count();
@@ -753,8 +793,10 @@ impl Raft {
                 ..
             } => {
                 let can = self.vote.is_none_or(|v| v == from);
-                let granted =
-                    can && self.role != Role::Leader && self.up_to_date(last_index, last_term);
+                let granted = can
+                    && self.role != Role::Leader
+                    && self.may_vote()
+                    && self.up_to_date(last_index, last_term);
                 if granted {
                     self.vote = Some(from);
                     self.hs_dirty = true;
@@ -1300,6 +1342,8 @@ mod tests {
                             entries: vec![],
                             snapshot: (LogIndex(0), Term(0)),
                             applied: LogIndex(0),
+                            installing: false,
+                            vote_barrier: LogIndex(0),
                         },
                     ),
                     disk: Disk::default(),
@@ -1489,6 +1533,8 @@ mod tests {
                     entries: disk.entries.clone(),
                     snapshot: disk.snapshot,
                     applied,
+                    installing: false,
+                    vote_barrier: LogIndex(0),
                 },
             );
             self.nodes[i].alive = true;
@@ -1902,6 +1948,7 @@ mod tests {
             Message::PreVoteResp {
                 term: Term(3),
                 granted: true,
+                current: Term(2),
             },
             Message::Vote {
                 term: Term(3),

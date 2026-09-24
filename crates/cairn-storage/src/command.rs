@@ -1,7 +1,7 @@
 //! Commands carried by log entries.
 
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::{DocId, Document, Error, Result};
+use cairn_core::{DocId, Document, Error, Result, SegmentId};
 
 /// One replicated command (a log entry payload).
 #[derive(Debug, Clone, PartialEq)]
@@ -12,6 +12,19 @@ pub enum Command {
     Upsert(Vec<Document>),
     /// Remove documents by id (a takedown).
     Delete(Vec<DocId>),
+    /// Freeze the memtable for a flush (ADR 0016). The segment id is the entry's log index,
+    /// so every replica cuts the same rows under the same id.
+    FlushBegin,
+    /// The leader built the segment of the freeze `id`: its file length and body hash, which
+    /// followers check after fetching it.
+    FlushCommit {
+        /// Segment id (the `FlushBegin` index).
+        id: SegmentId,
+        /// File length in bytes.
+        len: u64,
+        /// Body hash recorded in the file's table of contents.
+        hash: u64,
+    },
 }
 
 impl Command {
@@ -30,6 +43,12 @@ impl Command {
                 for id in ids {
                     w.u64(id.get());
                 }
+            }
+            Command::FlushBegin => {
+                w.u8(3);
+            }
+            Command::FlushCommit { id, len, hash } => {
+                w.u8(4).u64(id.get()).u64(*len).u64(*hash);
             }
         }
     }
@@ -69,6 +88,12 @@ impl Command {
                 }
                 Ok(Command::Delete(ids))
             }
+            3 => Ok(Command::FlushBegin),
+            4 => Ok(Command::FlushCommit {
+                id: SegmentId(r.u64()?),
+                len: r.u64()?,
+                hash: r.u64()?,
+            }),
             t => Err(Error::corruption(format!("unknown command tag {t}"))),
         }
     }
@@ -79,5 +104,36 @@ impl Command {
         let c = Command::decode(&mut r)?;
         r.finish()?;
         Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_commands_roundtrip() {
+        for cmd in [
+            Command::Noop,
+            Command::FlushBegin,
+            Command::FlushCommit {
+                id: SegmentId(42),
+                len: 1 << 40,
+                hash: u64::MAX,
+            },
+            Command::Delete(vec![DocId(7), DocId(9)]),
+        ] {
+            assert_eq!(Command::from_bytes(&cmd.to_bytes()).unwrap(), cmd);
+        }
+        // Truncated payloads are errors, not panics (an empty payload is the no-op marker).
+        let b = Command::FlushCommit {
+            id: SegmentId(1),
+            len: 2,
+            hash: 3,
+        }
+        .to_bytes();
+        for n in 1..b.len() {
+            assert!(Command::from_bytes(&b[..n]).is_err());
+        }
     }
 }

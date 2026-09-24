@@ -201,3 +201,8 @@ Deviations from the sketch above, all recorded in the ADR outcomes:
 - **Replica resilience**: a replica that hits a fatal error reopens itself from disk (the
   in-memory equivalent of a restart); a stale snapshot install self-heals that way.
 - **Wire protocol**: the workspace codec, not protobuf (ADR 0009 outcome).
+- **Flush through the log** (ADR 0016, 2026-09-24): steps 6 and 7 above as built use two
+  entries. `FlushBegin` freezes the memtable on every replica at the same index (which becomes
+  the segment id); the leader builds and proposes `FlushCommit { id, len, hash }`; followers
+  fetch the file, check it and publish it in freeze order. A follower builds the segment itself
+  if the fetch fails, as the fallback. Compaction is still local to each replica.

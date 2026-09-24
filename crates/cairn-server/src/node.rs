@@ -54,6 +54,8 @@ pub struct NodeConfig {
     pub compaction_slots: usize,
     /// Flush an idle memtable after this many milliseconds without writes (0: never).
     pub idle_flush_ms: u64,
+    /// Followers fetch leader-built segments instead of building them (ADR 0016).
+    pub ship_segments: bool,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -279,6 +281,7 @@ impl Node {
                 own_receiver: false,
                 idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
                 compaction_slots: Some(slots.clone()),
+                ship_segments: cfg.ship_segments,
             };
             match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
                 Ok(h) => {
@@ -517,7 +520,10 @@ impl Node {
                 let req = match cmd {
                     Command::Upsert(docs) => Request::Upsert(docs),
                     Command::Delete(ids) => Request::Delete(ids),
-                    Command::Noop => return Ok(Vec::new()),
+                    // Upkeep entries are proposed by replicas themselves, never forwarded.
+                    Command::Noop | Command::FlushBegin | Command::FlushCommit { .. } => {
+                        return Ok(Vec::new());
+                    }
                 };
                 match Self::forward(rt, cfg, l, shard, req).await {
                     Response::Ack(tokens) => Ok(tokens),

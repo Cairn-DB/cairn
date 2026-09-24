@@ -611,8 +611,15 @@ fn main() -> anyhow::Result<()> {
                                 .map(|s| format!("{}/{}/{}", s.queued[0], s.queued[1], s.queued[2]))
                                 .collect();
                             let net = st.first().map_or((0, 0), |s| s.net);
+                            let fl = st.iter().fold([0u64; 3], |a, s| {
+                                [
+                                    a[0] + s.flushes[0],
+                                    a[1] + s.flushes[1],
+                                    a[2] + s.flushes[2],
+                                ]
+                            });
                             println!(
-                                "{} node {i}: leads {lead}/{} memtables {:.0} MB raftlog {:.0} MB net-out {:.0} MB net-in {} segs {} deferred/commit/inbox {}",
+                                "{} node {i}: leads {lead}/{} memtables {:.0} MB raftlog {:.0} MB net-out {:.0} MB net-in {} segs {} flushes built/fetched/pending {}/{}/{} deferred/commit/inbox {}",
                                 chrono_free_date(),
                                 st.len(),
                                 mb(mem),
@@ -620,6 +627,9 @@ fn main() -> anyhow::Result<()> {
                                 mb(net.0),
                                 net.1,
                                 st.iter().map(|s| s.segments.len()).sum::<usize>(),
+                                fl[0],
+                                fl[1],
+                                fl[2],
                                 q.join(" ")
                             );
                         }

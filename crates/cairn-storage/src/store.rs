@@ -134,6 +134,43 @@ impl SegmentIndexer for NoIndexer {
     }
 }
 
+/// Compaction outputs carry this bit in their id, so they never collide with flush ids (which
+/// are log indexes, ADR 0016).
+pub const COMPACT_ID_BIT: u64 = 1 << 62;
+/// Bits 40..62 of a compaction id hold the replica's namespace (its node id): compactions are
+/// local, so two replicas' outputs with the same id would hold different rows, and a snapshot
+/// would replace one with the other under a name the old manifest still references.
+const COMPACT_NS_SHIFT: u32 = 40;
+const COMPACT_COUNTER_MASK: u64 = (1 << COMPACT_NS_SHIFT) - 1;
+
+/// A frozen memtable waiting to become a segment (ADR 0016): cut by a `FlushBegin` entry (or a
+/// local flush), readable until published, published strictly in order.
+struct PendingFlush {
+    id: SegmentId,
+    /// Last log index folded into the segment (the `FlushBegin` index).
+    last: LogIndex,
+    mem: Memtable,
+    /// Ids deleted or replaced after the freeze: masked in the segment when it is published.
+    masked: cairn_core::HashSet<DocId>,
+    /// `(len, hash)` announced by the leader's `FlushCommit`.
+    commit: Option<(u64, u64)>,
+    /// `(len, hash)` of the segment file present locally (built here or fetched).
+    file: Option<(u64, u64)>,
+}
+
+/// What the replica must do for one frozen memtable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingInfo {
+    /// Segment id.
+    pub id: SegmentId,
+    /// `(len, hash)` from the leader's commit, if applied.
+    pub commit: Option<(u64, u64)>,
+    /// Whether the segment file is present locally.
+    pub has_file: bool,
+    /// Whether the frozen memtable holds no rows (published without a file).
+    pub empty: bool,
+}
+
 /// A flush in progress: the frozen documents to turn into a segment.
 pub struct FlushJob {
     /// Live documents of the frozen memtable, sorted by id.
@@ -192,13 +229,14 @@ pub struct Store<R: Runtime> {
     memtable: Memtable,
     applied: LogIndex,
     indexer: Box<dyn SegmentIndexer>,
-    /// Memtable frozen for a flush in progress (still readable).
-    frozen: Option<Memtable>,
-    /// Ids deleted or replaced while a flush or compaction job was building; masked in the
-    /// new segment at finish time.
+    /// Frozen memtables waiting to be published, oldest first (still readable).
+    pending: std::collections::VecDeque<PendingFlush>,
+    /// Ids deleted or replaced while a compaction was building; masked in the merged segment.
     masked_during_build: cairn_core::HashSet<DocId>,
-    /// Whether a flush or compaction job is in progress.
+    /// Whether a compaction job is in progress.
     job_active: bool,
+    /// Namespace of this replica's compaction ids (see `COMPACT_NS_SHIFT`).
+    compact_ns: u64,
     /// Bumped whenever the store's state is replaced (snapshot install): a build that began
     /// before must be discarded, or it would publish pre-snapshot rows under a segment id the
     /// snapshot may already use.
@@ -270,6 +308,7 @@ impl<R: Runtime> Store<R> {
             .collect();
         for name in disk.list(&format!("{dir}/segs")).await? {
             if name.ends_with(".tmp")
+                || name.ends_with(".fetch")
                 || (!referenced.contains(&name)
                     && (name.ends_with(".seg") || name.ends_with(".del")))
             {
@@ -323,9 +362,10 @@ impl<R: Runtime> Store<R> {
             memtable: Memtable::new(),
             applied: LogIndex(0),
             indexer: Box::new(NoIndexer),
-            frozen: None,
+            pending: std::collections::VecDeque::new(),
             masked_during_build: cairn_core::HashSet::default(),
             job_active: false,
+            compact_ns: 0,
             generation: 0,
             memtable_version: 0,
             segments_version: 0,
@@ -353,6 +393,19 @@ impl<R: Runtime> Store<R> {
             }
         }
         Ok(store)
+    }
+
+    /// Sets the namespace of this replica's compaction ids (a replicated shard passes its node
+    /// id; at most 2^22 - 1).
+    pub fn set_compaction_namespace(&mut self, ns: u64) {
+        self.compact_ns = ns & ((1 << (62 - COMPACT_NS_SHIFT)) - 1);
+    }
+
+    /// Abandons the compaction in progress (its output is not written): a replica installing a
+    /// snapshot must not change its segments meanwhile.
+    pub fn abandon_compact(&mut self) {
+        self.job_active = false;
+        self.masked_during_build.clear();
     }
 
     /// Installs the indexer used by future flushes and compactions.
@@ -438,6 +491,18 @@ impl<R: Runtime> Store<R> {
         }
         match cmd {
             Command::Noop => self.memtable.note_index(index),
+            Command::FlushBegin => {
+                self.memtable.note_index(index);
+                self.freeze(SegmentId(index.get()), index);
+            }
+            Command::FlushCommit { id, len, hash } => {
+                self.memtable.note_index(index);
+                if let Some(p) = self.pending.iter_mut().find(|p| p.id == *id)
+                    && p.commit.is_none()
+                {
+                    p.commit = Some((*len, *hash));
+                }
+            }
             Command::Upsert(docs) => {
                 for d in docs {
                     let mut d = d.clone();
@@ -462,8 +527,12 @@ impl<R: Runtime> Store<R> {
         if self.job_active {
             self.masked_during_build.insert(id);
         }
-        if let Some(f) = &mut self.frozen {
-            f.delete(id, self.applied);
+        // Frozen memtables stay exactly as cut (ADR 0016): a segment built from one, by any
+        // replica at any time, holds the same rows, and a lagging follower that installs it
+        // never sees the effect of an entry it has not applied yet. Newer layers (the active
+        // memtable, newer freezes) shadow the changed rows for reads; publication masks them.
+        for p in &mut self.pending {
+            p.masked.insert(id);
         }
         for s in &mut self.segments {
             if let Some(row) = s.docs.row_of(id)
@@ -498,8 +567,8 @@ impl<R: Runtime> Store<R> {
             Some(None) => return Ok(None),
             None => {}
         }
-        if let Some(f) = &self.frozen {
-            match f.get(id) {
+        for p in self.pending.iter().rev() {
+            match p.mem.get(id) {
                 Some(Some(d)) => return Ok(Some(d.clone())),
                 Some(None) => return Ok(None),
                 None => {}
@@ -528,17 +597,191 @@ impl<R: Runtime> Store<R> {
         Ok(())
     }
 
-    /// Documents visible in memory for queries: the active memtable plus the frozen one.
+    /// Documents visible in memory for queries: the active memtable plus the frozen ones
+    /// (the newest version of each id; a tombstone in a newer layer hides older rows).
     pub fn memtable_docs(&self) -> Vec<Document> {
         let mut v: Vec<Document> = self.memtable.docs().cloned().collect();
-        if let Some(f) = &self.frozen {
+        let layers: Vec<&Memtable> = self.pending.iter().rev().map(|p| &p.mem).collect();
+        for (i, layer) in layers.iter().enumerate() {
             v.extend(
-                f.docs()
-                    .filter(|d| self.memtable.get(d.id).is_none())
+                layer
+                    .docs()
+                    .filter(|d| {
+                        self.memtable.get(d.id).is_none()
+                            && layers[..i].iter().all(|newer| newer.get(d.id).is_none())
+                    })
                     .cloned(),
             );
         }
         v
+    }
+
+    /// Freezes the active memtable under `id` (last folded index `last`).
+    fn freeze(&mut self, id: SegmentId, last: LogIndex) {
+        let mem = std::mem::take(&mut self.memtable);
+        self.pending.push_back(PendingFlush {
+            id,
+            last,
+            mem,
+            masked: cairn_core::HashSet::default(),
+            commit: None,
+            file: None,
+        });
+        self.memtable_version += 1;
+    }
+
+    /// Frozen memtables waiting to be published, oldest first.
+    pub fn pending_flushes(&self) -> Vec<PendingInfo> {
+        self.pending
+            .iter()
+            .map(|p| PendingInfo {
+                id: p.id,
+                commit: p.commit,
+                has_file: p.file.is_some(),
+                empty: p.mem.docs().next().is_none(),
+            })
+            .collect()
+    }
+
+    /// The build job of the frozen memtable `id` (its rows, sorted by id), if still pending.
+    pub fn flush_job(&self, id: SegmentId) -> Option<FlushJob> {
+        let p = self.pending.iter().find(|p| p.id == id)?;
+        Some(FlushJob {
+            docs: p.mem.sorted_docs().into_iter().cloned().collect(),
+            last: p.last,
+            id,
+            generation: self.generation,
+        })
+    }
+
+    /// Writes the segment file of a flush job built here (not yet published). Returns its
+    /// `(len, hash)`, or `None` when the freeze is no longer pending (snapshot installed).
+    pub async fn write_flush_file(
+        &mut self,
+        job: &FlushJob,
+        sections: Vec<(String, Vec<u8>)>,
+    ) -> Result<Option<(u64, u64)>> {
+        if !self.job_is_current(job.generation)
+            || !self
+                .pending
+                .iter()
+                .any(|p| p.id == job.id && p.file.is_none())
+        {
+            return Ok(None);
+        }
+        let refs: Vec<&Document> = job.docs.iter().collect();
+        let mut w = SegmentWriter::create(self.rt.clone(), &seg_path(&self.dir, job.id)).await?;
+        write_columns(&mut w, &self.manifest.schema, &refs).await?;
+        for (name, bytes) in &sections {
+            w.add_section(name, bytes).await?;
+        }
+        let (len, hash) = w.finish().await?;
+        if let Some(p) = self.pending.iter_mut().find(|p| p.id == job.id) {
+            p.file = Some((len, hash));
+        }
+        Ok(Some((len, hash)))
+    }
+
+    /// Staging name (relative, before the `.fetch` suffix) of a leader-built segment being
+    /// fetched: distinct from the snapshot fetch's, which may run for the same id at the same
+    /// time.
+    pub fn ship_staging(id: SegmentId) -> String {
+        format!("segs/{:016x}.seg.ship", id.get())
+    }
+
+    /// Installs a segment file fetched from the leader (streamed to
+    /// `<Store::ship_staging(id)>.fetch` and synced)
+    /// for the pending freeze `id`, after checking its length and body hash against the
+    /// commit. Returns whether it was accepted (on `false` the caller builds locally).
+    pub async fn install_fetched_flush(&mut self, id: SegmentId) -> Result<bool> {
+        let Some((len, hash)) = self
+            .pending
+            .iter()
+            .find(|p| p.id == id && p.file.is_none())
+            .and_then(|p| p.commit)
+        else {
+            return Ok(false);
+        };
+        let path = seg_path(&self.dir, id);
+        let disk = self.rt.disk();
+        disk.rename(
+            &format!("{}/{}.fetch", self.dir, Self::ship_staging(id)),
+            &path,
+        )
+        .await?;
+        let ok = match SegmentReader::open(self.rt.clone(), &path).await {
+            Ok(r) => r.len() == len && r.file_hash() == hash && r.verify_file_hash().await?,
+            Err(_) => false,
+        };
+        if !ok {
+            let _ = disk.remove(&path).await;
+            return Ok(false);
+        }
+        if let Some(p) = self.pending.iter_mut().find(|p| p.id == id) {
+            p.file = Some((len, hash));
+        }
+        Ok(true)
+    }
+
+    /// Publishes, in order, every frozen memtable at the head of the queue whose segment file is
+    /// present (or which holds no rows). Returns how many were published.
+    pub async fn publish_ready(&mut self) -> Result<usize> {
+        let mut n = 0;
+        while self
+            .pending
+            .front()
+            .is_some_and(|p| p.file.is_some() || p.mem.docs().next().is_none())
+        {
+            self.persist_dirty_deletions().await?;
+            let p = self.pending.pop_front().expect("checked");
+            let mut new_manifest = self.manifest.clone();
+            let mut new_segment = None;
+            if let Some((file_len, file_hash)) = p.file {
+                let path = seg_path(&self.dir, p.id);
+                let reader = SegmentReader::open(self.rt.clone(), &path).await?;
+                let docstore = DocStore::open(&reader).await?;
+                let doc_count = docstore.doc_count();
+                let meta = SegmentMeta {
+                    id: p.id,
+                    doc_count,
+                    log_last: p.last,
+                    file_len,
+                    file_hash,
+                };
+                let mut deletions = DeletionSet::new(doc_count);
+                let mut dirty = false;
+                for id in &p.masked {
+                    if let Some(row) = docstore.row_of(*id) {
+                        deletions.set(row);
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    ManifestStore::new(self.rt.clone(), del_path(&self.dir, p.id))
+                        .store(&deletions)
+                        .await?;
+                }
+                new_manifest.segments.push(meta.clone());
+                new_segment = Some(OpenSegment {
+                    meta,
+                    reader,
+                    docs: docstore,
+                    deletions,
+                    deletions_dirty: false,
+                });
+            }
+            new_manifest.applied_index = p.last.max(new_manifest.applied_index);
+            self.manifest_store.store(&new_manifest).await?;
+            self.manifest = new_manifest;
+            if let Some(seg) = new_segment {
+                self.segments.push(seg);
+            }
+            self.memtable_version += 1;
+            self.segments_version += 1;
+            self.log.truncate_prefix(p.last.next()).await?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Whether a flush or compaction job is in progress.
@@ -546,25 +789,16 @@ impl<R: Runtime> Store<R> {
         self.job_active
     }
 
-    /// Freezes the memtable and returns the build job, or `None` if nothing is pending or a job
-    /// is already active. The frozen documents stay readable until [`Store::finish_flush`].
+    /// Local flush (single-node path, no log entry): freezes the memtable under the id of its
+    /// last log index and returns the build job. `None` when the memtable is empty or a freeze
+    /// is already pending.
     pub fn begin_flush(&mut self) -> Option<FlushJob> {
-        if self.job_active {
+        if !self.pending.is_empty() {
             return None;
         }
         let (_, last) = self.memtable.log_range()?;
-        let frozen = std::mem::take(&mut self.memtable);
-        let docs: Vec<Document> = frozen.sorted_docs().into_iter().cloned().collect();
-        self.frozen = Some(frozen);
-        self.job_active = true;
-        self.masked_during_build.clear();
-        self.memtable_version += 1;
-        Some(FlushJob {
-            generation: self.generation,
-            docs,
-            last,
-            id: SegmentId(self.manifest.next_segment_id),
-        })
+        self.freeze(SegmentId(last.get()), last);
+        self.flush_job(SegmentId(last.get()))
     }
 
     /// Builds the index sections for `docs` (pure CPU; run through `Runtime::offload`).
@@ -582,84 +816,28 @@ impl<R: Runtime> Store<R> {
         generation == self.generation
     }
 
-    /// Writes and publishes the segment of a flush job. A job that began before a snapshot was
-    /// installed is discarded (its rows are covered by the snapshot).
+    /// Writes the segment of a local flush job and publishes whatever is ready, in order. A job
+    /// that began before a snapshot was installed is discarded.
     pub async fn finish_flush(
         &mut self,
         job: FlushJob,
-        docs: Vec<Document>,
         sections: Vec<(String, Vec<u8>)>,
     ) -> Result<()> {
-        if !self.job_is_current(job.generation) {
+        if job.docs.is_empty() {
+            // Nothing to write: the freeze publishes without a file.
+        } else if self.write_flush_file(&job, sections).await?.is_none() {
             return Ok(());
         }
-        self.persist_dirty_deletions().await?;
-        let mut new_manifest = self.manifest.clone();
-        let mut new_segment = None;
-        if !docs.is_empty() {
-            let refs: Vec<&Document> = docs.iter().collect();
-            let path = seg_path(&self.dir, job.id);
-            let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
-            write_columns(&mut w, &self.manifest.schema, &refs).await?;
-            for (name, bytes) in &sections {
-                w.add_section(name, bytes).await?;
-            }
-            let (file_len, file_hash) = w.finish().await?;
-            let meta = SegmentMeta {
-                id: job.id,
-                doc_count: refs.len() as u32,
-                log_last: job.last,
-                file_len,
-                file_hash,
-            };
-            let reader = SegmentReader::open(self.rt.clone(), &path).await?;
-            let docstore = DocStore::open(&reader).await?;
-            let mut deletions = DeletionSet::new(meta.doc_count);
-            // Documents deleted or replaced while the job was building are masked in the new segment.
-            let mut dirty = false;
-            for id in &self.masked_during_build {
-                if let Some(row) = docstore.row_of(*id) {
-                    deletions.set(row);
-                    dirty = true;
-                }
-            }
-            if dirty {
-                ManifestStore::new(self.rt.clone(), del_path(&self.dir, job.id))
-                    .store(&deletions)
-                    .await?;
-            }
-            new_manifest.segments.push(meta.clone());
-            new_manifest.next_segment_id = job.id.get() + 1;
-            new_segment = Some(OpenSegment {
-                meta,
-                reader,
-                docs: docstore,
-                deletions,
-                deletions_dirty: false,
-            });
-        }
-        new_manifest.applied_index = job.last.max(new_manifest.applied_index);
-        self.manifest_store.store(&new_manifest).await?;
-        self.manifest = new_manifest;
-        if let Some(seg) = new_segment {
-            self.segments.push(seg);
-        }
-        self.frozen = None;
-        self.job_active = false;
-        self.masked_during_build.clear();
-        self.memtable_version += 1;
-        self.segments_version += 1;
-        self.log.truncate_prefix(job.last.next()).await?;
+        self.publish_ready().await?;
         Ok(())
     }
 
     /// Synchronous convenience: flush and compact inline with the installed indexer.
     pub async fn flush(&mut self) -> Result<()> {
         if let Some(job) = self.begin_flush() {
-            let docs = job.docs.clone();
             let sections =
-                Self::build_sections(&self.manifest.schema, &docs, self.indexer.as_ref())?;
-            self.finish_flush(job, docs, sections).await?;
+                Self::build_sections(&self.manifest.schema, &job.docs, self.indexer.as_ref())?;
+            self.finish_flush(job, sections).await?;
         }
         while let Some(job) = self.begin_compact().await? {
             let sections =
@@ -771,7 +949,11 @@ impl<R: Runtime> Store<R> {
             inputs: ids.to_vec(),
             docs,
             log_last,
-            id: SegmentId(self.manifest.next_segment_id),
+            id: SegmentId(
+                COMPACT_ID_BIT
+                    | (self.compact_ns << COMPACT_NS_SHIFT)
+                    | (self.manifest.next_segment_id & COMPACT_COUNTER_MASK),
+            ),
         })
     }
 
@@ -822,7 +1004,7 @@ impl<R: Runtime> Store<R> {
         }
         let mut new_manifest = self.manifest.clone();
         new_manifest.segments.splice(range.clone(), [meta.clone()]);
-        new_manifest.next_segment_id = job.id.get() + 1;
+        new_manifest.next_segment_id = (job.id.get() & COMPACT_COUNTER_MASK) + 1;
         self.manifest_store.store(&new_manifest).await?;
         self.manifest = new_manifest;
         self.segments_version += 1;
@@ -976,6 +1158,42 @@ impl<R: Runtime> Store<R> {
             return Err(Error::Schema("snapshot schema differs".into()));
         }
         let disk = self.rt.disk();
+        // Every segment must be present and match before anything changes: fetched ones in
+        // their staging files, the others as local files (a local compaction or a publication
+        // may have changed them since the fetch started). On failure the caller fetches again.
+        for meta in &m.segments {
+            let seg = format!("segs/{:016x}.seg", meta.id.get());
+            let path = if fetched.contains(&seg) {
+                format!("{}/{seg}.fetch", self.dir)
+            } else {
+                seg_path(&self.dir, meta.id)
+            };
+            let ok = disk.exists(&path).await?
+                && match SegmentReader::open(self.rt.clone(), &path).await {
+                    Ok(r) => r.len() == meta.file_len && r.file_hash() == meta.file_hash,
+                    Err(_) => false,
+                };
+            if !ok {
+                return Err(Error::Internal(format!(
+                    "snapshot segment {} missing or different locally",
+                    meta.id
+                )));
+            }
+        }
+        // A local deletion checkpoint is only valid for the local file it was written for:
+        // when the segment file itself is replaced (same id, other content: ids of local
+        // compactions and fallback builds are per replica) and the leader had no checkpoint to
+        // send, the local one must go, or its row numbers would mask the wrong rows.
+        for meta in &m.segments {
+            let seg = format!("segs/{:016x}.seg", meta.id.get());
+            let del = format!("segs/{:016x}.del", meta.id.get());
+            if fetched.contains(&seg) && !fetched.contains(&del) {
+                let path = del_path(&self.dir, meta.id);
+                if disk.exists(&path).await? {
+                    disk.remove(&path).await?;
+                }
+            }
+        }
         // Fetched files were streamed to `<rel>.fetch` and synced; publish them by rename.
         for rel in fetched {
             let path = format!("{}/{rel}", self.dir);
@@ -1002,7 +1220,7 @@ impl<R: Runtime> Store<R> {
         }
         self.manifest = m;
         self.memtable.clear();
-        self.frozen = None;
+        self.pending.clear();
         self.job_active = false;
         self.generation += 1;
         self.masked_during_build.clear();
@@ -1040,11 +1258,7 @@ impl<R: Runtime> Store<R> {
             .iter()
             .map(|s| (s.meta.doc_count - s.deletions.count()) as u64)
             .sum();
-        let frozen = self.frozen.as_ref().map_or(0, |f| {
-            f.docs()
-                .filter(|d| self.memtable.get(d.id).is_none())
-                .count() as u64
-        });
+        let frozen: u64 = self.pending.iter().map(|p| p.mem.len() as u64).sum();
         seg + self.memtable.len() as u64 + frozen
     }
 
@@ -1262,7 +1476,7 @@ mod tests {
                 let mut model: HashMap<DocId, Option<Document>> = HashMap::default();
                 for c in &cmds[..applied] {
                     match c {
-                        Command::Noop => {}
+                        Command::Noop | Command::FlushBegin | Command::FlushCommit { .. } => {}
                         Command::Upsert(ds) => {
                             for d in ds {
                                 model.insert(d.id, Some(d.clone()));
@@ -1385,6 +1599,176 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(st.approx_live_docs(), 30);
+        });
+    }
+
+    /// Copies a segment file from one store to another's fetch staging file.
+    async fn ship<R: Runtime>(from: &Store<R>, to: &Store<R>, id: SegmentId, corrupt: bool) {
+        let rel = format!("segs/{:016x}.seg", id.get());
+        let (_, data) = from
+            .read_file_range(&rel, 0, 1 << 30)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut data = data.to_vec();
+        if corrupt {
+            let mid = data.len() / 2;
+            data[mid] ^= 0xff;
+        }
+        to.write_fetch_chunk(&Store::<R>::ship_staging(id), 0, Bytes::from(data))
+            .await
+            .unwrap();
+        to.sync_fetched(&Store::<R>::ship_staging(id))
+            .await
+            .unwrap();
+    }
+
+    async fn build_local<R: Runtime>(st: &mut Store<R>, id: SegmentId) -> (u64, u64) {
+        let job = st.flush_job(id).unwrap();
+        let sections =
+            Store::<R>::build_sections(&st.manifest.schema, &job.docs, st.indexer.as_ref())
+                .unwrap();
+        st.write_flush_file(&job, sections).await.unwrap().unwrap()
+    }
+
+    /// ADR 0016: freezes cut by log entries, a leader-built file installed on a follower,
+    /// strict publication order, masking of rows changed after the freeze, a corrupt fetch
+    /// rejected, and replay of pending freezes after a restart.
+    #[test]
+    fn two_phase_flush_ships_segments_in_order() {
+        let (sim, mut ex) = Simulation::new(11, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let cfg = StoreConfig {
+                memtable_max_bytes: usize::MAX,
+                ..small_cfg()
+            };
+            let mut a = Store::open(rt.clone(), "a", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let mut b = Store::open(rt.clone(), "b", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let run = async |a: &mut Store<_>, b: &mut Store<_>, cmd: Command| {
+                let ia = a.write(&cmd).await.unwrap();
+                let ib = b.write(&cmd).await.unwrap();
+                assert_eq!(ia, ib);
+                ia
+            };
+            for i in 1..=20u64 {
+                run(&mut a, &mut b, Command::Upsert(vec![doc(i, 1)])).await;
+            }
+            let f1 = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+            for i in 21..=25u64 {
+                run(&mut a, &mut b, Command::Upsert(vec![doc(i, 1)])).await;
+            }
+            // Changed after the first freeze: must be masked in its segment.
+            run(&mut a, &mut b, Command::Delete(vec![DocId(5)])).await;
+            run(&mut a, &mut b, Command::Upsert(vec![doc(6, 9)])).await;
+            let f2 = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+            run(&mut a, &mut b, Command::Delete(vec![DocId(22)])).await;
+            assert_eq!(b.pending_flushes().len(), 2);
+            for st in [&a, &b] {
+                assert_eq!(st.get(DocId(5)).await.unwrap(), None);
+                assert_eq!(st.get(DocId(6)).await.unwrap(), Some(doc(6, 9)));
+                assert_eq!(st.get(DocId(22)).await.unwrap(), None);
+                assert_eq!(st.get(DocId(21)).await.unwrap(), Some(doc(21, 1)));
+                let mut ids: Vec<u64> = st.memtable_docs().iter().map(|d| d.id.get()).collect();
+                ids.sort_unstable();
+                let want: Vec<u64> = (1..=25).filter(|i| *i != 5 && *i != 22).collect();
+                assert_eq!(ids, want);
+            }
+            // Leader: builds both, commits both.
+            let (l1, h1) = build_local(&mut a, f1).await;
+            let (l2, h2) = build_local(&mut a, f2).await;
+            assert_eq!(a.publish_ready().await.unwrap(), 2);
+            run(
+                &mut a,
+                &mut b,
+                Command::FlushCommit {
+                    id: f1,
+                    len: l1,
+                    hash: h1,
+                },
+            )
+            .await;
+            run(
+                &mut a,
+                &mut b,
+                Command::FlushCommit {
+                    id: f2,
+                    len: l2,
+                    hash: h2,
+                },
+            )
+            .await;
+            assert!(b.pending_flushes().iter().all(|p| p.commit.is_some()));
+            // Follower: the second freeze is ready first; nothing publishes out of order.
+            build_local(&mut b, f2).await;
+            assert_eq!(b.publish_ready().await.unwrap(), 0);
+            // A corrupt fetch is rejected, a good one installed.
+            ship(&a, &b, f1, true).await;
+            assert!(!b.install_fetched_flush(f1).await.unwrap());
+            ship(&a, &b, f1, false).await;
+            assert!(b.install_fetched_flush(f1).await.unwrap());
+            assert_eq!(b.publish_ready().await.unwrap(), 2);
+            assert_eq!(
+                b.segment(f1).unwrap().meta.file_hash,
+                a.segment(f1).unwrap().meta.file_hash
+            );
+            // The freeze is immutable: rows changed after it are in the file, masked.
+            let seg = a.segment(f1).unwrap();
+            let row = seg.docs.row_of(DocId(5)).expect("row cut by the freeze");
+            assert!(seg.deletions.contains(row));
+            // Local builds of the same freeze are identical across replicas.
+            assert_eq!(
+                b.segment(f2).unwrap().meta.file_hash,
+                a.segment(f2).unwrap().meta.file_hash
+            );
+            // A third freeze, left pending across a restart.
+            run(&mut a, &mut b, Command::Upsert(vec![doc(30, 1)])).await;
+            let f3 = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+            run(
+                &mut a,
+                &mut b,
+                Command::FlushCommit {
+                    id: f3,
+                    len: 1,
+                    hash: 2,
+                },
+            )
+            .await;
+            drop(b);
+            let mut b = Store::open(rt.clone(), "b", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let p = b.pending_flushes();
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0].id, f3);
+            assert_eq!(p[0].commit, Some((1, 2)));
+            assert_eq!(b.get(DocId(30)).await.unwrap(), Some(doc(30, 1)));
+            // The committed hash does not match anything the leader has: fetch fails, fallback.
+            build_local(&mut b, f3).await;
+            assert_eq!(b.publish_ready().await.unwrap(), 1);
+            let (_, h3) = build_local(&mut a, f3).await;
+            a.publish_ready().await.unwrap();
+            assert_ne!(h3, 2);
+            for i in 1..=31u64 {
+                assert_eq!(
+                    a.get(DocId(i)).await.unwrap(),
+                    b.get(DocId(i)).await.unwrap(),
+                    "doc {i}"
+                );
+            }
+            assert_eq!(a.get(DocId(5)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(6)).await.unwrap(), Some(doc(6, 9)));
+            drop(b);
+            let b = Store::open(rt.clone(), "b", schema(), cfg).await.unwrap();
+            assert!(b.pending_flushes().is_empty());
+            assert_eq!(b.get(DocId(5)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(22)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(6)).await.unwrap(), Some(doc(6, 9)));
+            assert_eq!(b.approx_live_docs(), 24);
         });
     }
 }

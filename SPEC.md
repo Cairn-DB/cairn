@@ -65,7 +65,7 @@ A Rust database engine that is:
 | D2 | Atomic writes across vector + metadata + text | Hybrid queries require these to be mutually consistent. Takedowns must be visible everywhere at once. |
 | D3 | One Raft group per logical shard, several shards per node, spread over cores | One group per core explodes consensus traffic. |
 | D4 | Raft implemented as a pure state machine with injectable I/O (candidate: `raft-rs`) | Makes deterministic simulation possible. Validate the crate choice in Phase 0. |
-| D5 | Log replication for recent writes, immutable segment shipping for bulk data (Lucene/Quickwit style) | Followers should not rebuild the whole index from the log. |
+| D5 | Log replication for recent writes, immutable segment shipping for bulk data (Lucene/Quickwit style) | Followers should not rebuild the whole index from the log. Flushes: ADR 0016 (leader builds, followers fetch); compaction is still local. |
 | D6 | Followers may serve reads with bounded staleness; leader serves linearizable reads | Read scaling for a read-heavy workload. |
 | D7 | Every source of nondeterminism (time, network, disk, randomness, scheduling where feasible) sits behind an injectable trait | Deterministic simulation (FoundationDB / TigerBeetle style) cannot be retrofitted cheaply. |
 
