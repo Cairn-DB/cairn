@@ -15,7 +15,7 @@ use crate::memtable::Memtable;
 use crate::segment::{SegmentReader, SegmentWriter};
 use cairn_core::codec::{Reader, Writer};
 use cairn_core::{
-    Disk, DocId, Document, Error, LogIndex, Result, Runtime, Schema, SegmentId, Term,
+    Disk, DocId, Document, Error, LogIndex, NodeId, Result, Runtime, Schema, SegmentId, Term,
 };
 
 /// Tuning.
@@ -81,6 +81,30 @@ pub struct ShardManifest {
     /// was recorded). Stored with the index in one atomic write, so a restart never pairs a
     /// new snapshot index with the term of an older one (ADR 0020, chaos seed 34367).
     pub applied_term: Term,
+    /// Compactions committed through the log but not installed yet, in log order (ADR 0021).
+    /// Persisted so that neither log truncation nor a restart can lose one.
+    pub compactions: Vec<CompactionMeta>,
+    /// Index of the last `CompactCommit` this manifest reflects, accepted or rejected. Replay
+    /// skips commits up to it: they were decided against the list as it stood then, and the
+    /// segments and pending list here may already reflect later merges (chaos seed 11892).
+    pub compacted_through: LogIndex,
+}
+
+/// A committed compaction waiting to be installed (ADR 0021).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionMeta {
+    /// Merged segment id.
+    pub id: SegmentId,
+    /// Input segments, adjacent and in manifest order.
+    pub inputs: Vec<SegmentId>,
+    /// Index of the `CompactCommit` entry.
+    pub index: LogIndex,
+    /// Leader's file length and body hash.
+    pub len: u64,
+    /// See `len`.
+    pub hash: u64,
+    /// Node that built the file (fetch it from there).
+    pub from: NodeId,
 }
 
 impl Manifest for ShardManifest {
@@ -97,6 +121,19 @@ impl Manifest for ShardManifest {
                 .u64(s.file_hash);
         }
         w.u64(self.applied_term.get());
+        w.u32(self.compactions.len() as u32);
+        for c in &self.compactions {
+            w.u64(c.id.get())
+                .u64(c.index.get())
+                .u64(c.len)
+                .u64(c.hash)
+                .u32(c.from.get())
+                .u32(c.inputs.len() as u32);
+            for i in &c.inputs {
+                w.u64(i.get());
+            }
+        }
+        w.u64(self.compacted_through.get());
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
@@ -115,12 +152,42 @@ impl Manifest for ShardManifest {
             });
         }
         let applied_term = Term(if r.remaining() > 0 { r.u64()? } else { 0 });
+        let mut compactions = Vec::new();
+        if r.remaining() > 0 {
+            let n = r.u32()? as usize;
+            for _ in 0..n.min(1 << 16) {
+                let id = SegmentId(r.u64()?);
+                let index = LogIndex(r.u64()?);
+                let len = r.u64()?;
+                let hash = r.u64()?;
+                let from = NodeId(r.u32()?);
+                let k = r.u32()? as usize;
+                if k > 1 << 16 {
+                    return Err(Error::corruption("compaction with too many inputs"));
+                }
+                let mut inputs = Vec::with_capacity(k);
+                for _ in 0..k {
+                    inputs.push(SegmentId(r.u64()?));
+                }
+                compactions.push(CompactionMeta {
+                    id,
+                    inputs,
+                    index,
+                    len,
+                    hash,
+                    from,
+                });
+            }
+        }
+        let compacted_through = LogIndex(if r.remaining() > 0 { r.u64()? } else { 0 });
         Ok(ShardManifest {
             schema,
             applied_index,
             segments,
             next_segment_id,
             applied_term,
+            compactions,
+            compacted_through,
         })
     }
 }
@@ -140,6 +207,10 @@ impl SegmentIndexer for NoIndexer {
         Ok(Vec::new())
     }
 }
+
+/// Prefix of the error `install_snapshot` returns when a snapshot file is missing or differs
+/// from the manifest: the snapshot is stale for this replica (ADR 0021).
+pub const SNAPSHOT_MISMATCH: &str = "snapshot segment mismatch";
 
 /// Compaction outputs carry this bit in their id, so they never collide with flush ids (which
 /// are log indexes, ADR 0016).
@@ -161,6 +232,8 @@ struct PendingFlush {
     masked: cairn_core::HashSet<DocId>,
     /// `(len, hash)` announced by the leader's `FlushCommit`.
     commit: Option<(u64, u64)>,
+    /// Node that built the committed file.
+    commit_from: Option<NodeId>,
     /// `(len, hash)` of the segment file present locally (built here or fetched).
     file: Option<(u64, u64)>,
 }
@@ -172,6 +245,8 @@ pub struct PendingInfo {
     pub id: SegmentId,
     /// `(len, hash)` from the leader's commit, if applied.
     pub commit: Option<(u64, u64)>,
+    /// Node that built the committed file.
+    pub commit_from: Option<NodeId>,
     /// Whether the segment file is present locally.
     pub has_file: bool,
     /// Whether the frozen memtable holds no rows (published without a file).
@@ -238,6 +313,17 @@ pub struct Store<R: Runtime> {
     indexer: Box<dyn SegmentIndexer>,
     /// Frozen memtables waiting to be published, oldest first (still readable).
     pending: std::collections::VecDeque<PendingFlush>,
+    /// `(len, hash)` of the local file of each committed, uninstalled compaction that has one
+    /// (the compactions themselves live in the manifest, ADR 0021).
+    compaction_files: cairn_core::HashMap<SegmentId, (u64, u64)>,
+    /// Segments replaced by an installed compaction whose files are kept for a while, so
+    /// followers and snapshot installs that still need them can fetch them (ADR 0021).
+    retired: Vec<SegmentId>,
+    /// The segment list as the log defines it: published segments, plus freezes with rows (in
+    /// `FlushBegin` order), with every accepted compaction applied. The same on every replica
+    /// at the same applied index, whatever each has installed yet: a `CompactCommit` is
+    /// accepted only if its inputs are adjacent here (ADR 0021).
+    logical: Vec<SegmentId>,
     /// Ids deleted or replaced while a compaction was building; masked in the merged segment.
     masked_during_build: cairn_core::HashSet<DocId>,
     /// Whether a compaction job is in progress.
@@ -254,6 +340,42 @@ pub struct Store<R: Runtime> {
     memtable_version: u64,
     /// Bumped whenever the segment list changes.
     segments_version: u64,
+}
+
+/// Writes a complete segment file (columns and index sections) at `path`: the part of a flush
+/// or merge that runs outside the replica actor (ADR 0021), so large writes never hold back
+/// Raft heartbeats. Returns `(len, hash)`.
+pub async fn write_segment_file<R: Runtime>(
+    rt: R,
+    path: &str,
+    schema: &Schema,
+    version: u32,
+    docs: &[Document],
+    sections: &[(String, Vec<u8>)],
+) -> Result<(u64, u64)> {
+    let refs: Vec<&Document> = docs.iter().collect();
+    let mut w = SegmentWriter::create_version(rt, path, version).await?;
+    write_columns(&mut w, schema, &refs).await?;
+    for (name, bytes) in sections {
+        w.add_section(name, bytes).await?;
+    }
+    w.finish().await
+}
+
+/// Reads the live rows of merge inputs from their files (outside the replica actor): `sources`
+/// from [`Store::compaction_sources`]. Rows are sorted by id.
+pub async fn read_compaction_rows<R: Runtime>(
+    rt: R,
+    sources: &[(String, DeletionSet)],
+) -> Result<Vec<Document>> {
+    let mut docs: Vec<Document> = Vec::new();
+    for (path, dels) in sources {
+        let reader = SegmentReader::open(rt.clone(), path).await?;
+        let store = DocStore::open(&reader).await?;
+        docs.extend(store.read_all(&reader, |row| dels.contains(row)).await?);
+    }
+    docs.sort_by_key(|d| d.id);
+    Ok(docs)
 }
 
 fn seg_path(dir: &str, id: SegmentId) -> String {
@@ -300,6 +422,8 @@ impl<R: Runtime> Store<R> {
                     segments: Vec::new(),
                     next_segment_id: 1,
                     applied_term: Term(0),
+                    compactions: Vec::new(),
+                    compacted_through: LogIndex(0),
                 };
                 manifest_store.store(&m).await?;
                 m
@@ -319,6 +443,7 @@ impl<R: Runtime> Store<R> {
         for name in disk.list(&format!("{dir}/segs")).await? {
             if name.ends_with(".tmp")
                 || name.ends_with(".fetch")
+                || name.ends_with(".built")
                 || (!referenced.contains(&name)
                     && (name.ends_with(".seg") || name.ends_with(".del")))
             {
@@ -373,6 +498,9 @@ impl<R: Runtime> Store<R> {
             applied: LogIndex(0),
             indexer: Box::new(NoIndexer),
             pending: std::collections::VecDeque::new(),
+            compaction_files: cairn_core::HashMap::default(),
+            retired: Vec::new(),
+            logical: Vec::new(),
             masked_during_build: cairn_core::HashSet::default(),
             job_active: false,
             compact_ns: 0,
@@ -382,6 +510,7 @@ impl<R: Runtime> Store<R> {
             segments_version: 0,
         };
         store.applied = store.manifest.applied_index;
+        store.rebuild_logical();
         // Replay the log after the manifest's applied index.
         if let Some(mut last) = store.log.last_index()
             && last > store.applied
@@ -513,12 +642,58 @@ impl<R: Runtime> Store<R> {
                 self.memtable.note_index(index);
                 self.freeze(SegmentId(index.get()), index);
             }
-            Command::FlushCommit { id, len, hash } => {
+            Command::CompactCommit {
+                id,
+                inputs,
+                len,
+                hash,
+                from,
+            } => {
+                self.memtable.note_index(index);
+                let installed = self.segments.iter().any(|s| s.meta.id == *id);
+                let pending = self.manifest.compactions.iter().any(|c| c.id == *id);
+                let decided = index <= self.manifest.compacted_through;
+                self.manifest.compacted_through = self.manifest.compacted_through.max(index);
+                if decided && !pending {
+                    // Replay of a commit this manifest already reflects (accepted, installed
+                    // and maybe merged again since, or rejected).
+                } else if installed {
+                    // Replay of a compaction already installed here.
+                } else if pending {
+                    // Replay after a restart: persisted in the manifest, but its inputs (a freeze
+                    // replayed just before) were not in the list when it was rebuilt.
+                    if !self.logical.contains(id) {
+                        Self::apply_to_logical(&mut self.logical, inputs, *id);
+                    }
+                // Accepted only if the inputs are adjacent in the log-defined segment list, the
+                // same decision on every replica. A second merge of inputs already merged (a new
+                // leader repeating one) is dropped everywhere.
+                } else if Self::apply_to_logical(&mut self.logical, inputs, *id) {
+                    // Kept in the in-memory manifest; persisted with the next manifest write.
+                    // Until then the entry stays in the log (it is truncated only after a
+                    // manifest carrying this compaction is stored), so replay restores it.
+                    self.manifest.compactions.push(CompactionMeta {
+                        id: *id,
+                        inputs: inputs.clone(),
+                        index,
+                        len: *len,
+                        hash: *hash,
+                        from: *from,
+                    });
+                }
+            }
+            Command::FlushCommit {
+                id,
+                len,
+                hash,
+                from,
+            } => {
                 self.memtable.note_index(index);
                 if let Some(p) = self.pending.iter_mut().find(|p| p.id == *id)
                     && p.commit.is_none()
                 {
                     p.commit = Some((*len, *hash));
+                    p.commit_from = Some(*from);
                 }
             }
             Command::Upsert(docs) => {
@@ -637,12 +812,17 @@ impl<R: Runtime> Store<R> {
     /// Freezes the active memtable under `id` (last folded index `last`).
     fn freeze(&mut self, id: SegmentId, last: LogIndex) {
         let mem = std::mem::take(&mut self.memtable);
+        // A freeze without rows publishes no segment (the rows are fixed at the freeze).
+        if mem.docs().next().is_some() {
+            self.logical.push(id);
+        }
         self.pending.push_back(PendingFlush {
             id,
             last,
             mem,
             masked: cairn_core::HashSet::default(),
             commit: None,
+            commit_from: None,
             file: None,
         });
         self.memtable_version += 1;
@@ -655,6 +835,7 @@ impl<R: Runtime> Store<R> {
             .map(|p| PendingInfo {
                 id: p.id,
                 commit: p.commit,
+                commit_from: p.commit_from,
                 has_file: p.file.is_some(),
                 empty: p.mem.docs().next().is_none(),
             })
@@ -838,6 +1019,11 @@ impl<R: Runtime> Store<R> {
         indexer.sections(schema, &refs)
     }
 
+    /// Current store generation (bumped by snapshot installs).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Whether a job that began at `generation` still applies (no snapshot was installed since).
     pub fn job_is_current(&self, generation: u64) -> bool {
         generation == self.generation
@@ -872,6 +1058,397 @@ impl<R: Runtime> Store<R> {
             self.finish_compact(job, sections).await?;
         }
         Ok(())
+    }
+
+    /// The compaction the policy would run now (adjacent input ids), if any (ADR 0021: the
+    /// leader decides, then builds with [`Store::compaction_rows`]).
+    pub fn select_compaction(&self) -> Option<Vec<SegmentId>> {
+        let n = self.segments.len();
+        let stale = self.segments.iter().position(|s| {
+            s.meta.doc_count > 0
+                && f64::from(s.deletions.count()) / f64::from(s.meta.doc_count)
+                    > self.cfg.max_deleted_fraction
+        });
+        let live = |s: &OpenSegment<R>| u64::from(s.meta.doc_count - s.deletions.count());
+        let run = self.tiered_run(n, &live);
+        if let Some(i) = stale {
+            Some(vec![self.segments[i].meta.id])
+        } else if let Some((first, len)) = run {
+            Some(
+                self.segments[first..first + len]
+                    .iter()
+                    .map(|s| s.meta.id)
+                    .collect(),
+            )
+        } else if n > self.cfg.max_segments {
+            let (i, _) = (0..n - 1)
+                .map(|i| (i, live(&self.segments[i]) + live(&self.segments[i + 1])))
+                .min_by_key(|(_, rows)| *rows)
+                .expect("n > 1");
+            Some(vec![self.segments[i].meta.id, self.segments[i + 1].meta.id])
+        } else {
+            None
+        }
+    }
+
+    /// Reserves a compaction output id that this replica never used before, persisted before
+    /// it is returned (so a restart cannot hand out an id already proposed).
+    pub async fn reserve_compaction_id(&mut self) -> Result<SegmentId> {
+        // Never reuse an id: past the persisted counter and past every id of this namespace
+        // still known (a lagging replica that still holds an old id would ignore a new commit
+        // reusing it).
+        let ns = self.compact_ns;
+        let seen = self
+            .manifest
+            .segments
+            .iter()
+            .map(|m| m.id)
+            .chain(self.manifest.compactions.iter().map(|c| c.id))
+            .filter(|id| {
+                id.get() & COMPACT_ID_BIT != 0 && (id.get() >> COMPACT_NS_SHIFT) & 0x3f_ffff == ns
+            })
+            .map(|id| (id.get() & COMPACT_COUNTER_MASK) + 1)
+            .max()
+            .unwrap_or(0);
+        let counter = (self.manifest.next_segment_id & COMPACT_COUNTER_MASK).max(seen);
+        let mut m = self.manifest.clone();
+        m.next_segment_id = counter + 1;
+        self.manifest_store.store(&m).await?;
+        self.manifest = m;
+        Ok(SegmentId(
+            COMPACT_ID_BIT | (self.compact_ns << COMPACT_NS_SHIFT) | counter,
+        ))
+    }
+
+    /// Where `ids` sit in the segment list, if they are all present, adjacent and in order.
+    fn input_range(&self, ids: &[SegmentId]) -> Option<std::ops::Range<usize>> {
+        let head = *ids.first()?;
+        let first = self.segments.iter().position(|s| s.meta.id == head)?;
+        let ok = ids
+            .iter()
+            .enumerate()
+            .all(|(k, id)| self.segments.get(first + k).map(|s| s.meta.id) == Some(*id));
+        ok.then(|| first..first + ids.len())
+    }
+
+    /// A compaction job for output `id` over `inputs`: their rows live now, sorted by id.
+    /// `None` when the inputs are not (or no longer) all published and adjacent.
+    pub async fn compaction_rows(
+        &self,
+        id: SegmentId,
+        inputs: &[SegmentId],
+    ) -> Result<Option<CompactJob>> {
+        let Some(range) = self.input_range(inputs) else {
+            return Ok(None);
+        };
+        let mut docs: Vec<Document> = Vec::new();
+        let mut log_last = LogIndex(0);
+        for s in &self.segments[range] {
+            let dels = &s.deletions;
+            docs.extend(s.docs.read_all(&s.reader, |row| dels.contains(row)).await?);
+            log_last = log_last.max(s.meta.log_last);
+        }
+        docs.sort_by_key(|d| d.id);
+        Ok(Some(CompactJob {
+            generation: self.generation,
+            inputs: inputs.to_vec(),
+            docs,
+            log_last,
+            id,
+        }))
+    }
+
+    /// Writes the merged segment file of `job` without installing it; returns `(len, hash)`.
+    pub async fn write_compaction_file(
+        &mut self,
+        job: &CompactJob,
+        sections: Vec<(String, Vec<u8>)>,
+    ) -> Result<(u64, u64)> {
+        let refs: Vec<&Document> = job.docs.iter().collect();
+        let mut w = SegmentWriter::create_version(
+            self.rt.clone(),
+            &seg_path(&self.dir, job.id),
+            self.segment_version,
+        )
+        .await?;
+        write_columns(&mut w, &self.manifest.schema, &refs).await?;
+        for (name, bytes) in &sections {
+            w.add_section(name, bytes).await?;
+        }
+        let file = w.finish().await?;
+        if self.manifest.compactions.iter().any(|c| c.id == job.id) {
+            self.compaction_files.insert(job.id, file);
+        }
+        Ok(file)
+    }
+
+    /// Where a build outside the actor writes segment `id` (a side name, adopted by
+    /// [`Store::adopt_built_file`] only if still wanted), the schema and the format version.
+    pub fn segment_write_params(&self, id: SegmentId) -> (String, Schema, u32) {
+        (
+            format!("{}.built", seg_path(&self.dir, id)),
+            self.manifest.schema.clone(),
+            self.segment_version,
+        )
+    }
+
+    /// Moves a segment written by a build outside the actor into place. A late build must
+    /// never replace a file installed meanwhile (a snapshot, a fetch): the caller adopts only
+    /// results still wanted, and [`Store::discard_built_file`] drops the others.
+    pub async fn adopt_built_file(&self, id: SegmentId) -> Result<()> {
+        let path = seg_path(&self.dir, id);
+        self.rt.disk().rename(&format!("{path}.built"), &path).await
+    }
+
+    /// Removes an unwanted build result.
+    pub async fn discard_built_file(&self, id: SegmentId) -> Result<()> {
+        let path = format!("{}.built", seg_path(&self.dir, id));
+        let disk = self.rt.disk();
+        if disk.exists(&path).await? {
+            disk.remove(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the pending freeze `id` still needs a file (begun at `generation`).
+    pub fn flush_wanted(&self, id: SegmentId, generation: u64) -> bool {
+        self.job_is_current(generation)
+            && self.pending.iter().any(|p| p.id == id && p.file.is_none())
+    }
+
+    /// The inputs of a merge as `(file path, deletion bits now)`, if they are all published and
+    /// adjacent; with their highest log index.
+    pub fn compaction_sources(
+        &self,
+        inputs: &[SegmentId],
+    ) -> Option<(Vec<(String, DeletionSet)>, LogIndex)> {
+        let range = self.input_range(inputs)?;
+        let segs = &self.segments[range];
+        let log_last = segs
+            .iter()
+            .map(|s| s.meta.log_last)
+            .max()
+            .unwrap_or(LogIndex(0));
+        Some((
+            segs.iter()
+                .map(|s| (seg_path(&self.dir, s.meta.id), s.deletions.clone()))
+                .collect(),
+            log_last,
+        ))
+    }
+
+    /// Records the file of the pending freeze `id`, written outside the actor. `false` when the
+    /// freeze is no longer pending (published, or a snapshot replaced the state since the job
+    /// began at `generation`).
+    pub fn set_flush_file(&mut self, id: SegmentId, generation: u64, file: (u64, u64)) -> bool {
+        if !self.job_is_current(generation) {
+            return false;
+        }
+        match self
+            .pending
+            .iter_mut()
+            .find(|p| p.id == id && p.file.is_none())
+        {
+            Some(p) => {
+                p.file = Some(file);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether committed compaction `id` is pending here (not installed).
+    pub fn compaction_pending(&self, id: SegmentId) -> bool {
+        self.manifest.compactions.iter().any(|c| c.id == id)
+    }
+
+    /// Records that the file of committed compaction `id` is present locally (the leader wrote
+    /// it before proposing).
+    pub fn set_compaction_file(&mut self, id: SegmentId, file: (u64, u64)) {
+        if self.manifest.compactions.iter().any(|c| c.id == id) {
+            self.compaction_files.insert(id, file);
+        }
+    }
+
+    /// Committed compactions not installed yet, in log order: `(meta, has local file, inputs
+    /// all published)`.
+    pub fn pending_compactions(&self) -> Vec<(CompactionMeta, bool, bool)> {
+        self.manifest
+            .compactions
+            .iter()
+            .map(|c| {
+                (
+                    c.clone(),
+                    self.compaction_files.contains_key(&c.id),
+                    self.input_range(&c.inputs).is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// Replaces adjacent `inputs` with `id` in `logical`; `false` (unchanged) if they are not
+    /// there, adjacent and in order.
+    fn apply_to_logical(logical: &mut Vec<SegmentId>, inputs: &[SegmentId], id: SegmentId) -> bool {
+        let Some(&head) = inputs.first() else {
+            return false;
+        };
+        let Some(first) = logical.iter().position(|s| *s == head) else {
+            return false;
+        };
+        let adjacent = inputs
+            .iter()
+            .enumerate()
+            .all(|(k, i)| logical.get(first + k) == Some(i));
+        if adjacent {
+            logical.splice(first..first + inputs.len(), [id]);
+        }
+        adjacent
+    }
+
+    /// Recomputes the log-defined segment list from the manifest (open, snapshot install):
+    /// published segments with the committed, uninstalled compactions applied in order.
+    fn rebuild_logical(&mut self) {
+        self.logical = Self::logical_of(&self.manifest);
+    }
+
+    fn logical_of(m: &ShardManifest) -> Vec<SegmentId> {
+        let mut logical: Vec<SegmentId> = m.segments.iter().map(|s| s.id).collect();
+        for c in &m.compactions {
+            Self::apply_to_logical(&mut logical, &c.inputs, c.id);
+        }
+        logical
+    }
+
+    /// Whether the compaction `id` was accepted (committed and valid), installed or pending.
+    pub fn compaction_accepted(&self, id: SegmentId) -> bool {
+        self.logical.contains(&id) || self.segments.iter().any(|s| s.meta.id == id)
+    }
+
+    /// Segments replaced since the last call; their files are still on disk until
+    /// [`Store::purge_segment_files`].
+    pub fn take_retired(&mut self) -> Vec<SegmentId> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Removes the files of a retired segment (no-op if it is live again or gone).
+    pub async fn purge_segment_files(&self, id: SegmentId) -> Result<()> {
+        if self.segments.iter().any(|s| s.meta.id == id) {
+            return Ok(());
+        }
+        let disk = self.rt.disk();
+        for path in [seg_path(&self.dir, id), del_path(&self.dir, id)] {
+            if disk.exists(&path).await? {
+                disk.remove(&path).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Installs a fetched merged segment (staged at `<Store::ship_staging(id)>.fetch`) after
+    /// checking it against the commit. `false`: rejected (the caller builds locally).
+    pub async fn install_fetched_compaction(&mut self, id: SegmentId) -> Result<bool> {
+        let Some(c) = self
+            .manifest
+            .compactions
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let path = seg_path(&self.dir, id);
+        let disk = self.rt.disk();
+        disk.rename(
+            &format!("{}/{}.fetch", self.dir, Self::ship_staging(id)),
+            &path,
+        )
+        .await?;
+        let ok = match SegmentReader::open(self.rt.clone(), &path).await {
+            Ok(r) => r.len() == c.len && r.file_hash() == c.hash && r.verify_file_hash().await?,
+            Err(_) => false,
+        };
+        if !ok {
+            let _ = disk.remove(&path).await;
+            return Ok(false);
+        }
+        self.compaction_files.insert(id, (c.len, c.hash));
+        Ok(true)
+    }
+
+    /// Installs, in log order, every committed compaction whose file is present and whose
+    /// inputs are all published (ADR 0021). A merged row is masked when its input row is
+    /// deleted now: input deletion bits carry every change applied here since the rows were
+    /// read, and nothing beyond. Returns how many were installed.
+    pub async fn install_compactions(&mut self) -> Result<usize> {
+        let mut n = 0;
+        while let Some(c) = self.manifest.compactions.first().cloned() {
+            let (Some(&(file_len, file_hash)), Some(range)) = (
+                self.compaction_files.get(&c.id),
+                self.input_range(&c.inputs),
+            ) else {
+                break;
+            };
+            self.persist_dirty_deletions().await?;
+            let path = seg_path(&self.dir, c.id);
+            let reader = SegmentReader::open(self.rt.clone(), &path).await?;
+            let docstore = DocStore::open(&reader).await?;
+            let doc_count = docstore.doc_count();
+            // Ids still live in the inputs.
+            let mut live: cairn_core::HashSet<u64> = cairn_core::HashSet::default();
+            let mut log_last = LogIndex(0);
+            for s in &self.segments[range.clone()] {
+                log_last = log_last.max(s.meta.log_last);
+                for (row, id) in s.docs.docids().iter().enumerate() {
+                    if !s.deletions.contains(row as u32) {
+                        live.insert(*id);
+                    }
+                }
+            }
+            let mut deletions = DeletionSet::new(doc_count);
+            let mut dirty = false;
+            for (row, id) in docstore.docids().iter().enumerate() {
+                if !live.contains(id) {
+                    deletions.set(row as u32);
+                    dirty = true;
+                }
+            }
+            if dirty {
+                ManifestStore::new(self.rt.clone(), del_path(&self.dir, c.id))
+                    .store(&deletions)
+                    .await?;
+            }
+            let meta = SegmentMeta {
+                id: c.id,
+                doc_count,
+                log_last,
+                file_len,
+                file_hash,
+            };
+            let mut new_manifest = self.manifest.clone();
+            new_manifest.segments.splice(range.clone(), [meta.clone()]);
+            new_manifest.compactions.remove(0);
+            self.manifest_store.store(&new_manifest).await?;
+            self.manifest = new_manifest;
+            self.compaction_files.remove(&c.id);
+            self.segments_version += 1;
+            let removed: Vec<OpenSegment<R>> = self
+                .segments
+                .splice(
+                    range,
+                    [OpenSegment {
+                        meta,
+                        reader,
+                        docs: docstore,
+                        deletions,
+                        deletions_dirty: false,
+                    }],
+                )
+                .collect();
+            // Files stay until the caller purges them (see `take_retired`).
+            self.retired.extend(removed.iter().map(|s| s.meta.id));
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Picks the next compaction per policy and reads its inputs. `None` when nothing to do or a
@@ -1181,7 +1758,10 @@ impl<R: Runtime> Store<R> {
     /// reused. `manifest` is the encoded manifest. The log is reset to start after the manifest's applied index
     /// unless it already does.
     pub async fn install_snapshot(&mut self, manifest: &[u8], fetched: Vec<String>) -> Result<()> {
-        let m: ShardManifest = ManifestStore::<R>::decode(manifest)?;
+        let mut m: ShardManifest = ManifestStore::<R>::decode(manifest)?;
+        // The compaction id counter is this replica's own (its namespace): keep the higher of
+        // the local and the incoming one, or a later leadership here could reuse an id.
+        m.next_segment_id = m.next_segment_id.max(self.manifest.next_segment_id);
         if m.schema != self.manifest.schema {
             return Err(Error::Schema("snapshot schema differs".into()));
         }
@@ -1203,7 +1783,7 @@ impl<R: Runtime> Store<R> {
                 };
             if !ok {
                 return Err(Error::Internal(format!(
-                    "snapshot segment {} missing or different locally",
+                    "{SNAPSHOT_MISMATCH}: {} missing or different locally",
                     meta.id
                 )));
             }
@@ -1249,6 +1829,8 @@ impl<R: Runtime> Store<R> {
         self.manifest = m;
         self.memtable.clear();
         self.pending.clear();
+        self.compaction_files.clear();
+        self.logical = Self::logical_of(&self.manifest);
         self.job_active = false;
         self.generation += 1;
         self.masked_during_build.clear();
@@ -1504,7 +2086,10 @@ mod tests {
                 let mut model: HashMap<DocId, Option<Document>> = HashMap::default();
                 for c in &cmds[..applied] {
                     match c {
-                        Command::Noop | Command::FlushBegin | Command::FlushCommit { .. } => {}
+                        Command::Noop
+                        | Command::FlushBegin
+                        | Command::FlushCommit { .. }
+                        | Command::CompactCommit { .. } => {}
                         Command::Upsert(ds) => {
                             for d in ds {
                                 model.insert(d.id, Some(d.clone()));
@@ -1717,6 +2302,7 @@ mod tests {
                     id: f1,
                     len: l1,
                     hash: h1,
+                    from: NodeId(1),
                 },
             )
             .await;
@@ -1727,6 +2313,7 @@ mod tests {
                     id: f2,
                     len: l2,
                     hash: h2,
+                    from: NodeId(1),
                 },
             )
             .await;
@@ -1763,6 +2350,7 @@ mod tests {
                     id: f3,
                     len: 1,
                     hash: 2,
+                    from: NodeId(1),
                 },
             )
             .await;
@@ -1797,6 +2385,118 @@ mod tests {
             assert_eq!(b.get(DocId(22)).await.unwrap(), None);
             assert_eq!(b.get(DocId(6)).await.unwrap(), Some(doc(6, 9)));
             assert_eq!(b.approx_live_docs(), 24);
+        });
+    }
+
+    /// ADR 0021: a compaction committed through the log waits for its inputs, masks rows
+    /// changed after the merged rows were read (input deletion bits), survives a restart, and
+    /// a fetched file must match the commit.
+    #[test]
+    fn compaction_through_the_log() {
+        let (sim, mut ex) = Simulation::new(12, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let cfg = StoreConfig {
+                memtable_max_bytes: usize::MAX,
+                ..small_cfg()
+            };
+            let mut a = Store::open(rt.clone(), "ca", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let mut b = Store::open(rt.clone(), "cb", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let run = async |a: &mut Store<_>, b: &mut Store<_>, cmd: Command| {
+                let ia = a.write(&cmd).await.unwrap();
+                assert_eq!(ia, b.write(&cmd).await.unwrap());
+                ia
+            };
+            // Two flushed segments on both replicas.
+            let mut segs = Vec::new();
+            for batch in 0..2u64 {
+                for i in 1..=10u64 {
+                    run(
+                        &mut a,
+                        &mut b,
+                        Command::Upsert(vec![doc(batch * 10 + i, 1)]),
+                    )
+                    .await;
+                }
+                let f = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+                for st in [&mut a, &mut b] {
+                    build_local(st, f).await;
+                    st.publish_ready().await.unwrap();
+                }
+                segs.push(f);
+            }
+            // Leader: picks, reads and builds the merge.
+            a.set_compaction_namespace(1);
+            let id = a.reserve_compaction_id().await.unwrap();
+            let job = a.compaction_rows(id, &segs).await.unwrap().unwrap();
+            assert_eq!(job.docs.len(), 20);
+            let sections = Store::<cairn_sim::SimRuntime>::build_sections(
+                &a.manifest.schema,
+                &job.docs,
+                a.indexer.as_ref(),
+            )
+            .unwrap();
+            let (len, hash) = a.write_compaction_file(&job, sections).await.unwrap();
+            // Changes after the rows were read, before the commit.
+            run(&mut a, &mut b, Command::Delete(vec![DocId(3)])).await;
+            run(&mut a, &mut b, Command::Upsert(vec![doc(15, 2)])).await;
+            let commit = Command::CompactCommit {
+                id,
+                inputs: segs.clone(),
+                len,
+                hash,
+                from: NodeId(1),
+            };
+            run(&mut a, &mut b, commit).await;
+            // A second leader merging the same inputs: rejected on both replicas, whether or
+            // not the first merge is installed yet (b has not installed it).
+            let dup = Command::CompactCommit {
+                id: SegmentId(id.get() + 1),
+                inputs: segs.clone(),
+                len,
+                hash,
+                from: NodeId(2),
+            };
+            run(&mut a, &mut b, dup).await;
+            for st in [&a, &b] {
+                assert_eq!(st.pending_compactions().len(), 1);
+                assert!(!st.compaction_accepted(SegmentId(id.get() + 1)));
+                assert!(st.compaction_accepted(id));
+            }
+            a.set_compaction_file(id, (len, hash));
+            assert_eq!(a.install_compactions().await.unwrap(), 1);
+            assert_eq!(a.segments().map(|m| m.id).collect::<Vec<_>>(), vec![id]);
+            // Follower: survives a restart before installing, rejects a corrupt fetch.
+            drop(b);
+            let mut b = Store::open(rt.clone(), "cb", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let p = b.pending_compactions();
+            assert_eq!(p.len(), 1);
+            assert!(!p[0].1 && p[0].2, "no file yet, inputs published");
+            assert_eq!(b.install_compactions().await.unwrap(), 0);
+            ship(&a, &b, id, true).await;
+            assert!(!b.install_fetched_compaction(id).await.unwrap());
+            ship(&a, &b, id, false).await;
+            assert!(b.install_fetched_compaction(id).await.unwrap());
+            assert_eq!(b.install_compactions().await.unwrap(), 1);
+            for st in [&a, &b] {
+                assert_eq!(st.segments().count(), 1);
+                assert_eq!(st.get(DocId(3)).await.unwrap(), None);
+                assert_eq!(st.get(DocId(15)).await.unwrap(), Some(doc(15, 2)));
+                assert_eq!(st.get(DocId(4)).await.unwrap(), Some(doc(4, 1)));
+                assert_eq!(st.get(DocId(20)).await.unwrap(), Some(doc(20, 1)));
+            }
+            assert!(b.pending_compactions().is_empty());
+            drop(b);
+            let b = Store::open(rt.clone(), "cb", schema(), cfg).await.unwrap();
+            assert!(b.pending_compactions().is_empty());
+            assert_eq!(b.get(DocId(3)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(15)).await.unwrap(), Some(doc(15, 2)));
         });
     }
 }

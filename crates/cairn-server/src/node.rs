@@ -542,7 +542,10 @@ impl Node {
                     Command::Upsert(docs) => Request::Upsert(docs),
                     Command::Delete(ids) => Request::Delete(ids),
                     // Upkeep entries are proposed by replicas themselves, never forwarded.
-                    Command::Noop | Command::FlushBegin | Command::FlushCommit { .. } => {
+                    Command::Noop
+                    | Command::FlushBegin
+                    | Command::FlushCommit { .. }
+                    | Command::CompactCommit { .. } => {
                         return Ok(Vec::new());
                     }
                 };

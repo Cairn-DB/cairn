@@ -1,7 +1,7 @@
 //! Commands carried by log entries.
 
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::{DocId, Document, Error, Result, SegmentId};
+use cairn_core::{DocId, Document, Error, NodeId, Result, SegmentId};
 
 /// One replicated command (a log entry payload).
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,21 @@ pub enum Command {
     /// Freeze the memtable for a flush (ADR 0016). The segment id is the entry's log index,
     /// so every replica cuts the same rows under the same id.
     FlushBegin,
+    /// The leader merged `inputs` (adjacent segments, in manifest order) into the segment
+    /// `id` with the given file length and body hash (ADR 0021). Every replica replaces the
+    /// inputs with `id` when it applies this, fetching the file or building it locally.
+    CompactCommit {
+        /// Merged segment id (unique: the leader's compaction namespace).
+        id: SegmentId,
+        /// Input segments.
+        inputs: Vec<SegmentId>,
+        /// File length.
+        len: u64,
+        /// File body hash.
+        hash: u64,
+        /// Node that built the file: every other replica fetches it from there.
+        from: NodeId,
+    },
     /// The leader built the segment of the freeze `id`: its file length and body hash, which
     /// followers check after fetching it.
     FlushCommit {
@@ -24,6 +39,9 @@ pub enum Command {
         len: u64,
         /// Body hash recorded in the file's table of contents.
         hash: u64,
+        /// Node that built the file: every other replica (a later leader included) fetches
+        /// it from there before building it itself.
+        from: NodeId,
     },
 }
 
@@ -47,8 +65,26 @@ impl Command {
             Command::FlushBegin => {
                 w.u8(3);
             }
-            Command::FlushCommit { id, len, hash } => {
-                w.u8(4).u64(id.get()).u64(*len).u64(*hash);
+            Command::FlushCommit {
+                id,
+                len,
+                hash,
+                from,
+            } => {
+                w.u8(4).u64(id.get()).u64(*len).u64(*hash).u32(from.get());
+            }
+            Command::CompactCommit {
+                id,
+                inputs,
+                len,
+                hash,
+                from,
+            } => {
+                w.u8(5).u64(id.get()).u32(inputs.len() as u32);
+                for i in inputs {
+                    w.u64(i.get());
+                }
+                w.u64(*len).u64(*hash).u32(from.get());
             }
         }
     }
@@ -89,10 +125,29 @@ impl Command {
                 Ok(Command::Delete(ids))
             }
             3 => Ok(Command::FlushBegin),
+            5 => {
+                let id = SegmentId(r.u64()?);
+                let n = r.u32()? as usize;
+                if n > 1 << 16 {
+                    return Err(Error::corruption("compaction with too many inputs"));
+                }
+                let mut inputs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    inputs.push(SegmentId(r.u64()?));
+                }
+                Ok(Command::CompactCommit {
+                    id,
+                    inputs,
+                    len: r.u64()?,
+                    hash: r.u64()?,
+                    from: NodeId(r.u32()?),
+                })
+            }
             4 => Ok(Command::FlushCommit {
                 id: SegmentId(r.u64()?),
                 len: r.u64()?,
                 hash: r.u64()?,
+                from: NodeId(r.u32()?),
             }),
             t => Err(Error::corruption(format!("unknown command tag {t}"))),
         }
@@ -120,8 +175,16 @@ mod tests {
                 id: SegmentId(42),
                 len: 1 << 40,
                 hash: u64::MAX,
+                from: NodeId(2),
             },
             Command::Delete(vec![DocId(7), DocId(9)]),
+            Command::CompactCommit {
+                id: SegmentId((1 << 62) | 3),
+                inputs: vec![SegmentId(10), SegmentId(20)],
+                len: 4096,
+                hash: 77,
+                from: NodeId(3),
+            },
         ] {
             assert_eq!(Command::from_bytes(&cmd.to_bytes()).unwrap(), cmd);
         }
@@ -130,6 +193,7 @@ mod tests {
             id: SegmentId(1),
             len: 2,
             hash: 3,
+            from: NodeId(2),
         }
         .to_bytes();
         for n in 1..b.len() {

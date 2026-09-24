@@ -493,10 +493,20 @@ fn spawn_three(
     memtable: usize,
     ship: bool,
 ) -> Vec<ReplicaHandle> {
+    spawn_three_with(sim, ex, memtable, ship, 1000)
+}
+
+fn spawn_three_with(
+    sim: &Simulation,
+    ex: &mut cairn_runtime::Executor<cairn_sim::SimReactor>,
+    memtable: usize,
+    ship: bool,
+    max_segments: usize,
+) -> Vec<ReplicaHandle> {
     (1..=3u32)
         .map(|n| {
             let mut cfg = config(NodeId(n), memtable);
-            cfg.engine.store.max_segments = 1000;
+            cfg.engine.store.max_segments = max_segments;
             cfg.ship_segments = ship;
             let (sim, hh) = (sim.clone(), ex.handle());
             ex.block_on(async move {
@@ -719,5 +729,56 @@ fn leadership_follows_the_preferred_replica() {
                 }
             }
         }
+    });
+}
+
+/// ADR 0021: the leader decides and builds every merge; followers install the leader's merged
+/// segments, so all replicas hold the same segment list and followers build nothing.
+#[test]
+fn followers_install_leader_built_compactions() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(41, SimConfig::default());
+    let handles = spawn_three_with(&sim, &mut ex, 3000, true, 3);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    ex.block_on(async move {
+        let li = wait_leader(&rt, &hs).await;
+        for i in 1..=150u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+            if i % 30 == 0 {
+                propose(&rt, &hs, Command::Delete(vec![DocId(i - 7)])).await;
+            }
+        }
+        let deleted: Vec<u64> = (1..=5).map(|k| k * 30 - 7).collect();
+        wait_converged(&rt, &hs, 145).await;
+        // Let merges settle: same segment list everywhere, nothing pending.
+        let mut st = Vec::new();
+        for _ in 0..3000 {
+            st.clear();
+            for h in &hs {
+                st.push(h.status().await.unwrap());
+            }
+            if st
+                .iter()
+                .all(|s| s.flushes[2] == 0 && s.segments == st[0].segments)
+            {
+                break;
+            }
+            rt.sleep(Duration::from_millis(10)).await;
+        }
+        assert!(st.iter().all(|s| s.segments == st[0].segments), "{st:#?}");
+        assert!(
+            st[0].segments.iter().any(|id| id & (1 << 62) != 0),
+            "no merged segment: {:?}",
+            st[0].segments
+        );
+        assert!(st[0].segments.len() <= 4, "{:?}", st[0].segments);
+        for (i, s) in st.iter().enumerate() {
+            if i != li {
+                assert_eq!(s.flushes[0], 0, "follower {} built locally", s.id);
+                assert!(s.flushes[1] > 0);
+            }
+        }
+        check_all_docs(&hs, 150, &deleted).await;
     });
 }

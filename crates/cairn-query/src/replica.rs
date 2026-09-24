@@ -19,7 +19,7 @@ use cairn_core::{
 use cairn_index::DefaultIndexer;
 use cairn_raft::{Entry, HardState, InitialState, Raft, Ready, Role, Snapshot};
 use cairn_storage::manifest::{Manifest, ManifestStore};
-use cairn_storage::{Command, CompactJob, FlushJob, LogEntry, Store};
+use cairn_storage::{Command, LogEntry, Store};
 
 /// Consistency level of a read (ADR 0010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,8 +159,19 @@ enum Event {
     ),
     Get(DocId, Consistency, Sender<Result<Option<Document>>>),
     Status(Sender<ReplicaStatus>),
-    FlushBuilt(FlushJob, Result<Vec<(String, Vec<u8>)>>),
-    CompactBuilt(CompactJob, Result<Vec<(String, Vec<u8>)>>),
+    /// A flushed segment was built and written outside the actor (ADR 0021).
+    FlushWritten {
+        id: SegmentId,
+        generation: u64,
+        file: Result<(u64, u64)>,
+    },
+    /// A merged segment was read, built and written outside the actor (ADR 0021).
+    CompactWritten {
+        id: SegmentId,
+        inputs: Vec<SegmentId>,
+        generation: u64,
+        file: Result<(u64, u64)>,
+    },
 }
 
 /// Handle to a running replica (cheap to clone).
@@ -190,8 +201,8 @@ impl Drop for AliveGuard {
                 Event::Status(_)
                 | Event::Tick
                 | Event::Net(..)
-                | Event::FlushBuilt(..)
-                | Event::CompactBuilt(..) => {}
+                | Event::FlushWritten { .. }
+                | Event::CompactWritten { .. } => {}
             }
         }
     }
@@ -333,20 +344,33 @@ struct PendingSnapshot {
     last_index: LogIndex,
     last_term: Term,
     data: Bytes,
+    /// The node that sent it: its files are fetched from it, since since ADR 0021 the same
+    /// segment id may hold different bytes on different replicas (local fallback builds).
+    from: Option<NodeId>,
 }
 
 impl Manifest for PendingSnapshot {
     fn encode(&self, w: &mut Writer) {
         w.u64(self.last_index.get())
             .u64(self.last_term.get())
-            .bytes(&self.data);
+            .bytes(&self.data)
+            .u32(self.from.map_or(u32::MAX, |n| n.get()));
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let last_index = LogIndex(r.u64()?);
+        let last_term = Term(r.u64()?);
+        let data = Bytes::copy_from_slice(r.bytes()?);
+        let from = if r.remaining() > 0 {
+            Some(r.u32()?).filter(|n| *n != u32::MAX).map(NodeId)
+        } else {
+            None
+        };
         Ok(PendingSnapshot {
-            last_index: LogIndex(r.u64()?),
-            last_term: Term(r.u64()?),
-            data: Bytes::copy_from_slice(r.bytes()?),
+            last_index,
+            last_term,
+            data,
+            from,
         })
     }
 }
@@ -379,6 +403,8 @@ const NO_CHECKPOINT: u64 = u64::MAX - 1;
 /// A follower fetching a leader-built segment (ADR 0016).
 struct SegFetch {
     id: SegmentId,
+    /// A merged segment (ADR 0021) rather than a flushed one.
+    compaction: bool,
     from: NodeId,
     req: u64,
     /// Bytes received so far.
@@ -386,6 +412,10 @@ struct SegFetch {
     /// Tick of the last chunk (or of the request).
     progress_tick: u64,
 }
+
+/// Files of segments replaced by a compaction are kept this many election timeouts (30 s at
+/// the server's 50 ms tick), so fetches and snapshot installs in flight can finish.
+const RETIRED_GRACE_ELECTIONS: u64 = 60;
 
 /// A segment fetch that gets no chunk for this many election timeouts is abandoned for a
 /// local build.
@@ -431,6 +461,17 @@ struct FlushState {
     begin_proposed: Option<(Term, LogIndex)>,
     /// Freeze whose segment builds here now.
     building: Option<SegmentId>,
+    /// Compaction whose merged segment builds here now (ADR 0021).
+    compacting: Option<SegmentId>,
+    /// Leader: a merged segment built here and proposed, not yet committed: its id, file and
+    /// the term of the proposal.
+    own_compaction: Option<(SegmentId, (u64, u64), Term)>,
+    /// Leader: the last merge built here (inputs, id, file), re-proposed instead of rebuilt if
+    /// its proposal is lost.
+    last_merge: Option<(Vec<SegmentId>, SegmentId, (u64, u64))>,
+    /// Segments replaced by a compaction, with the tick they were retired: their files are
+    /// purged after a grace period (ADR 0021).
+    retired: std::collections::VecDeque<(SegmentId, u64)>,
     /// Follower: the segment being fetched.
     fetch: Option<SegFetch>,
     /// Freezes to build here although the leader ships them (fetch failed or never announced).
@@ -463,7 +504,7 @@ impl<R: Runtime> Replica<R> {
         Raft,
         RaftState,
         ManifestStore<R>,
-        Option<Snapshot>,
+        Option<(Snapshot, Option<NodeId>)>,
     )> {
         // Raft state first: only entries up to the persisted commit index may be replayed.
         let state_store = ManifestStore::new(rt.clone(), format!("{}/RAFT", cfg.dir));
@@ -546,10 +587,15 @@ impl<R: Runtime> Replica<R> {
                 data: engine.store().manifest_bytes(),
             });
         }
-        let resume = pending.map(|p| Snapshot {
-            last_index: p.last_index,
-            last_term: p.last_term,
-            data: p.data,
+        let resume = pending.map(|p| {
+            (
+                Snapshot {
+                    last_index: p.last_index,
+                    last_term: p.last_term,
+                    data: p.data,
+                },
+                p.from,
+            )
         });
         Ok((engine, raft, state, state_store, resume))
     }
@@ -565,8 +611,8 @@ impl<R: Runtime> Replica<R> {
         self.state_store = state_store;
         self.fetch = None;
         self.flush = FlushState::default();
-        if let Some(s) = resume {
-            self.start_fetch(s).await?;
+        if let Some((s, from)) = resume {
+            self.start_fetch(s, from).await?;
         }
         for (_, (_, done)) in self.waiting_commit.drain() {
             done.send(closed());
@@ -667,8 +713,8 @@ impl<R: Runtime> Replica<R> {
                         Event::Status(_)
                         | Event::Tick
                         | Event::Net(..)
-                        | Event::FlushBuilt(..)
-                        | Event::CompactBuilt(..) => {}
+                        | Event::FlushWritten { .. }
+                        | Event::CompactWritten { .. } => {}
                     }
                 }
             }
@@ -676,9 +722,9 @@ impl<R: Runtime> Replica<R> {
         Ok(handle)
     }
 
-    async fn run(&mut self, resume: Option<Snapshot>) -> Result<()> {
-        if let Some(s) = resume {
-            self.start_fetch(s).await?;
+    async fn run(&mut self, resume: Option<(Snapshot, Option<NodeId>)>) -> Result<()> {
+        if let Some((s, from)) = resume {
+            self.start_fetch(s, from).await?;
         }
         self.drain_ready().await?;
         loop {
@@ -719,57 +765,89 @@ impl<R: Runtime> Replica<R> {
             Event::Query(q, c, done) => self.read(Event::Query(q, c, done)).await?,
             Event::QueryLegs(q, c, done) => self.read(Event::QueryLegs(q, c, done)).await?,
             Event::Get(id, c, done) => self.read(Event::Get(id, c, done)).await?,
-            Event::FlushBuilt(job, sections) => {
+            Event::FlushWritten {
+                id,
+                generation,
+                file,
+            } => {
                 self.release_slot();
                 self.flush.building = None;
-                let sections = sections?;
-                let id = job.id;
-                if let Some(file) = self
-                    .engine
-                    .store_mut()
-                    .write_flush_file(&job, sections)
-                    .await?
-                {
-                    self.flush.built += 1;
-                    self.flush.fallback.remove(&id);
-                    let committed = self
-                        .engine
-                        .store()
-                        .pending_flushes()
-                        .iter()
-                        .any(|p| p.id == id && p.commit.is_some());
-                    if !committed {
-                        self.flush.announce.insert(id, (file, None));
+                match file {
+                    Err(e) => {
+                        // Retried by the next drive: the freeze is still pending without a file.
+                        tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "flush build failed: {e}");
                     }
-                    tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "flush built");
+                    Ok(file) => {
+                        let wanted = self.engine.store().flush_wanted(id, generation);
+                        if wanted {
+                            self.engine.store().adopt_built_file(id).await?;
+                        } else {
+                            self.engine.store().discard_built_file(id).await?;
+                        }
+                        if wanted && self.engine.store_mut().set_flush_file(id, generation, file) {
+                            self.flush.built += 1;
+                            self.flush.fallback.remove(&id);
+                            let committed = self
+                                .engine
+                                .store()
+                                .pending_flushes()
+                                .iter()
+                                .any(|p| p.id == id && p.commit.is_some());
+                            if !committed {
+                                self.flush.announce.insert(id, (file, None));
+                            }
+                        }
+                    }
                 }
                 self.drive_flushes().await?;
             }
-            Event::CompactBuilt(job, sections) => {
+            Event::CompactWritten {
+                id,
+                inputs,
+                generation,
+                file,
+            } => {
                 self.release_slot();
-                if self.fetch.is_some() {
-                    // Installing a snapshot: its files were chosen against the current segments.
-                    self.engine.store_mut().abandon_compact();
+                self.flush.compacting = None;
+                let file = match file {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // Inputs retired or replaced meanwhile, or an I/O error: dropped; a
+                        // pending compaction is retried by the next drive.
+                        tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "merge build failed: {e}");
+                        return Ok(());
+                    }
+                };
+                let pending = self.engine.store().compaction_pending(id);
+                let has_file = self
+                    .engine
+                    .store()
+                    .pending_compactions()
+                    .iter()
+                    .any(|(c, f, _)| c.id == id && *f);
+                let installed = self.engine.store().segments().any(|m| m.id == id);
+                let wanted = self.fetch.is_none()
+                    && self.engine.store().job_is_current(generation)
+                    && !installed
+                    && !has_file
+                    && (pending || self.raft.role() == Role::Leader);
+                if !wanted {
+                    // A snapshot was installed, or the merge was fetched or installed meanwhile:
+                    // never replace a file that is in use.
+                    self.engine.store().discard_built_file(id).await?;
                     return Ok(());
                 }
-                let sections = sections?;
-                self.engine
-                    .store_mut()
-                    .finish_compact(job, sections)
-                    .await?;
-                self.engine.refresh().await?;
-                // Lagging followers must fetch the merged files, not the removed ones: refresh
-                // the snapshot Raft offers them.
-                let up_to = self.engine.store().manifest().applied_index;
-                if up_to > LogIndex(0) {
-                    let term = self.manifest_term();
-                    self.compact_raft_log(Snapshot {
-                        last_index: up_to,
-                        last_term: term,
-                        data: self.engine.store().manifest_bytes(),
-                    });
+                self.engine.store().adopt_built_file(id).await?;
+                self.flush.built += 1;
+                if pending {
+                    self.engine.store_mut().set_compaction_file(id, file);
+                    self.flush.fallback.remove(&id);
+                } else {
+                    self.propose_merge(id, inputs.clone(), file);
                 }
-                self.maybe_compact_job().await?;
+                // Kept for a re-proposal if this one is lost with a leadership change.
+                self.flush.last_merge = Some((inputs, id, file));
+                self.drive_flushes().await?;
                 self.release_deferred();
             }
             Event::Status(done) => {
@@ -794,7 +872,7 @@ impl<R: Runtime> Replica<R> {
                     flushes: [
                         self.flush.built,
                         self.flush.fetched,
-                        st.pending_flushes().len() as u64,
+                        (st.pending_flushes().len() + st.pending_compactions().len()) as u64,
                     ],
                 });
             }
@@ -991,11 +1069,14 @@ impl<R: Runtime> Replica<R> {
             // before any entry that follows it is appended or acknowledged.
             if let Some(snap) = ready.snapshot {
                 tracing::info!(node = %self.cfg.id, last_index = %snap.last_index, applied = %self.engine.store().applied_index(), "snapshot accepted");
+                // Raft records the sender as leader when it accepts a snapshot.
+                let source = self.raft.leader();
                 ManifestStore::<R>::new(self.rt.clone(), format!("{}/SNAPSHOT", self.cfg.dir))
                     .store(&PendingSnapshot {
                         last_index: snap.last_index,
                         last_term: snap.last_term,
                         data: snap.data.clone(),
+                        from: source,
                     })
                     .await?;
                 self.engine
@@ -1003,7 +1084,7 @@ impl<R: Runtime> Replica<R> {
                     .log_mut()
                     .reset(snap.last_index.next())
                     .await?;
-                self.start_fetch(snap).await?;
+                self.start_fetch(snap, source).await?;
             }
             if let Some(t) = ready.truncate_from {
                 self.engine.store_mut().log_mut().truncate_suffix(t).await?;
@@ -1042,9 +1123,21 @@ impl<R: Runtime> Replica<R> {
                 if let Command::FlushCommit { id, .. } = &cmd {
                     self.flush.announce.remove(id);
                 }
+                let compact_id = match &cmd {
+                    Command::CompactCommit { id, .. } => Some(*id),
+                    _ => None,
+                };
                 let store = self.engine.store_mut();
                 if e.index > store.applied_index() {
                     store.apply(e.index, &cmd)?;
+                }
+                if let Some(id) = compact_id
+                    && self.flush.own_compaction.is_some_and(|o| o.0 == id)
+                    && !self.engine.store().compaction_accepted(id)
+                {
+                    // Our merge lost to another one of the same inputs: nothing to install.
+                    tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "own compaction rejected");
+                    self.flush.own_compaction = None;
                 }
                 if let Some((term, done)) = self.waiting_commit.remove(&e.index) {
                     if term == e.term {
@@ -1066,7 +1159,10 @@ impl<R: Runtime> Replica<R> {
                 if ready.committed.iter().any(|e| {
                     !matches!(
                         Command::from_bytes(&e.payload),
-                        Ok(Command::FlushBegin | Command::FlushCommit { .. } | Command::Noop)
+                        Ok(Command::FlushBegin
+                            | Command::FlushCommit { .. }
+                            | Command::CompactCommit { .. }
+                            | Command::Noop)
                     )
                 }) {
                     self.last_apply_tick = self.ticks;
@@ -1145,7 +1241,7 @@ impl<R: Runtime> Replica<R> {
 
     /// Whether an index build (flush or compaction) runs on this replica.
     fn busy(&self) -> bool {
-        self.flush.building.is_some() || self.engine.store().job_active()
+        self.flush.building.is_some() || self.flush.compacting.is_some()
     }
 
     /// Moves frozen memtables towards publication (ADR 0016): publishes what is ready, in
@@ -1157,10 +1253,8 @@ impl<R: Runtime> Replica<R> {
             return Ok(());
         }
         let leader = self.raft.role() == Role::Leader;
-        // Announce segments built here once leader (the old leader may have died before). A
-        // leader builds its freezes itself: a fetch started as a follower is dropped.
+        // Announce segments built here once leader (the old leader may have died before).
         if leader {
-            self.flush.fetch = None;
             let term = self.raft.term();
             let todo: Vec<(SegmentId, (u64, u64))> = self
                 .flush
@@ -1172,7 +1266,15 @@ impl<R: Runtime> Replica<R> {
             for (id, (len, hash)) in todo {
                 if self
                     .raft
-                    .propose(Command::FlushCommit { id, len, hash }.to_bytes())
+                    .propose(
+                        Command::FlushCommit {
+                            id,
+                            len,
+                            hash,
+                            from: self.cfg.id,
+                        }
+                        .to_bytes(),
+                    )
                     .is_ok()
                     && let Some(e) = self.flush.announce.get_mut(&id)
                 {
@@ -1184,37 +1286,55 @@ impl<R: Runtime> Replica<R> {
             self.after_publish().await?;
         }
         let pending = self.engine.store().pending_flushes();
-        let live: std::collections::BTreeSet<SegmentId> = pending.iter().map(|p| p.id).collect();
+        let mut live: std::collections::BTreeSet<SegmentId> =
+            pending.iter().map(|p| p.id).collect();
+        // Fallbacks of committed compactions are kept too (dropping them made a follower
+        // re-fetch a missing file on every tick).
+        live.extend(
+            self.engine
+                .store()
+                .pending_compactions()
+                .iter()
+                .map(|(c, _, _)| c.id),
+        );
         self.flush.fallback.retain(|id| live.contains(id));
         self.flush.waiting_since.retain(|id, _| live.contains(id));
         if self
             .flush
             .fetch
             .as_ref()
-            .is_some_and(|f| !live.contains(&f.id))
+            .is_some_and(|f| !f.compaction && !live.contains(&f.id))
         {
             self.flush.fetch = None;
         }
         let election = u64::from(self.cfg.election_ticks.max(1));
         let mut to_build = None;
         let mut to_fetch = None;
+        let me = self.cfg.id;
         for p in &pending {
             if p.has_file || p.empty {
                 continue;
             }
             let fetching = self.flush.fetch.as_ref().is_some_and(|f| f.id == p.id);
-            let local = leader || !self.cfg.ship_segments || self.flush.fallback.contains(&p.id);
+            // A committed file is fetched from the node that built it, whoever leads now (a
+            // new leader included: rebuilding it was wasted work, and its followers then
+            // asked it for a file it did not have yet). Built here: no commit yet and this
+            // replica leads, its own file, no shipping, or a failed fetch.
+            let local = !self.cfg.ship_segments
+                || self.flush.fallback.contains(&p.id)
+                || p.commit_from == Some(me)
+                || (p.commit.is_none() && leader);
             if local && !fetching {
                 if to_build.is_none() && self.flush.building != Some(p.id) {
                     to_build = Some(p.id);
                 }
                 continue;
             }
-            if p.commit.is_some() {
+            if let (Some(_), Some(src)) = (p.commit, p.commit_from) {
                 if to_fetch.is_none() && !fetching {
-                    to_fetch = Some(p.id);
+                    to_fetch = Some((p.id, src));
                 }
-            } else {
+            } else if p.commit.is_none() {
                 let since = *self.flush.waiting_since.entry(p.id).or_insert(self.ticks);
                 if self.ticks - since >= COMMIT_WAIT_ELECTIONS * election {
                     tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, id = %p.id, "no commit for a freeze: building it here");
@@ -1230,14 +1350,14 @@ impl<R: Runtime> Replica<R> {
         {
             self.start_flush_build(id)?;
         }
-        if let Some(id) = to_fetch
+        if let Some((id, from)) = to_fetch
             && self.flush.fetch.is_none()
-            && let Some(from) = self.raft.leader().filter(|l| *l != self.cfg.id)
         {
             let req = self.next_read;
             self.next_read += 1;
             self.flush.fetch = Some(SegFetch {
                 id,
+                compaction: false,
                 from,
                 req,
                 have: 0,
@@ -1253,7 +1373,7 @@ impl<R: Runtime> Replica<R> {
             )
             .await;
         }
-        Ok(())
+        self.drive_compactions().await
     }
 
     /// A snapshot fetch whose requests or chunks were lost would wait forever (chaos campaign,
@@ -1304,9 +1424,11 @@ impl<R: Runtime> Replica<R> {
             || !self.cfg.peers.contains(&pref)
             || self.raft.transferring_to().is_some()
             || self.ticks < self.flush.next_handover
-            || self.flush.building.is_some()
+            || self.busy()
             || self.fetch.is_some()
+            || self.flush.own_compaction.is_some()
             || !self.engine.store().pending_flushes().is_empty()
+            || !self.engine.store().pending_compactions().is_empty()
         {
             return;
         }
@@ -1345,30 +1467,66 @@ impl<R: Runtime> Replica<R> {
             }
             self.holds_slot = true;
         }
-        let Some(mut job) = self.engine.store().flush_job(id) else {
+        let Some(job) = self.engine.store().flush_job(id) else {
             self.release_slot();
             return Ok(());
         };
         self.flush.building = Some(id);
-        let schema = self.engine.schema().clone();
+        let (path, schema, version) = self.engine.store().segment_write_params(id);
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,
             parallel: self.cfg.build_parallel.clone(),
         };
         let inbox = self.inbox.clone();
         let rt = self.rt.clone();
+        let generation = job.generation;
+        // Build on a helper thread, write from a task of its own: the actor keeps serving Raft
+        // (a long write on the actor delayed heartbeats and cost leaderships, ADR 0021).
         self.rt.spawn(async move {
-            let docs = std::mem::take(&mut job.docs);
+            let docs = job.docs;
+            let schema2 = schema.clone();
             let (docs, sections) = rt
                 .offload(move || {
-                    let sections = Store::<R>::build_sections(&schema, &docs, &indexer);
+                    let sections = Store::<R>::build_sections(&schema2, &docs, &indexer);
                     (docs, sections)
                 })
                 .await;
-            job.docs = docs;
-            inbox.push(Event::FlushBuilt(job, sections));
+            let file = match sections {
+                Ok(sections) => {
+                    cairn_storage::store::write_segment_file(
+                        rt.clone(),
+                        &path,
+                        &schema,
+                        version,
+                        &docs,
+                        &sections,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+            inbox.push(Event::FlushWritten {
+                id,
+                generation,
+                file,
+            });
         });
         Ok(())
+    }
+
+    /// Proposes a merge built here (leader).
+    fn propose_merge(&mut self, id: SegmentId, inputs: Vec<SegmentId>, file: (u64, u64)) {
+        let cmd = Command::CompactCommit {
+            id,
+            inputs: inputs.clone(),
+            len: file.0,
+            hash: file.1,
+            from: self.cfg.id,
+        };
+        if self.raft.propose(cmd.to_bytes()).is_ok() {
+            self.flush.own_compaction = Some((id, file, self.raft.term()));
+            tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, ?inputs, "compaction proposed");
+        }
     }
 
     /// After a segment was published: reload indexes, compact the Raft log to the manifest,
@@ -1490,6 +1648,16 @@ impl<R: Runtime> Replica<R> {
         }
         self.retry_stalled_snapshot_fetch().await;
         self.maybe_hand_over_leadership();
+        // Files of segments replaced by a compaction outlive them for a while: a follower or a
+        // snapshot install may still be fetching them.
+        let grace = RETIRED_GRACE_ELECTIONS * u64::from(self.cfg.election_ticks.max(1));
+        while let Some(&(id, at)) = self.flush.retired.front() {
+            if self.ticks - at < grace {
+                break;
+            }
+            self.flush.retired.pop_front();
+            self.engine.store().purge_segment_files(id).await?;
+        }
         // A stalled segment fetch falls back to a local build.
         let stall = FETCH_STALL_ELECTIONS * u64::from(self.cfg.election_ticks.max(1));
         if self
@@ -1521,29 +1689,58 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
+    /// Leader only (ADR 0021): picks a compaction per policy and builds it; the result is
+    /// proposed as a `CompactCommit` and installed everywhere when applied. One compaction at
+    /// a time: none while another is committed but not installed, or proposed but not
+    /// committed.
     async fn maybe_compact_job(&mut self) -> Result<()> {
-        if self.busy() || self.fetch.is_some() {
+        if self.raft.role() != Role::Leader
+            || self.busy()
+            || self.fetch.is_some()
+            || self.flush.own_compaction.is_some()
+            || !self.engine.store().pending_compactions().is_empty()
+            // A new leader waits until every entry of earlier terms is applied: a merge the old
+            // leader committed is then pending here and fetched, not merged again.
+            || self.engine.store().applied_index() < self.raft.lead_start()
+        {
             return Ok(());
         }
+        let Some(inputs) = self.engine.store().select_compaction() else {
+            return Ok(());
+        };
+        // The same merge built here before and lost with a leadership change: propose that file
+        // again (a commit with a known id is ignored, so a late duplicate is harmless).
+        if let Some((last_inputs, id, file)) = self.flush.last_merge.clone()
+            && last_inputs == inputs
+            && !self.engine.store().compaction_accepted(id)
+        {
+            let (built, _, _) = self.engine.store().segment_write_params(id);
+            let path = built.trim_end_matches(".built").to_owned();
+            if self.rt.disk().exists(&path).await? {
+                self.propose_merge(id, inputs, file);
+                return Ok(());
+            }
+        }
+        let id = self.engine.store_mut().reserve_compaction_id().await?;
+        self.start_compaction_build(id, inputs)
+    }
+
+    /// Builds the merged segment `id` from `inputs` (their rows live now): rows are read, the
+    /// indexes built and the file written outside the actor.
+    fn start_compaction_build(&mut self, id: SegmentId, inputs: Vec<SegmentId>) -> Result<()> {
+        let Some((sources, _)) = self.engine.store().compaction_sources(&inputs) else {
+            return Ok(());
+        };
         if let Some(slots) = &self.cfg.compaction_slots {
             if !slots.try_acquire() {
                 return Ok(());
             }
             self.holds_slot = true;
         }
-        let job = match self.engine.store_mut().begin_compact().await {
-            Ok(Some(job)) => job,
-            Ok(None) => {
-                self.release_slot();
-                return Ok(());
-            }
-            Err(e) => {
-                self.release_slot();
-                return Err(e);
-            }
-        };
-        tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, inputs = ?job.inputs, rows = job.docs.len(), "compaction started");
-        let schema = self.engine.schema().clone();
+        tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, ?inputs, "compaction build started");
+        self.flush.compacting = Some(id);
+        let (path, schema, version) = self.engine.store().segment_write_params(id);
+        let generation = self.engine.store().generation();
         let indexer = DefaultIndexer {
             vector: self.cfg.engine.vector,
             parallel: self.cfg.build_parallel.clone(),
@@ -1551,27 +1748,140 @@ impl<R: Runtime> Replica<R> {
         let inbox = self.inbox.clone();
         let rt = self.rt.clone();
         self.rt.spawn(async move {
-            let (job, sections) = rt
-                .offload(move || {
-                    let sections = Store::<R>::build_sections(&schema, &job.docs, &indexer);
-                    (job, sections)
-                })
-                .await;
-            inbox.push(Event::CompactBuilt(job, sections));
+            let file = async {
+                let docs = cairn_storage::store::read_compaction_rows(rt.clone(), &sources).await?;
+                let schema2 = schema.clone();
+                let (docs, sections) = rt
+                    .offload(move || {
+                        let sections = Store::<R>::build_sections(&schema2, &docs, &indexer);
+                        (docs, sections)
+                    })
+                    .await;
+                cairn_storage::store::write_segment_file(
+                    rt.clone(),
+                    &path,
+                    &schema,
+                    version,
+                    &docs,
+                    &sections?,
+                )
+                .await
+            }
+            .await;
+            inbox.push(Event::CompactWritten {
+                id,
+                inputs,
+                generation,
+                file,
+            });
         });
         Ok(())
     }
 
-    async fn start_fetch(&mut self, s: Snapshot) -> Result<()> {
+    /// Moves committed compactions towards installation (ADR 0021), oldest first: installs
+    /// when the file is here and the inputs are published; otherwise the leader (or a
+    /// follower falling back, or every replica without shipping) builds it, and a follower
+    /// fetches it from the leader.
+    async fn drive_compactions(&mut self) -> Result<()> {
+        if let Some((_, _, term)) = self.flush.own_compaction
+            && term != self.raft.term()
+        {
+            // Leadership changed: the proposal may never commit. If it does, the file is
+            // fetched or rebuilt like any other.
+            self.flush.own_compaction = None;
+        }
+        loop {
+            let pending = self.engine.store().pending_compactions();
+            let Some((c, has_file, inputs_ready)) = pending.first().cloned() else {
+                return Ok(());
+            };
+            if !has_file
+                && let Some((id, file, _)) = self.flush.own_compaction
+                && id == c.id
+            {
+                self.engine.store_mut().set_compaction_file(id, file);
+                self.flush.own_compaction = None;
+                continue;
+            }
+            if has_file && inputs_ready {
+                let n = self.engine.store_mut().install_compactions().await?;
+                if n > 0 {
+                    self.after_compaction_install().await?;
+                    continue;
+                }
+                return Ok(());
+            }
+            if !inputs_ready || has_file {
+                // Earlier flushes still to publish here.
+                return Ok(());
+            }
+            let fetching = self.flush.fetch.as_ref().is_some_and(|f| f.id == c.id);
+            // From the node that built it, whoever leads now; here if it is ours (a restart
+            // lost the file), without shipping, or after a failed fetch.
+            let local = !self.cfg.ship_segments
+                || self.flush.fallback.contains(&c.id)
+                || c.from == self.cfg.id;
+            if local && !fetching {
+                if !self.busy() && self.flush.compacting != Some(c.id) {
+                    self.start_compaction_build(c.id, c.inputs.clone())?;
+                }
+            } else if self.flush.fetch.is_none() {
+                let from = c.from;
+                let req = self.next_read;
+                self.next_read += 1;
+                self.flush.fetch = Some(SegFetch {
+                    id: c.id,
+                    compaction: true,
+                    from,
+                    req,
+                    have: 0,
+                    progress_tick: self.ticks,
+                });
+                self.send(
+                    from,
+                    FrameBody::FetchFile {
+                        req,
+                        path: seg_rel(c.id),
+                        offset: 0,
+                    },
+                )
+                .await;
+            }
+            return Ok(());
+        }
+    }
+
+    /// After merged segments were installed: reload indexes, and offer lagging followers a
+    /// snapshot that references the new files.
+    async fn after_compaction_install(&mut self) -> Result<()> {
+        let ticks = self.ticks;
+        let retired = self.engine.store_mut().take_retired();
+        self.flush
+            .retired
+            .extend(retired.into_iter().map(|id| (id, ticks)));
+        self.engine.refresh().await?;
+        let up_to = self.engine.store().manifest().applied_index;
+        if up_to > LogIndex(0) {
+            let term = self.manifest_term();
+            self.compact_raft_log(Snapshot {
+                last_index: up_to,
+                last_term: term,
+                data: self.engine.store().manifest_bytes(),
+            });
+        }
+        self.maybe_compact_job().await
+    }
+
+    async fn start_fetch(&mut self, s: Snapshot, source: Option<NodeId>) -> Result<()> {
         let m: cairn_storage::ShardManifest = ManifestStore::<R>::decode(&s.data)?;
         let needed = self.engine.store().snapshot_files_needed(&m);
-        // The leader, or (after a restart, leader unknown) another peer; a stalled fetch
-        // switches source.
+        // The node that sent the snapshot: its files match its manifest (the same segment id
+        // may hold other bytes elsewhere). Older pending snapshots name no sender: the
+        // leader, or another peer; a mismatch then makes the snapshot stale.
         let me = self.cfg.id;
-        let from = self
-            .raft
-            .leader()
+        let from = source
             .filter(|l| *l != me)
+            .or_else(|| self.raft.leader().filter(|l| *l != me))
             .or_else(|| self.cfg.peers.iter().copied().find(|p| *p != me))
             .unwrap_or(me);
         tracing::info!(node = %self.cfg.id, %from, last_index = %s.last_index, segments = ?m.segments.iter().map(|x| x.id.get()).collect::<Vec<_>>(), "fetching snapshot");
@@ -1639,22 +1949,10 @@ impl<R: Runtime> Replica<R> {
         } else if total == u64::MAX {
             // A segment, or the deletion checkpoint of a segment, that is gone on the server
             // (compacted away): the snapshot is stale. A local checkpoint for a reused file
-            // would miss deletions, so none may be assumed. Drop the snapshot and the log after
-            // it, and reopen from disk so the leader ships a fresh one. The entries after it
-            // were acknowledged: until the log is back to them, this node must not vote (Raft's
-            // vote barrier).
-            if self.raft.last_index() > self.state.vote_barrier {
-                self.state.vote_barrier = self.raft.last_index();
-                self.state.vote_barrier_term = self.raft.last_log_term();
-            }
-            self.state_store.store(&self.state).await?;
-            let pending = format!("{}/SNAPSHOT", self.cfg.dir);
-            if self.rt.disk().exists(&pending).await? {
-                self.rt.disk().remove(&pending).await?;
-            }
-            return Err(Error::Internal(format!(
-                "snapshot file {path} vanished on the leader"
-            )));
+            // would miss deletions, so none may be assumed.
+            return self
+                .drop_stale_snapshot(format!("snapshot file {path} vanished on the leader"))
+                .await;
         } else if offset == have {
             // Stream to the staging file: a catch-up never holds whole segments in memory.
             let len = data.len() as u64;
@@ -1706,17 +2004,25 @@ impl<R: Runtime> Replica<R> {
         let Some(f) = self.flush.fetch.as_ref() else {
             return Ok(());
         };
-        let (id, req, have) = (f.id, f.req, f.have);
+        let (id, req, have, compaction) = (f.id, f.req, f.have, f.compaction);
         if f.from != from || path != seg_rel(id) || offset != have {
             return Ok(());
         }
-        let expected = self
-            .engine
-            .store()
-            .pending_flushes()
-            .into_iter()
-            .find(|p| p.id == id)
-            .and_then(|p| p.commit);
+        let expected = if compaction {
+            self.engine
+                .store()
+                .pending_compactions()
+                .into_iter()
+                .find(|(c, _, _)| c.id == id)
+                .map(|(c, _, _)| (c.len, c.hash))
+        } else {
+            self.engine
+                .store()
+                .pending_flushes()
+                .into_iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.commit)
+        };
         let Some((len, _)) = expected else {
             self.flush.fetch = None;
             return Ok(());
@@ -1755,7 +2061,15 @@ impl<R: Runtime> Replica<R> {
         }
         self.flush.fetch = None;
         self.engine.store().sync_fetched(&staging).await?;
-        if self.engine.store_mut().install_fetched_flush(id).await? {
+        let installed = if compaction {
+            self.engine
+                .store_mut()
+                .install_fetched_compaction(id)
+                .await?
+        } else {
+            self.engine.store_mut().install_fetched_flush(id).await?
+        };
+        if installed {
             self.flush.fetched += 1;
             tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, bytes = have, "segment fetched");
         } else {
@@ -1763,6 +2077,22 @@ impl<R: Runtime> Replica<R> {
             self.flush.fallback.insert(id);
         }
         self.drive_flushes().await
+    }
+
+    /// Drops the accepted snapshot and the log after it, and reopens from disk so the leader
+    /// ships a fresh one. The entries after it were acknowledged: until the log is back to
+    /// them, this node must not vote for a candidate without them (Raft's vote barrier).
+    async fn drop_stale_snapshot(&mut self, why: String) -> Result<()> {
+        if self.raft.last_index() > self.state.vote_barrier {
+            self.state.vote_barrier = self.raft.last_index();
+            self.state.vote_barrier_term = self.raft.last_log_term();
+        }
+        self.state_store.store(&self.state).await?;
+        let pending = format!("{}/SNAPSHOT", self.cfg.dir);
+        if self.rt.disk().exists(&pending).await? {
+            self.rt.disk().remove(&pending).await?;
+        }
+        Err(Error::Internal(why))
     }
 
     async fn finish_fetch(&mut self) -> Result<()> {
@@ -1782,10 +2112,17 @@ impl<R: Runtime> Replica<R> {
             .filter(|p| f.got.contains(p))
             .cloned()
             .collect();
-        self.engine
+        match self
+            .engine
             .store_mut()
             .install_snapshot(&f.manifest, files)
-            .await?;
+            .await
+        {
+            Err(Error::Internal(m)) if m.starts_with(cairn_storage::store::SNAPSHOT_MISMATCH) => {
+                return self.drop_stale_snapshot(m).await;
+            }
+            r => r?,
+        }
         // Installed: the manifest now holds it.
         let pending = format!("{}/SNAPSHOT", self.cfg.dir);
         if self.rt.disk().exists(&pending).await? {

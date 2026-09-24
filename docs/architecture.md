@@ -217,3 +217,7 @@ Deviations from the sketch above, all recorded in the ADR outcomes:
 - **Leader balancing** (ADR 0020, 2026-09-24): Raft leadership transfer (`TimeoutNow`); each
   shard's first host in the placement is its preferred leader, and a leader hands over to it
   once it is caught up. The shard manifest records the term of its applied index.
+- **Compaction through the log** (ADR 0021, 2026-09-25): the leader picks, builds and proposes
+  each merge (`CompactCommit`); every replica installs it when applied, fetching the file from
+  its builder. Acceptance is decided against the log-defined segment list, so all replicas
+  hold the same segments. Segment files are read and written outside the replica actor.

@@ -161,17 +161,20 @@ pub fn offload<T: Send + 'static>(
     let (slot, inner) = Slot::new();
     completer.begin();
     let c = completer.clone();
-    std::thread::spawn(move || {
-        let v = work();
-        let inner2 = inner.clone();
-        c.complete(Box::new(move || {
-            let mut g = inner2.lock().expect("slot poisoned");
-            g.value = Some(v);
-            if let Some(w) = g.waker.take() {
-                w.wake();
-            }
-        }));
-    });
+    std::thread::Builder::new()
+        .name("offload".into())
+        .spawn(move || {
+            let v = work();
+            let inner2 = inner.clone();
+            c.complete(Box::new(move || {
+                let mut g = inner2.lock().expect("slot poisoned");
+                g.value = Some(v);
+                if let Some(w) = g.waker.take() {
+                    w.wake();
+                }
+            }));
+        })
+        .expect("spawn offload");
     slot
 }
 

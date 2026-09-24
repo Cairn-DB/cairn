@@ -51,7 +51,10 @@ impl Parallel for ThreadParallel {
         std::thread::scope(|s| {
             for w in 1..workers {
                 let work = &work;
-                s.spawn(move || work(w));
+                std::thread::Builder::new()
+                    .name("build-w".into())
+                    .spawn_scoped(s, move || work(w))
+                    .expect("spawn build worker");
             }
             work(0);
         });

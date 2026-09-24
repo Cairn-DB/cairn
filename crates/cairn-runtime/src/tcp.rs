@@ -35,12 +35,12 @@ const MAX_FRAME: usize = 64 << 20;
 
 /// Wire protocol version this build speaks: node and client frames, Raft messages, commands in
 /// the log, file shipping. Bump on any incompatible change (ADR 0018). Version 1 was the
-/// unversioned protocol (4-byte hello) before ADR 0018. Version 3 adds the Raft `TimeoutNow`
-/// message (ADR 0020); a version-2 node ignores it (its leadership transfer times out), so
-/// version 2 stays accepted.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// unversioned protocol (4-byte hello) before ADR 0018; version 3 added the Raft `TimeoutNow`
+/// message (ADR 0020); version 4 adds the `CompactCommit` command and the builder in
+/// `FlushCommit` (ADR 0021), which older nodes cannot decode.
+pub const PROTOCOL_VERSION: u32 = 4;
 /// Oldest protocol version this build still accepts from peers and clients.
-pub const PROTOCOL_MIN: u32 = 2;
+pub const PROTOCOL_MIN: u32 = 4;
 
 /// Writes one frame (one write call: one TLS record for small frames).
 pub fn write_frame(w: &mut impl Write, kind: u8, req: u64, payload: &[u8]) -> std::io::Result<()> {
@@ -241,7 +241,9 @@ impl TcpNetwork {
                 }
                 let Ok(stream) = stream else { continue };
                 let s2 = s.clone();
-                std::thread::spawn(move || Self::serve_connection(s2, stream));
+                let _ = std::thread::Builder::new()
+                    .name("net-in".into())
+                    .spawn(move || Self::serve_connection(s2, stream));
             }
         });
         Ok(TcpNetwork { shared })
@@ -377,7 +379,9 @@ impl TcpNetwork {
         qs.insert(to, q.clone());
         let shared = self.shared.clone();
         let q2 = q.clone();
-        std::thread::spawn(move || Self::writer_loop(shared, to, q2));
+        let _ = std::thread::Builder::new()
+            .name("net-out".into())
+            .spawn(move || Self::writer_loop(shared, to, q2));
         q
     }
 

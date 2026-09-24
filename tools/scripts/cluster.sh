@@ -18,7 +18,7 @@ case "${1:-}" in
       if [ -n "${CAIRN_TLS_DIR:-}" ]; then
         TLS="--tls-ca $CAIRN_TLS_DIR/ca.pem --tls-cert $CAIRN_TLS_DIR/node$i.pem --tls-key $CAIRN_TLS_DIR/node$i.key"
       fi
-      MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2} RUST_LOG=${RUST_LOG:-warn} nohup target/release/cairn-server --node-id $i --listen 127.0.0.1:710$i $PEERS \
+      MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-2} RUST_LOG=${RUST_LOG:-warn} nohup ${CAIRN_SERVER_BIN:-target/release/cairn-server} --node-id $i --listen 127.0.0.1:710$i $PEERS \
         --data "$DATA/node$i" --schema "$SCHEMA" --shards "$SHARDS" --cores "$CORES" --memtable-bytes "$MEM" --max-segments "$MAXSEG" ${CAIRN_SERVER_FLAGS:-} $TLS --tick-ms 50 \
         > "$DATA/node$i.log" 2>&1 &
       echo $! >> "$PIDFILE"

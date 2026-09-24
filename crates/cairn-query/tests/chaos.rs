@@ -516,7 +516,10 @@ fn run(seed: u64) -> (usize, usize, u64) {
     }
     *stop.borrow_mut() = true;
     let h = ex.handle();
-    ex.block_on(h.sleep(Duration::from_secs(5)));
+    // 15 s (was 5): since ADR 0021 a replica that comes back late fetches every merged segment
+    // it missed, one at a time, where it used to rebuild them (instant in simulated time).
+    // Seeds 16167, 20616, 40964 and 57668 converged between 5 and 15 s.
+    ex.block_on(h.sleep(Duration::from_secs(15)));
     // Convergence: same applied index and same documents everywhere.
     let statuses: Vec<_> = ex.block_on({
         let hs = handles.clone();
@@ -577,6 +580,18 @@ fn run(seed: u64) -> (usize, usize, u64) {
         }
         f.set(t);
     });
+    // Segment lists (ADR 0021): the log decides flushes and merges, so replicas with nothing
+    // left to install hold the same segments.
+    if statuses.iter().all(|s| s.flushes[2] == 0) {
+        assert!(
+            statuses.iter().all(|s| s.segments == statuses[0].segments),
+            "seed {seed}: replicas hold different segments: {:?}",
+            statuses
+                .iter()
+                .map(|s| s.segments.clone())
+                .collect::<Vec<_>>()
+        );
+    }
     let hist = history.borrow();
     let (reads, checked) = check(&hist);
     let writes = hist
