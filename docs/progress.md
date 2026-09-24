@@ -208,6 +208,8 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     certificate-less clients, versions, negotiation, 3 MB frames), format contract test,
     three-process cluster test over mTLS, manual check with openssl certificates, campaign
     20k seeds zero violations, 99 workspace tests.
+  - TLS cost (bench-results/phase4-adr0018-tls.md, 2 alternating runs each, 2M rows): +22%
+    total CPU; ingest, recall, takedown latency unchanged within noise.
   - Limits (ADR 0018): no revocation (CRL) or hot rotation, no authorization, no connection
     limits, no feature gating by cluster protocol version yet.
 
