@@ -63,6 +63,19 @@ struct Cli {
     /// (ADR 0016).
     #[arg(long)]
     no_ship_segments: bool,
+    /// Cluster CA certificate (PEM). With --tls-cert and --tls-key, every connection uses
+    /// mutual TLS (ADR 0018). Without them the node runs in plaintext (development only).
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+    /// This node's certificate chain (PEM), valid for `node-<id>.cairn`.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// This node's private key (PEM, PKCS#8).
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+    /// Let application clients connect without a certificate (peers always need one).
+    #[arg(long)]
+    tls_anonymous_clients: bool,
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
@@ -84,6 +97,20 @@ fn main() -> anyhow::Result<()> {
     let schema: Schema =
         serde_json::from_slice(&std::fs::read(&cli.schema).context("reading schema")?)
             .context("parsing schema")?;
+    let tls = match (&cli.tls_ca, &cli.tls_cert, &cli.tls_key) {
+        (Some(ca), Some(cert), Some(key)) => Some(
+            cairn_runtime::tls::NodeTls::from_pem_files(ca, cert, key, cli.tls_anonymous_clients)
+                .context("loading TLS material")?,
+        ),
+        (None, None, None) => {
+            eprintln!(
+                "WARNING: no --tls-ca/--tls-cert/--tls-key: node traffic and client traffic are \
+                 plaintext and unauthenticated (development only)"
+            );
+            None
+        }
+        _ => anyhow::bail!("--tls-ca, --tls-cert and --tls-key go together"),
+    };
     let node = Node::start(NodeConfig {
         id: NodeId(cli.node_id),
         listen: cli.listen,
@@ -102,6 +129,7 @@ fn main() -> anyhow::Result<()> {
         compaction_slots: cli.compaction_slots,
         idle_flush_ms: cli.idle_flush_ms,
         ship_segments: !cli.no_ship_segments,
+        tls,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
     })?;

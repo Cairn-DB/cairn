@@ -18,7 +18,11 @@ libc = "0.2"
 slab.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# mTLS between nodes (ADR 0018): rustls with the ring backend (no cmake), webpki for node identity.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 proptest.workspace = true
 loom.workspace = true

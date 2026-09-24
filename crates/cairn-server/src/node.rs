@@ -56,6 +56,8 @@ pub struct NodeConfig {
     pub idle_flush_ms: u64,
     /// Followers fetch leader-built segments instead of building them (ADR 0016).
     pub ship_segments: bool,
+    /// mTLS for all connections (ADR 0018); `None`: plaintext (development only).
+    pub tls: Option<cairn_runtime::tls::NodeTls>,
     /// Raft tick in milliseconds.
     pub tick_ms: u64,
     /// Message drop probability (tests).
@@ -204,6 +206,8 @@ impl Node {
                     listen: cfg.listen,
                     peers: cfg.peers.iter().map(|(k, v)| (*k, *v)).collect(),
                     drop_prob: cfg.drop_prob,
+                    tls: cfg.tls.clone(),
+                    segment_version_max: cairn_storage::segment::SEGMENT_VERSION,
                 },
                 ex.reactor().completer(),
             );
@@ -460,13 +464,17 @@ impl Node {
             return Err(Error::InvalidRequest(format!("unknown node {node}")));
         };
         let bytes = Request::Forwarded(Box::new(req)).to_bytes();
+        let tls = cfg.tls.as_ref().map(|t| t.client.clone());
         offload(&rt.completer(), move || {
             let conn = {
                 let mut m = peer_conns().lock().expect("peer conns");
                 match m.get(&node) {
                     Some(c) => c.clone(),
                     None => {
-                        let c = Arc::new(ClientConn::connect(addr)?);
+                        let c = Arc::new(ClientConn::connect_with(
+                            addr,
+                            tls.as_ref().map(|t| (t, node)),
+                        )?);
                         m.insert(node, c.clone());
                         c
                     }

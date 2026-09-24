@@ -18,8 +18,26 @@ use xxhash_rust::xxh3::Xxh3;
 
 const MAGIC: &[u8; 8] = b"CRNSEG01";
 const MAGIC_TAIL: &[u8; 8] = b"CRNSEGEN";
-/// Segment container version. Bump on any layout change (ADR 0004).
+/// Newest segment format version this build writes and reads. The version covers the container
+/// and the encoding of every section (vector, text, structured, disk index): any change that an
+/// older reader cannot decode bumps it (ADR 0004, ADR 0018).
 pub const SEGMENT_VERSION: u32 = 1;
+/// Oldest segment format version this build reads.
+pub const SEGMENT_VERSION_MIN_READ: u32 = 1;
+/// Oldest segment format version this build can still write, so that a cluster in the middle
+/// of a rolling upgrade keeps writing what its oldest member reads.
+pub const SEGMENT_VERSION_MIN_WRITE: u32 = 1;
+
+/// The segment format a node writes, given the lowest format its peers read (`None` until
+/// every peer has said hello): the newest this build writes that every peer reads, never older
+/// than this build can write. A peer that reads only older formats than
+/// `SEGMENT_VERSION_MIN_WRITE` cannot be served and must be upgraded first.
+pub fn negotiated_segment_version(peers_max: Option<u32>) -> u32 {
+    match peers_max {
+        Some(p) => p.clamp(SEGMENT_VERSION_MIN_WRITE, SEGMENT_VERSION),
+        None => SEGMENT_VERSION_MIN_WRITE,
+    }
+}
 /// Section alignment.
 pub const PAGE: u64 = 4096;
 const TAIL_LEN: u64 = 4 + 4 + 8;
@@ -54,12 +72,24 @@ pub struct SegmentWriter<R: Runtime> {
 }
 
 impl<R: Runtime> SegmentWriter<R> {
-    /// Starts writing `path` (written as `path.tmp` and renamed on finish).
+    /// Starts writing `path` in the newest format (written as `path.tmp` and renamed on finish).
     pub async fn create(rt: R, path: &str) -> Result<Self> {
+        Self::create_version(rt, path, SEGMENT_VERSION).await
+    }
+
+    /// Starts writing `path` in format `version` (between `SEGMENT_VERSION_MIN_WRITE` and
+    /// `SEGMENT_VERSION`).
+    pub async fn create_version(rt: R, path: &str, version: u32) -> Result<Self> {
+        if !(SEGMENT_VERSION_MIN_WRITE..=SEGMENT_VERSION).contains(&version) {
+            return Err(Error::UnsupportedVersion {
+                found: version,
+                supported: SEGMENT_VERSION,
+            });
+        }
         let tmp_path = format!("{path}.tmp");
         let file = rt.disk().open(&tmp_path, OpenMode::CreateTruncate).await?;
         let mut header = Writer::with_capacity(PAGE as usize);
-        header.raw(MAGIC).u32(SEGMENT_VERSION).u32(0);
+        header.raw(MAGIC).u32(version).u32(0);
         debug_assert_eq!(header.len(), HEADER_LEN);
         header.raw(&vec![0u8; PAGE as usize - HEADER_LEN]);
         let mut hasher = Xxh3::new();
@@ -153,7 +183,7 @@ impl<R: Runtime> SegmentReader<R> {
             return Err(Error::corruption(format!("segment {path}: bad magic")));
         }
         let version = r.u32()?;
-        if version != SEGMENT_VERSION {
+        if !(SEGMENT_VERSION_MIN_READ..=SEGMENT_VERSION).contains(&version) {
             return Err(Error::UnsupportedVersion {
                 found: version,
                 supported: SEGMENT_VERSION,
@@ -435,5 +465,51 @@ mod tests {
                 "cut at {cut}"
             );
         }
+    }
+
+    /// ADR 0018: readers accept exactly the supported range, writers write only versions this
+    /// build can write, and the negotiated version never exceeds what every peer reads.
+    #[test]
+    fn format_versions_are_a_contract() {
+        assert_eq!(negotiated_segment_version(None), SEGMENT_VERSION_MIN_WRITE);
+        assert_eq!(negotiated_segment_version(Some(u32::MAX)), SEGMENT_VERSION);
+        assert_eq!(
+            negotiated_segment_version(Some(0)),
+            SEGMENT_VERSION_MIN_WRITE
+        );
+        assert!(negotiated_segment_version(Some(SEGMENT_VERSION)) <= SEGMENT_VERSION);
+        let (sim, mut ex) = Simulation::new(3, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            assert!(
+                SegmentWriter::create_version(rt.clone(), "x.seg", SEGMENT_VERSION + 1)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                SegmentWriter::create_version(rt.clone(), "x.seg", SEGMENT_VERSION_MIN_WRITE - 1)
+                    .await
+                    .is_err()
+            );
+            let mut w = SegmentWriter::create_version(rt.clone(), "v.seg", SEGMENT_VERSION)
+                .await
+                .unwrap();
+            w.add_section("docids", b"abc").await.unwrap();
+            w.finish().await.unwrap();
+            assert!(SegmentReader::open(rt.clone(), "v.seg").await.is_ok());
+            // The version field sits after the 8-byte magic.
+            let f = rt.disk().open("v.seg", OpenMode::ReadWrite).await.unwrap();
+            for v in [SEGMENT_VERSION + 1, SEGMENT_VERSION_MIN_READ - 1] {
+                rt.disk()
+                    .write_at(&f, 8, bytes::Bytes::copy_from_slice(&v.to_le_bytes()))
+                    .await
+                    .unwrap();
+                match SegmentReader::open(rt.clone(), "v.seg").await {
+                    Err(Error::UnsupportedVersion { found, .. }) => assert_eq!(found, v),
+                    Err(e) => panic!("version {v}: unexpected error {e}"),
+                    Ok(_) => panic!("version {v} must be refused"),
+                }
+            }
+        });
     }
 }

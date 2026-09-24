@@ -198,13 +198,25 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     ids carry the node id, FileChunk and PreVoteResp gained a field. Old shard dirs must be
     reloaded (flush ids are log indexes now).
 
+- Step 6 of ADR 0016 (2026-09-24, owner: "vas-y pour l'etape 6"): ADR 0018.
+  - Hello v2 with protocol version (2; the old 4-byte hello is refused, so upgrading needs one
+    full restart) and the newest segment format a node reads; nodes write the negotiated format.
+  - mTLS (rustls + ring; certificates for node-<id>.cairn; `--tls-*` server flags,
+    `--tls-anonymous-clients`, bench `--tls-*`, `CAIRN_TLS_DIR` in cluster.sh,
+    tools/scripts/gen-certs.sh with openssl).
+  - Evidence: 9 transport tests (identity forgery with control, foreign CA, plaintext and
+    certificate-less clients, versions, negotiation, 3 MB frames), format contract test,
+    three-process cluster test over mTLS, manual check with openssl certificates, campaign
+    20k seeds zero violations, 99 workspace tests.
+  - Limits (ADR 0018): no revocation (CRL) or hot rotation, no authorization, no connection
+    limits, no feature gating by cluster protocol version yet.
+
 ## Next step
-ADR 0016 steps 1-2 delivered 2026-09-24. Before production (owner's goal), in order: step 6
-(versioned segment-format contract + mTLS between nodes; required for rolling upgrades and
-for accepting files from peers), step 3 (parallel build on the leader), step 5 (leader
-balancing: build load now concentrates on leaders), step 4 (compaction through the log).
-Other open levers: scan threshold for large segments (filtered linearizable p99 missed by 8% at
-50M), segment publication off the actor, dynamic membership.
+ADR 0016 steps 1-2 and 6 delivered 2026-09-24. Remaining toward production, in order:
+step 3 (parallel build on the leader), step 5 (leader balancing: build load concentrates on
+leaders), step 4 (compaction through the log); from ADR 0018: CRL / certificate rotation,
+authorization, connection limits. Other levers: scan threshold for large segments (filtered
+linearizable p99 missed by 8% at 50M), segment publication off the actor, dynamic membership.
 
 ## Old next step
 M2.1 kernels (compile, test, bench, commit), then M2.2 vector search: HNSW (deterministic build,
@@ -229,8 +241,8 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
   it catches up; if another replica of the shard is down at the same time, the shard has no
   leader until it returns. Safe, but a double fault stalls the shard.
 - Build load concentrates on leaders (ADR 0016); no leader balancing yet.
-- The segment format is now a cluster contract with no version negotiation: all nodes must run
-  the same build.
+- Security limits of ADR 0018: no certificate revocation or hot rotation, no authorization
+  (any client certificate may write and take down), no connection limits.
 
 ## Log
 - 2026-09-22 (end): Phases 3 and 4 closed. Real-cluster bugs: cross-thread wake did not

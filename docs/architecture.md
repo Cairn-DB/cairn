@@ -206,3 +206,8 @@ Deviations from the sketch above, all recorded in the ADR outcomes:
   the segment id); the leader builds and proposes `FlushCommit { id, len, hash }`; followers
   fetch the file, check it and publish it in freeze order. A follower builds the segment itself
   if the fetch fails, as the fallback. Compaction is still local to each replica.
+- **Transport security and versions** (ADR 0018, 2026-09-24): every connection opens with a
+  hello carrying the protocol version (and, for nodes, the newest segment format they read);
+  incompatible peers are refused. Nodes write the newest segment format all peers read. With
+  `--tls-ca/--tls-cert/--tls-key`, all traffic is mutual TLS (rustls); a node proves its id with
+  a certificate for `node-<id>.cairn` from the cluster CA.

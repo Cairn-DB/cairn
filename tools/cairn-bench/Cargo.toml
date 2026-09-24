@@ -15,6 +15,7 @@ cairn-core = { path = "../../crates/cairn-core" }
 cairn-index = { path = "../../crates/cairn-index" }
 cairn-bench-gen = { path = "../cairn-bench-gen" }
 cairn-client = { path = "../../crates/cairn-client" }
+cairn-runtime = { path = "../../crates/cairn-runtime" }
 cairn-query = { path = "../../crates/cairn-query" }
 anyhow.workspace = true
 bytes.workspace = true

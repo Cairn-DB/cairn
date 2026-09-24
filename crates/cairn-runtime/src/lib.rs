@@ -10,6 +10,7 @@ pub mod executor;
 pub mod pool;
 pub mod reactor;
 pub mod tcp;
+pub mod tls;
 
 pub use cross::{CrossQueue, CrossReceiver, CrossSender, cross_oneshot};
 pub use executor::{Executor, Handle, RunOutcome};

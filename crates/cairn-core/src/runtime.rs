@@ -105,6 +105,12 @@ pub trait Network {
     fn queue_stats(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// Lowest segment format version any peer reads, once every peer has announced it
+    /// (ADR 0018); `None` before, or where the transport does not negotiate (the simulator).
+    fn peer_segment_version(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Everything engine code may ask of its environment.

@@ -237,6 +237,8 @@ pub struct Store<R: Runtime> {
     job_active: bool,
     /// Namespace of this replica's compaction ids (see `COMPACT_NS_SHIFT`).
     compact_ns: u64,
+    /// Segment format version new segments are written in (ADR 0018).
+    segment_version: u32,
     /// Bumped whenever the store's state is replaced (snapshot install): a build that began
     /// before must be discarded, or it would publish pre-snapshot rows under a segment id the
     /// snapshot may already use.
@@ -366,6 +368,7 @@ impl<R: Runtime> Store<R> {
             masked_during_build: cairn_core::HashSet::default(),
             job_active: false,
             compact_ns: 0,
+            segment_version: crate::segment::SEGMENT_VERSION,
             generation: 0,
             memtable_version: 0,
             segments_version: 0,
@@ -399,6 +402,13 @@ impl<R: Runtime> Store<R> {
     /// id; at most 2^22 - 1).
     pub fn set_compaction_namespace(&mut self, ns: u64) {
         self.compact_ns = ns & ((1 << (62 - COMPACT_NS_SHIFT)) - 1);
+    }
+
+    /// Sets the segment format version of segments written from now on (a replicated shard
+    /// passes the version negotiated with its peers, see
+    /// [`crate::segment::negotiated_segment_version`]).
+    pub fn set_segment_version(&mut self, version: u32) {
+        self.segment_version = version;
     }
 
     /// Abandons the compaction in progress (its output is not written): a replica installing a
@@ -670,7 +680,12 @@ impl<R: Runtime> Store<R> {
             return Ok(None);
         }
         let refs: Vec<&Document> = job.docs.iter().collect();
-        let mut w = SegmentWriter::create(self.rt.clone(), &seg_path(&self.dir, job.id)).await?;
+        let mut w = SegmentWriter::create_version(
+            self.rt.clone(),
+            &seg_path(&self.dir, job.id),
+            self.segment_version,
+        )
+        .await?;
         write_columns(&mut w, &self.manifest.schema, &refs).await?;
         for (name, bytes) in &sections {
             w.add_section(name, bytes).await?;
@@ -974,7 +989,8 @@ impl<R: Runtime> Store<R> {
         let range = first..first + job.inputs.len();
         let refs: Vec<&Document> = job.docs.iter().collect();
         let path = seg_path(&self.dir, job.id);
-        let mut w = SegmentWriter::create(self.rt.clone(), &path).await?;
+        let mut w =
+            SegmentWriter::create_version(self.rt.clone(), &path, self.segment_version).await?;
         write_columns(&mut w, &self.manifest.schema, &refs).await?;
         for (name, bytes) in &sections {
             w.add_section(name, bytes).await?;

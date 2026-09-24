@@ -3,11 +3,18 @@
 //! surfaced separately through [`TcpNetwork::client_recv`] and answered with
 //! [`TcpNetwork::client_reply`].
 //!
-//! Frame: `u32 length | u8 kind | u64 request id | payload`. Kinds: 0 hello (payload: `u32` node
-//! id, or `u32::MAX` for a client), 1 node message, 2 client request, 3 client response.
+//! Frame: `u32 length | u8 kind | u64 request id | payload`. Kinds: 0 hello, 1 node message,
+//! 2 client request, 3 client response. Hello payload (ADR 0018): a node sends
+//! `u32 node id | u32 protocol version | u32 highest segment format it reads`; a client sends
+//! `u32::MAX | u32 protocol version`. A connection whose protocol version is outside
+//! [`PROTOCOL_MIN`, `PROTOCOL_VERSION`] is closed.
+//!
+//! With TLS configured ([`crate::tls`]), every connection is TLS; a node hello must come with a
+//! certificate valid for that node's name.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::pool::Completer;
+use crate::tls::{Channel, ChannelReader, ChannelWriter, ClientTls, NodeTls};
 use bytes::Bytes;
 use cairn_core::error::IoErrorKind;
 use cairn_core::{Error, Network, NodeId, Result};
@@ -26,16 +33,88 @@ const KIND_CLIENT_REQ: u8 = 2;
 const KIND_CLIENT_RESP: u8 = 3;
 const MAX_FRAME: usize = 64 << 20;
 
-/// Writes one frame.
+/// Wire protocol version this build speaks: node and client frames, Raft messages, commands in
+/// the log, file shipping. Bump on any incompatible change (ADR 0018). Version 1 was the
+/// unversioned protocol (4-byte hello) before ADR 0018.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Oldest protocol version this build still accepts from peers and clients.
+pub const PROTOCOL_MIN: u32 = 2;
+
+/// Writes one frame (one write call: one TLS record for small frames).
 pub fn write_frame(w: &mut impl Write, kind: u8, req: u64, payload: &[u8]) -> std::io::Result<()> {
     let len = (1 + 8 + payload.len()) as u32;
-    let mut head = [0u8; 13];
-    head[..4].copy_from_slice(&len.to_le_bytes());
-    head[4] = kind;
-    head[5..13].copy_from_slice(&req.to_le_bytes());
-    w.write_all(&head)?;
-    w.write_all(payload)?;
+    let mut buf = Vec::with_capacity(13 + payload.len());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.push(kind);
+    buf.extend_from_slice(&req.to_le_bytes());
+    buf.extend_from_slice(payload);
+    w.write_all(&buf)?;
     w.flush()
+}
+
+/// A parsed hello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hello {
+    /// A peer node: its id, protocol version and highest segment format it reads.
+    Node {
+        /// Node id.
+        id: NodeId,
+        /// Protocol version.
+        protocol: u32,
+        /// Highest segment format version it can read.
+        segment_max: u32,
+    },
+    /// An application client.
+    Client {
+        /// Protocol version.
+        protocol: u32,
+    },
+}
+
+impl Hello {
+    /// Encodes the payload.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(12);
+        match self {
+            Hello::Node {
+                id,
+                protocol,
+                segment_max,
+            } => {
+                v.extend_from_slice(&id.get().to_le_bytes());
+                v.extend_from_slice(&protocol.to_le_bytes());
+                v.extend_from_slice(&segment_max.to_le_bytes());
+            }
+            Hello::Client { protocol } => {
+                v.extend_from_slice(&u32::MAX.to_le_bytes());
+                v.extend_from_slice(&protocol.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    /// Decodes a payload; `None` for anything malformed, including the 4-byte hello of
+    /// protocol version 1.
+    pub fn decode(p: &[u8]) -> Option<Hello> {
+        let u = |i: usize| u32::from_le_bytes(p[i..i + 4].try_into().expect("4 bytes"));
+        match p.len() {
+            8 if u(0) == u32::MAX => Some(Hello::Client { protocol: u(4) }),
+            12 if u(0) != u32::MAX => Some(Hello::Node {
+                id: NodeId(u(0)),
+                protocol: u(4),
+                segment_max: u(8),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this build can talk to the sender.
+    pub fn compatible(&self) -> bool {
+        let p = match self {
+            Hello::Node { protocol, .. } | Hello::Client { protocol } => *protocol,
+        };
+        (PROTOCOL_MIN..=PROTOCOL_VERSION).contains(&p)
+    }
 }
 
 /// Reads one frame: `(kind, request id, payload)`.
@@ -93,6 +172,10 @@ pub struct TcpNetworkConfig {
     pub peers: HashMap<NodeId, SocketAddr>,
     /// Fraction of node messages to drop (tests only).
     pub drop_prob: f64,
+    /// TLS for every connection (`None`: plaintext, development only).
+    pub tls: Option<NodeTls>,
+    /// Highest segment format version this node reads, advertised to peers.
+    pub segment_version_max: u32,
 }
 
 /// Bytes a peer's send queue may hold. Beyond it messages are dropped: node traffic is Raft
@@ -112,7 +195,9 @@ type PeerQueue = Arc<(Mutex<PendingOut>, std::sync::Condvar)>;
 struct Shared {
     node_inbox: Mutex<Inbox<(NodeId, Bytes)>>,
     client_inbox: Mutex<Inbox<ClientRequest>>,
-    client_conns: Mutex<HashMap<u64, Arc<Mutex<TcpStream>>>>,
+    client_conns: Mutex<HashMap<u64, Arc<Mutex<ChannelWriter>>>>,
+    /// Highest segment format each peer advertised in its hello.
+    peer_formats: Mutex<HashMap<NodeId, u32>>,
     peer_queues: Mutex<HashMap<NodeId, PeerQueue>>,
     completer: Completer,
     cfg: TcpNetworkConfig,
@@ -136,6 +221,7 @@ impl TcpNetwork {
             node_inbox: Mutex::new(Inbox::new()),
             client_inbox: Mutex::new(Inbox::new()),
             client_conns: Mutex::new(HashMap::new()),
+            peer_formats: Mutex::new(HashMap::new()),
             peer_queues: Mutex::new(HashMap::new()),
             completer,
             cfg,
@@ -183,46 +269,101 @@ impl TcpNetwork {
         }));
     }
 
-    fn serve_connection(shared: Arc<Shared>, mut stream: TcpStream) {
+    fn serve_connection(shared: Arc<Shared>, stream: TcpStream) {
         let _ = stream.set_nodelay(true);
-        let Ok((kind, _, hello)) = read_frame(&mut stream) else {
+        let peer_addr = stream.peer_addr().ok();
+        let chan = match &shared.cfg.tls {
+            Some(tls) => match tls.accept(stream) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(?peer_addr, "rejected connection: {e}");
+                    return;
+                }
+            },
+            None => Channel::plain(stream),
+        };
+        let tls_on = chan.is_tls();
+        // The hello is read before splitting: a node hello is checked against the certificate.
+        let (mut reader, writer) = match chan.split() {
+            Ok(rw) => rw,
+            Err(_) => return,
+        };
+        let Ok((kind, _, hello)) = read_frame(&mut reader) else {
             return;
         };
-        if kind != KIND_HELLO || hello.len() != 4 {
-            return;
-        }
-        let who = u32::from_le_bytes(hello[..4].try_into().expect("4 bytes"));
-        if who == u32::MAX {
-            // Client connection.
-            let conn = shared.next_conn.fetch_add(1, Ordering::SeqCst);
-            let writer = Arc::new(Mutex::new(stream.try_clone().expect("clone stream")));
-            shared
-                .client_conns
-                .lock()
-                .expect("conns")
-                .insert(conn, writer);
-            while let Ok((kind, req, payload)) = read_frame(&mut stream) {
-                if kind == KIND_CLIENT_REQ {
-                    Self::wake_inbox(
-                        &shared,
-                        &shared.client_inbox,
-                        ClientRequest {
-                            conn,
-                            req,
-                            payload: Bytes::from(payload),
-                        },
-                    );
+        let hello = match (kind, Hello::decode(&hello)) {
+            (KIND_HELLO, Some(h)) if h.compatible() => h,
+            (_, h) => {
+                tracing::warn!(
+                    ?peer_addr,
+                    ?h,
+                    "rejected connection: bad or incompatible hello (this build speaks protocol {PROTOCOL_MIN}..={PROTOCOL_VERSION})"
+                );
+                return;
+            }
+        };
+        match hello {
+            Hello::Client { .. } => {
+                let conn = shared.next_conn.fetch_add(1, Ordering::SeqCst);
+                let writer = Arc::new(Mutex::new(writer));
+                shared
+                    .client_conns
+                    .lock()
+                    .expect("conns")
+                    .insert(conn, writer);
+                while let Ok((kind, req, payload)) = read_frame(&mut reader) {
+                    if kind == KIND_CLIENT_REQ {
+                        Self::wake_inbox(
+                            &shared,
+                            &shared.client_inbox,
+                            ClientRequest {
+                                conn,
+                                req,
+                                payload: Bytes::from(payload),
+                            },
+                        );
+                    }
+                }
+                shared.client_conns.lock().expect("conns").remove(&conn);
+            }
+            Hello::Node {
+                id: from,
+                segment_max,
+                ..
+            } => {
+                if tls_on && !reader.peer_is_node(from) {
+                    tracing::warn!(?peer_addr, node = %from, "rejected connection: certificate is not valid for the claimed node");
+                    return;
+                }
+                if !shared.cfg.peers.contains_key(&from) {
+                    tracing::warn!(?peer_addr, node = %from, "rejected connection: not a configured peer");
+                    return;
+                }
+                drop(writer);
+                shared
+                    .peer_formats
+                    .lock()
+                    .expect("formats")
+                    .insert(from, segment_max);
+                while let Ok((kind, _, payload)) = read_frame(&mut reader) {
+                    if kind == KIND_NODE {
+                        Self::wake_inbox(&shared, &shared.node_inbox, (from, Bytes::from(payload)));
+                    }
                 }
             }
-            shared.client_conns.lock().expect("conns").remove(&conn);
-        } else {
-            let from = NodeId(who);
-            while let Ok((kind, _, payload)) = read_frame(&mut stream) {
-                if kind == KIND_NODE {
-                    Self::wake_inbox(&shared, &shared.node_inbox, (from, Bytes::from(payload)));
-                }
-            }
         }
+    }
+
+    fn peer_formats_min(&self) -> Option<u32> {
+        let formats = self.shared.peer_formats.lock().expect("formats");
+        let mut min = u32::MAX;
+        for p in self.shared.cfg.peers.keys() {
+            if *p == self.shared.cfg.id {
+                continue;
+            }
+            min = min.min(*formats.get(p)?);
+        }
+        Some(min)
     }
 
     fn peer_queue(&self, to: NodeId) -> PeerQueue {
@@ -243,7 +384,7 @@ impl TcpNetwork {
         let Some(addr) = shared.cfg.peers.get(&to).copied() else {
             return;
         };
-        let mut stream: Option<TcpStream> = None;
+        let mut stream: Option<ChannelWriter> = None;
         loop {
             if shared.stopped.load(Ordering::SeqCst) {
                 return;
@@ -266,21 +407,10 @@ impl TcpNetwork {
             };
             for _attempt in 0..2 {
                 if stream.is_none() {
-                    match TcpStream::connect_timeout(&addr, StdDuration::from_millis(500)) {
-                        Ok(mut s) => {
-                            let _ = s.set_nodelay(true);
-                            if write_frame(
-                                &mut s,
-                                KIND_HELLO,
-                                0,
-                                &shared.cfg.id.get().to_le_bytes(),
-                            )
-                            .is_ok()
-                            {
-                                stream = Some(s);
-                            }
-                        }
-                        Err(_) => {
+                    match Self::dial_peer(&shared, addr, to) {
+                        Ok(w) => stream = Some(w),
+                        Err(e) => {
+                            tracing::debug!(peer = %to, "connect failed: {e}");
                             std::thread::sleep(StdDuration::from_millis(50));
                             continue;
                         }
@@ -295,6 +425,27 @@ impl TcpNetwork {
             }
             // Best effort: a message that could not be sent is dropped (Raft retries).
         }
+    }
+
+    /// Connects to peer `to`, handshakes (TLS if configured) and sends the node hello.
+    fn dial_peer(shared: &Shared, addr: SocketAddr, to: NodeId) -> Result<ChannelWriter> {
+        let s = TcpStream::connect_timeout(&addr, StdDuration::from_millis(500))
+            .map_err(|e| Error::io(IoErrorKind::Unreachable, e))?;
+        let _ = s.set_nodelay(true);
+        let chan = match &shared.cfg.tls {
+            Some(tls) => tls.client.connect(s, to)?,
+            None => Channel::plain(s),
+        };
+        // The read half is dropped: node connections carry traffic one way.
+        let (_reader, mut writer) = chan.split()?;
+        let hello = Hello::Node {
+            id: shared.cfg.id,
+            protocol: PROTOCOL_VERSION,
+            segment_max: shared.cfg.segment_version_max,
+        };
+        write_frame(&mut writer, KIND_HELLO, 0, &hello.encode())
+            .map_err(|e| Error::io(IoErrorKind::Other, e))?;
+        Ok(writer)
     }
 
     /// Next client request (server side).
@@ -330,6 +481,11 @@ impl TcpNetwork {
 }
 
 impl Network for TcpNetwork {
+    /// Lowest segment format version any configured peer reads, once every peer has said hello.
+    fn peer_segment_version(&self) -> Option<u32> {
+        self.peer_formats_min()
+    }
+
     fn queue_stats(&self) -> (u64, u64) {
         let out: u64 = self
             .shared
@@ -395,24 +551,35 @@ impl Network for TcpNetwork {
 
 /// A client-side connection: sends requests and reads responses on a reader thread.
 pub struct ClientConn {
-    writer: Mutex<TcpStream>,
+    writer: Mutex<ChannelWriter>,
     pending: Arc<Mutex<HashMap<u64, std::sync::mpsc::Sender<Bytes>>>>,
     next_req: AtomicU64,
 }
 
 impl ClientConn {
-    /// Connects and sends the client hello.
+    /// Connects in plaintext and sends the client hello.
     pub fn connect(addr: SocketAddr) -> Result<Self> {
-        let mut s = TcpStream::connect_timeout(&addr, StdDuration::from_secs(2))
+        Self::connect_with(addr, None)
+    }
+
+    /// Connects to node `node` at `addr`, over TLS when `tls` is given, and sends the client
+    /// hello.
+    pub fn connect_with(addr: SocketAddr, tls: Option<(&ClientTls, NodeId)>) -> Result<Self> {
+        let s = TcpStream::connect_timeout(&addr, StdDuration::from_secs(2))
             .map_err(|e| Error::io(IoErrorKind::Unreachable, e))?;
         let _ = s.set_nodelay(true);
-        write_frame(&mut s, KIND_HELLO, 0, &u32::MAX.to_le_bytes())
+        let chan = match tls {
+            Some((tls, node)) => tls.connect(s, node)?,
+            None => Channel::plain(s),
+        };
+        let (mut reader, mut writer): (ChannelReader, ChannelWriter) = chan.split()?;
+        let hello = Hello::Client {
+            protocol: PROTOCOL_VERSION,
+        };
+        write_frame(&mut writer, KIND_HELLO, 0, &hello.encode())
             .map_err(|e| Error::io(IoErrorKind::Other, e))?;
         let pending: Arc<Mutex<HashMap<u64, std::sync::mpsc::Sender<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let mut reader = s
-            .try_clone()
-            .map_err(|e| Error::io(IoErrorKind::Other, e))?;
         let p2 = pending.clone();
         std::thread::spawn(move || {
             while let Ok((kind, req, payload)) = read_frame(&mut reader) {
@@ -425,7 +592,7 @@ impl ClientConn {
             p2.lock().expect("pending").clear();
         });
         Ok(ClientConn {
-            writer: Mutex::new(s),
+            writer: Mutex::new(writer),
             pending,
             next_req: AtomicU64::new(1),
         })

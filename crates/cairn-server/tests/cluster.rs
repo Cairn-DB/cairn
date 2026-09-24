@@ -90,6 +90,42 @@ fn start(id: u32, addrs: &[(u32, SocketAddr)], data: &Path, schema_path: &Path) 
     start_with(id, addrs, data, schema_path, 4, 0)
 }
 
+/// Writes a CA, one certificate per node (`node-<id>.cairn`) and a client certificate as PEM
+/// files under `dir/tls` (ADR 0018), and returns the client's TLS settings.
+fn write_tls_material(dir: &Path, nodes: u32) -> cairn_runtime::tls::ClientTls {
+    let tls = dir.join("tls");
+    std::fs::create_dir_all(&tls).unwrap();
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    p.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = p.self_signed(&ca_key).unwrap();
+    std::fs::write(tls.join("ca.pem"), ca.pem()).unwrap();
+    let issue = |name: &str, file: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        p.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = p.signed_by(&key, &ca, &ca_key).unwrap();
+        std::fs::write(tls.join(format!("{file}.pem")), cert.pem()).unwrap();
+        std::fs::write(tls.join(format!("{file}.key")), key.serialize_pem()).unwrap();
+    };
+    for i in 1..=nodes {
+        issue(&format!("node-{i}.cairn"), &format!("node{i}"));
+    }
+    issue("client.cairn", "client");
+    cairn_runtime::tls::ClientTls::from_pem_files(
+        &tls.join("ca.pem"),
+        Some((&tls.join("client.pem"), &tls.join("client.key"))),
+    )
+    .unwrap()
+}
+
 fn start_with(
     id: u32,
     addrs: &[(u32, SocketAddr)],
@@ -119,6 +155,15 @@ fn start_with(
         .arg("20");
     for (i, a) in addrs {
         cmd.arg("--peer").arg(format!("{i}={a}"));
+    }
+    let tls = data.join("tls");
+    if tls.exists() {
+        cmd.arg("--tls-ca")
+            .arg(tls.join("ca.pem"))
+            .arg("--tls-cert")
+            .arg(tls.join(format!("node{id}.pem")))
+            .arg("--tls-key")
+            .arg(tls.join(format!("node{id}.key")));
     }
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
@@ -169,9 +214,25 @@ fn wait_applied_equal(clients: &mut [Client], shards: usize) {
 
 #[test]
 fn three_process_cluster() {
-    let dir = std::env::temp_dir().join(format!("cairn-cluster-{}", std::process::id()));
+    three_process_cluster_with(false);
+}
+
+/// The same scenario with mutual TLS on every connection (ADR 0018).
+#[test]
+fn three_process_cluster_over_mtls() {
+    three_process_cluster_with(true);
+}
+
+fn three_process_cluster_with(tls: bool) {
+    let dir = std::env::temp_dir().join(format!(
+        "cairn-cluster-{}-{}",
+        std::process::id(),
+        if tls { "tls" } else { "plain" }
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let client_tls = tls.then(|| write_tls_material(&dir, 3));
+    let new_client = |m: HashMap<NodeId, SocketAddr>| Client::new(m).with_tls(client_tls.clone());
     let schema_path = dir.join("schema.json");
     std::fs::write(&schema_path, serde_json::to_vec(&schema()).unwrap()).unwrap();
     let addrs: Vec<(u32, SocketAddr)> = (1..=3).map(|i| (i, free_port())).collect();
@@ -180,11 +241,11 @@ fn three_process_cluster() {
         .map(|(i, _)| Some(start(*i, &addrs, &dir, &schema_path)))
         .collect();
     let map: HashMap<NodeId, SocketAddr> = addrs.iter().map(|(i, a)| (NodeId(*i), *a)).collect();
-    let mut client = Client::new(map.clone());
+    let mut client = new_client(map.clone());
     wait_ready(&mut client);
     std::thread::sleep(Duration::from_secs(2));
     for (i, a) in &addrs {
-        let mut c = Client::new([(NodeId(*i), *a)].into_iter().collect());
+        let mut c = new_client([(NodeId(*i), *a)].into_iter().collect());
         let st = c.status().unwrap();
         eprintln!(
             "node {i}: {:?}",
@@ -256,12 +317,12 @@ fn three_process_cluster() {
     assert!(hits.iter().all(|h| h.doc_id != DocId(45)));
 
     // Kill node 2, keep writing, restart it, and check it converges and serves.
-    let mut clients: Vec<Client> = (1..=3).map(|_| Client::new(map.clone())).collect();
+    let mut clients: Vec<Client> = (1..=3).map(|_| new_client(map.clone())).collect();
     for (i, c) in clients.iter_mut().enumerate() {
         c.max_attempts = 3;
         let mut only = HashMap::default();
         only.insert(NodeId(i as u32 + 1), map[&NodeId(i as u32 + 1)]);
-        *c = Client::new(only);
+        *c = new_client(only);
     }
     wait_applied_equal(&mut clients, 4);
     procs[1] = None;
@@ -271,7 +332,7 @@ fn three_process_cluster() {
     }
     client.delete(vec![DocId(5)]).unwrap();
     procs[1] = Some(start(2, &addrs, &dir, &schema_path));
-    let mut c2 = Client::new([(NodeId(2), map[&NodeId(2)])].into_iter().collect());
+    let mut c2 = new_client([(NodeId(2), map[&NodeId(2)])].into_iter().collect());
     wait_ready(&mut c2);
     wait_applied_equal(&mut clients, 4);
     assert_eq!(

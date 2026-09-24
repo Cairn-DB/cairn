@@ -29,6 +29,15 @@ use std::time::Instant;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Cluster CA (PEM): connect to the nodes over TLS (ADR 0018).
+    #[arg(long, global = true)]
+    tls_ca: Option<PathBuf>,
+    /// Client certificate (PEM), for nodes that require one.
+    #[arg(long, global = true, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// Client private key (PEM, PKCS#8).
+    #[arg(long, global = true, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -513,7 +522,15 @@ fn chrono_free_date() -> String {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    if let Some(ca) = &cli.tls_ca {
+        let identity = cli.tls_cert.as_deref().zip(cli.tls_key.as_deref());
+        cairn_client::set_default_tls(Some(
+            cairn_runtime::tls::ClientTls::from_pem_files(ca, identity)
+                .map_err(|e| anyhow::anyhow!("loading TLS material: {e}"))?,
+        ));
+    }
+    match cli.cmd {
         Cmd::SiftSweep {
             dir,
             n,

@@ -1381,6 +1381,12 @@ impl<R: Runtime> Replica<R> {
     /// Background upkeep on ticks: flush an idle memtable, and retry a compaction that was
     /// waiting for a free slot.
     async fn on_idle_tick(&mut self) -> Result<()> {
+        // Write only a segment format every peer reads (ADR 0018): peers announce theirs when
+        // they connect, and a rolling upgrade switches formats once the last one did.
+        let v = cairn_storage::segment::negotiated_segment_version(
+            self.rt.network().peer_segment_version(),
+        );
+        self.engine.store_mut().set_segment_version(v);
         // Held-back proposals are retried on every tick, not only after a flush: a replica that
         // lost leadership while holding them would otherwise keep clients waiting until their
         // timeout (seen on GCP). On a follower, `propose` fails them with a leader hint.

@@ -7,8 +7,21 @@ use cairn_core::{DocId, Document, Error, HashMap, NodeId, Result};
 use cairn_proto::{Request, Response};
 use cairn_query::{Consistency, Hit, Query, ReplicaStatus, Token};
 use cairn_runtime::tcp::ClientConn;
+use cairn_runtime::tls::ClientTls;
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+fn default_tls_slot() -> &'static Mutex<Option<ClientTls>> {
+    static SLOT: OnceLock<Mutex<Option<ClientTls>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Sets the TLS settings every [`Client::new`] in this process uses from now on (`None`:
+/// plaintext). Tools that create many clients set it once from their command line.
+pub fn set_default_tls(tls: Option<ClientTls>) {
+    *default_tls_slot().lock().expect("tls slot") = tls;
+}
 
 /// A connected client.
 pub struct Client {
@@ -16,6 +29,7 @@ pub struct Client {
     conns: HashMap<NodeId, ClientConn>,
     current: NodeId,
     tokens: HashMap<u32, Token>,
+    tls: Option<ClientTls>,
     /// Per-request timeout.
     pub timeout: Duration,
     /// Attempts across redirects and reconnects.
@@ -40,9 +54,17 @@ impl Client {
             conns: HashMap::default(),
             current,
             tokens: HashMap::default(),
+            tls: default_tls_slot().lock().expect("tls slot").clone(),
             timeout: Duration::from_secs(10),
             max_attempts: 40,
         }
+    }
+
+    /// Uses TLS (or plaintext with `None`) for connections opened from now on.
+    pub fn with_tls(mut self, tls: Option<ClientTls>) -> Self {
+        self.tls = tls;
+        self.conns.clear();
+        self
     }
 
     /// Node the client currently talks to.
@@ -62,7 +84,7 @@ impl Client {
             let addr = *self.addrs.get(&node).ok_or_else(|| {
                 Error::io(IoErrorKind::Unreachable, format!("unknown node {node}"))
             })?;
-            let c = ClientConn::connect(addr)?;
+            let c = ClientConn::connect_with(addr, self.tls.as_ref().map(|t| (t, node)))?;
             self.conns.insert(node, c);
         }
         Ok(self.conns.get(&node).expect("inserted"))
