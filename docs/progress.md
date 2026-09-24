@@ -187,6 +187,10 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     pre-vote responses carrying the responder's term.
   - Evidence: bench-results/phase4-adr0016-campaign.md (seeds 0..60000, zero violations,
     ~19 segments built and ~16 fetched per run); 89 workspace tests.
+  - A/B, 2M BigANN, local 3-node cluster (bench-results/phase4-adr0016-bigann2m-{ship,noship}.md):
+    total CPU 706 s vs 1666 s, ingest 16.6k vs 11.3k docs/s, recall and query p99 unchanged.
+    OPEN: takedown p99 177 ms with shipping vs 102 ms without (one run each, cause unknown;
+    re-measure before drawing conclusions).
   - On-disk/wire changes: RAFT file +2 fields (old files decode), new SNAPSHOT file, compaction
     ids carry the node id, FileChunk and PreVoteResp gained a field. Old shard dirs must be
     reloaded (flush ids are log indexes now).
