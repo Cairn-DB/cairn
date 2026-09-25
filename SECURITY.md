@@ -6,6 +6,9 @@ Please **do not open a public issue**. Use GitHub's private vulnerability report
 repository, open *Security → Report a vulnerability*. Include the version or commit, a
 description, and a reproduction if you have one. A simulator seed is ideal.
 
+If you cannot use GitHub, write to **contact@cairn-db.com** with "SECURITY" in the subject.
+Do not include exploit details until we have agreed on a private channel.
+
 You will get an acknowledgement within 5 working days. Once a fix is ready, we agree on a
 disclosure date together, and credit you unless you prefer otherwise.
 

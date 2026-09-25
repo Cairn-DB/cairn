@@ -8,6 +8,6 @@ project space: issues, pull requests, discussions and chats.
 
 ## Reporting
 
-Report unacceptable behavior to the maintainers at **conduct@TO-BE-SET** (the address is
-being set up). Reports are kept confidential. Maintainers apply the Covenant's enforcement
+Report unacceptable behavior to the maintainers at **contact@cairn-db.com**, with
+"Code of conduct" in the subject. Reports are kept confidential. Maintainers apply the Covenant's enforcement
 guidelines: correction, warning, temporary ban, permanent ban.

@@ -66,8 +66,8 @@ priorities, in order:
 - **Before publishing** (checklist):
   - done 2026-09-25: LICENSE (Apache-2.0 text), CONTRIBUTING (the project's rules, and a DCO
     sign-off instead of a CLA: less friction for occasional contributors), SECURITY (GitHub
-    private reporting), CODE_OF_CONDUCT (Contributor Covenant 2.1; the contact address is
-    still to be set). Still to set: the repository URL in `Cargo.toml`, once the organization
+    private reporting), CODE_OF_CONDUCT (Contributor Covenant 2.1; contact: contact@cairn-db.com,
+    the project domain registered by the owner). Still to set: the repository URL in `Cargo.toml`, once the organization
     exists;
   - done 2026-09-25 in the current files: the names of the owner's other servers and cloud
     projects removed from `docs/` and `tools/scripts/` (the GCP project is now read from
