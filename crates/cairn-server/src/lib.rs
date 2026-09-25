@@ -3,6 +3,7 @@
 //! fans requests out to shards and merges the answers (per-leg merge then fusion, ADR 0007).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+pub mod http;
 pub mod node;
 
 pub use node::{Node, NodeConfig};

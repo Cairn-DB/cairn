@@ -6,6 +6,8 @@
 #   CAIRN_SCHEMA   schema JSON (default /etc/cairn/schema.json)
 #   CAIRN_SHARDS   shards (default 4); CAIRN_CORES executor threads (default: all CPUs)
 #   CAIRN_TLS_DIR  directory from tools/scripts/gen-certs.sh: ca.pem, node<id>.pem, node<id>.key
+#   CAIRN_HTTP_LISTEN  HTTP/JSON API address (default 0.0.0.0:7200; "off" disables it). With
+#                  CAIRN_TLS_DIR the API is off unless set, and needs CAIRN_HTTP_ALLOW_PLAINTEXT=1
 set -eu
 ID="${CAIRN_NODE_ID:-1}"
 LISTEN="${CAIRN_LISTEN:-0.0.0.0:7100}"
@@ -17,5 +19,11 @@ for p in $PEERS; do set -- "$@" --peer "$p"; done
 if [ -n "${CAIRN_TLS_DIR:-}" ]; then
   set -- "$@" --tls-ca "$CAIRN_TLS_DIR/ca.pem" \
     --tls-cert "$CAIRN_TLS_DIR/node$ID.pem" --tls-key "$CAIRN_TLS_DIR/node$ID.key"
+fi
+HTTP="${CAIRN_HTTP_LISTEN:-}"
+[ -z "$HTTP" ] && [ -z "${CAIRN_TLS_DIR:-}" ] && HTTP=0.0.0.0:7200
+if [ -n "$HTTP" ] && [ "$HTTP" != off ]; then
+  set -- "$@" --http-listen "$HTTP"
+  [ "${CAIRN_HTTP_ALLOW_PLAINTEXT:-0}" = 1 ] && set -- "$@" --http-allow-plaintext
 fi
 exec /usr/local/bin/cairn-server "$@"

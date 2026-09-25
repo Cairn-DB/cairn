@@ -3,7 +3,7 @@ services:
   cairn:
     build: { context: .., dockerfile: docker/Dockerfile }
     image: cairn:dev
-    ports: ["7100:7100"]
+    ports: ["7100:7100", "7200:7200"]
     volumes: ["cairn-data:/data"]
 volumes:
   cairn-data:

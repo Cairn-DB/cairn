@@ -797,6 +797,17 @@ impl Node {
                 }
                 let fused = if merged.is_empty() {
                     Vec::new()
+                } else if query.leg_count() == 0 {
+                    // A pure filter: each shard sent its first matches in id order.
+                    let mut ids: Vec<DocId> = merged
+                        .into_iter()
+                        .flat_map(|l| l.hits)
+                        .map(|h| h.0)
+                        .collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids.truncate(query.k);
+                    ids.into_iter().map(|d| (d, 0.0, Vec::new())).collect()
                 } else {
                     fuse(&query.fusion, &merged, query.k)
                 };

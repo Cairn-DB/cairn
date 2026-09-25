@@ -1,0 +1,204 @@
+openapi: 3.1.0
+info:
+  title: Cairn HTTP API
+  version: "0.1"
+  description: >
+    Hybrid search (vectors, BM25, filters) with a deletion guarantee: a takedown is final for
+    any read that passes its consistency token as `after`. See docs/api/http.md and ADR 0023.
+  license: { name: Apache-2.0, identifier: Apache-2.0 }
+servers:
+  - url: http://localhost:7200
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+  /v1/schema:
+    get:
+      summary: The collection schema
+      responses:
+        "200": { description: Schema, content: { application/json: { schema: { type: object } } } }
+  /v1/status:
+    get:
+      summary: Replicas hosted by the node answering
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replicas: { type: array, items: { $ref: "#/components/schemas/ReplicaStatus" } }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/documents:
+    post:
+      summary: Insert or replace documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [documents]
+              properties:
+                documents: { type: array, minItems: 1, items: { $ref: "#/components/schemas/Document" } }
+                after: { $ref: "#/components/schemas/Token" }
+      responses:
+        "200": { $ref: "#/components/responses/Ack" }
+        "400": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/documents/delete:
+    post:
+      summary: Take documents down
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, minItems: 1, items: { type: integer, minimum: 0 } }
+                after: { $ref: "#/components/schemas/Token" }
+      responses:
+        "200": { $ref: "#/components/responses/Ack" }
+        "400": { $ref: "#/components/responses/Error" }
+  /v1/documents/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: integer, minimum: 0 } }
+    get:
+      summary: Read one document
+      parameters:
+        - { $ref: "#/components/parameters/Consistency" }
+        - { $ref: "#/components/parameters/After" }
+      responses:
+        "200": { description: The document, content: { application/json: { schema: { $ref: "#/components/schemas/Document" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Take one document down
+      parameters:
+        - { $ref: "#/components/parameters/After" }
+      responses:
+        "200": { $ref: "#/components/responses/Ack" }
+  /v1/search:
+    post:
+      summary: Hybrid search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Search" }
+      responses:
+        "200":
+          description: Hits, best first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hits: { type: array, items: { $ref: "#/components/schemas/Hit" } }
+        "400": { $ref: "#/components/responses/Error" }
+components:
+  parameters:
+    Consistency:
+      name: consistency
+      in: query
+      schema: { $ref: "#/components/schemas/Consistency" }
+    After:
+      name: after
+      in: query
+      schema: { $ref: "#/components/schemas/Token" }
+  responses:
+    Ack:
+      description: Written
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              count: { type: integer }
+              consistency_token: { $ref: "#/components/schemas/Token" }
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { type: object, properties: { error: { type: string } } }
+  schemas:
+    Token:
+      type: string
+      description: Opaque consistency token (`shard.index,...`). Pass it back as `after`.
+    Consistency:
+      type: string
+      enum: [linearizable, read_your_writes, stale]
+    Document:
+      type: object
+      required: [id]
+      properties:
+        id: { type: integer, minimum: 0 }
+      additionalProperties: true
+      description: Fields keyed by schema name; see docs/api/http.md for the JSON type of each kind.
+    Filter:
+      type: object
+      description: >
+        {"and": [Filter]}, {"or": [Filter]}, {"not": Filter}, or
+        {"field": name, eq|in|gt|gte|lt|lte|is_null: value}.
+    Search:
+      type: object
+      properties:
+        k: { type: integer, minimum: 1, maximum: 10000, default: 10 }
+        vector: { $ref: "#/components/schemas/VectorLeg" }
+        vectors: { type: array, items: { $ref: "#/components/schemas/VectorLeg" } }
+        text:
+          type: object
+          required: [field, query]
+          properties:
+            field: { type: string }
+            query: { type: string }
+            all_terms: { type: boolean, default: false }
+        filter: { $ref: "#/components/schemas/Filter" }
+        fusion:
+          oneOf:
+            - { type: object, properties: { rrf: { type: object, properties: { k: { type: number } } } } }
+            - { type: object, properties: { weighted: { type: array, items: { type: number } } } }
+        oversample: { type: integer, minimum: 1, maximum: 64 }
+        with_documents: { type: boolean, default: true }
+        consistency: { $ref: "#/components/schemas/Consistency" }
+        after: { $ref: "#/components/schemas/Token" }
+    VectorLeg:
+      type: object
+      required: [field, values]
+      properties:
+        field: { type: string }
+        values: { type: array, items: { type: number } }
+        ef: { type: integer, minimum: 0, default: 0 }
+    Hit:
+      type: object
+      properties:
+        id: { type: integer }
+        score: { type: number }
+        legs:
+          type: array
+          items:
+            oneOf:
+              - type: "null"
+              - { type: object, properties: { rank: { type: integer }, score: { type: number } } }
+        document: { $ref: "#/components/schemas/Document" }
+    ReplicaStatus:
+      type: object
+      properties:
+        node: { type: integer }
+        role: { type: string, enum: [follower, precandidate, candidate, leader] }
+        term: { type: integer }
+        leader: { type: [integer, "null"] }
+        commit: { type: integer }
+        applied: { type: integer }
+        live_docs: { type: integer }
+        memtable_bytes: { type: integer }
+        raft_log_bytes: { type: integer }
+        segments: { type: array, items: { type: integer } }
+        segments_built: { type: integer }
+        segments_fetched: { type: integer }
+        pending: { type: integer }

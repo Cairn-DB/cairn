@@ -24,8 +24,18 @@ See [`SPEC.md`](SPEC.md) for goals, decisions, roadmap and success criteria, and
 
 ```bash
 docker build -f docker/Dockerfile -t cairn:dev .       # or podman
-docker run -p 7100:7100 -v cairn-data:/data cairn:dev  # one development node
-docker compose -f docker/compose.cluster.yaml up -d    # three replicated nodes (ports 7101-7103)
+docker run -p 7200:7200 -v cairn-data:/data cairn:dev  # one development node, HTTP on 7200
+docker compose -f docker/compose.cluster.yaml up -d    # three replicated nodes (HTTP 7201-7203)
+```
+
+Then, over the HTTP/JSON API ([docs/api/http.md](docs/api/http.md)):
+
+```bash
+curl -s 127.0.0.1:7200/v1/documents -H content-type:application/json \
+  -d '{"documents":[{"id":1,"text":"nuclear energy debate","source":"tv"}]}'
+# {"consistency_token":"2.2","count":1}
+curl -s 127.0.0.1:7200/v1/search -H content-type:application/json \
+  -d '{"text":{"field":"text","query":"nuclear"},"after":"2.2"}'
 ```
 
 Configuration is by environment variables (`CAIRN_NODE_ID`, `CAIRN_PEERS`, `CAIRN_SCHEMA`,

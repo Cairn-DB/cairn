@@ -86,6 +86,16 @@ struct Cli {
     /// Raft tick in milliseconds.
     #[arg(long, default_value_t = 50)]
     tick_ms: u64,
+    /// Serve the HTTP/JSON API on this address (ADR 0023). Off by default.
+    #[arg(long)]
+    http_listen: Option<SocketAddr>,
+    /// Allow the HTTP API on a node that uses mutual TLS. The HTTP port has no TLS and no
+    /// authentication: bind it to a trusted interface or put an authenticating proxy in front.
+    #[arg(long)]
+    http_allow_plaintext: bool,
+    /// Largest HTTP request body, in bytes.
+    #[arg(long, default_value_t = 64 << 20)]
+    http_max_body: usize,
     /// Drop this fraction of node messages (tests).
     #[arg(long, default_value_t = 0.0)]
     drop_prob: f64,
@@ -118,6 +128,25 @@ fn main() -> anyhow::Result<()> {
         }
         _ => anyhow::bail!("--tls-ca, --tls-cert and --tls-key go together"),
     };
+    let http_tls = match (&cli.http_listen, &tls) {
+        (Some(_), Some(_)) if !cli.http_allow_plaintext => anyhow::bail!(
+            "--http-listen serves plaintext without authentication, which would bypass mutual \
+             TLS: add --http-allow-plaintext to confirm (bind it to a trusted interface)"
+        ),
+        (Some(_), Some(_)) => Some(
+            cairn_runtime::tls::ClientTls::from_pem_files(
+                cli.tls_ca.as_deref().expect("checked"),
+                Some((
+                    cli.tls_cert.as_deref().expect("checked"),
+                    cli.tls_key.as_deref().expect("checked"),
+                )),
+            )
+            .context("loading TLS material for the HTTP API")?,
+        ),
+        _ => None,
+    };
+    let http_nodes = peers.clone();
+    let http_schema = schema.clone();
     let node = Node::start(NodeConfig {
         id: NodeId(cli.node_id),
         listen: cli.listen,
@@ -148,6 +177,16 @@ fn main() -> anyhow::Result<()> {
         node.addr(),
         node.cores()
     );
+    if let Some(listen) = cli.http_listen {
+        let addr = cairn_server::http::start(cairn_server::http::HttpConfig {
+            listen,
+            nodes: http_nodes,
+            schema: http_schema,
+            tls: http_tls,
+            max_body_bytes: cli.http_max_body,
+        })?;
+        eprintln!("cairn-server node {} serving HTTP on {addr}", node.id());
+    }
     node.join();
     Ok(())
 }

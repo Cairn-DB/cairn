@@ -287,6 +287,21 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Owner priorities: (1) 50M latency on real machines (GCP ready; needs the owner's explicit
     go for billing), (2) product: familiar UI, HTTP/JSON API, Python client, publication on
     GitHub/GHCR (checklist in ADR 0022).
+- 2026-09-25 (owner: go for the HTTP API; history rewrite, organization and contributor
+  docs approved; Hetzner approved):
+  - HTTP/JSON API, ADR 0023: axum in each node (`--http-listen`, port 7200 in Docker), with a
+    pooled binary client inside, a consistency token for read-your-writes, JSON filters,
+    `docs/api/http.md` and `openapi.yaml`. Found and fixed: filter-only search returned nothing
+    through the cluster. 114 tests; campaign 3,000 seeds OK.
+  - LICENSE, CONTRIBUTING (DCO), SECURITY, CODE_OF_CONDUCT (contact address TO SET).
+    Sensitive names removed from the files.
+  - History rewrite (e-mail to 193751724+FCHEHIDI@users.noreply.github.com, names removed
+    from old commits) and `git config user.email`: BLOCKED by the tool's permission
+    classifier (destructive git / identity change). The owner must run them; backup bundle
+    in data/backup/.
+  - Hetzner provisioning refused again: "dedicated core limit exceeded". Nothing created.
+    The owner is checking the quota, or an alternative provider.
+  - Podman lesson: `localhost` -> ::1 is reset by rootless port forwarding; use 127.0.0.1.
 
 ## Next step
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward

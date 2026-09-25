@@ -219,7 +219,12 @@ impl<R: Runtime> ShardEngine<R> {
     pub async fn query(&mut self, q: &Query) -> Result<Vec<Hit>> {
         let lists = self.query_legs(q).await?;
         let fused = if q.leg_count() == 0 {
-            self.filter_only(q).await?
+            // One list: the filter's matches in id order (see `query_legs`).
+            lists
+                .into_iter()
+                .flat_map(|l| l.hits)
+                .map(|(d, _)| (d, 0.0, Vec::new()))
+                .collect()
         } else {
             fuse(&q.fusion, &lists, q.k)
         };
@@ -268,6 +273,20 @@ impl<R: Runtime> ShardEngine<R> {
             return Ok(Vec::new());
         }
         self.refresh().await?;
+        if q.leg_count() == 0 {
+            // A pure filter: one list holding the first `k` matches in id order, which a
+            // coordinator merges across shards the same way.
+            let hits = self
+                .filter_only(q)
+                .await?
+                .into_iter()
+                .map(|(d, _, _)| (d, 0.0))
+                .collect();
+            return Ok(vec![LegList {
+                hits,
+                higher_is_better: true,
+            }]);
+        }
         let per_leg = q.per_leg();
         let n_legs = q.leg_count();
         let mut legs: Vec<Vec<(DocId, f32)>> = vec![Vec::new(); n_legs];

@@ -1,7 +1,8 @@
 # Cairn server image. Build from the repository root:
 #   podman build -f docker/Dockerfile -t cairn:dev .   (or docker build ...)
 # Run one development node:
-#   podman run -p 7100:7100 -v cairn-data:/data cairn:dev
+#   podman run -p 7200:7200 -p 7100:7100 -v cairn-data:/data cairn:dev
+# HTTP/JSON API on 7200 (ADR 0023), binary protocol on 7100.
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
@@ -23,5 +24,5 @@ COPY docker/entrypoint.sh /usr/local/bin/cairn-entrypoint
 COPY docker/schema.json /etc/cairn/schema.json
 USER cairn
 VOLUME /data
-EXPOSE 7100
+EXPOSE 7100 7200
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cairn-entrypoint"]
