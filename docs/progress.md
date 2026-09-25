@@ -304,6 +304,9 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Podman lesson: `localhost` -> ::1 is reset by rootless port forwarding; use 127.0.0.1.
 
 ## Next step
+Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
+end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
+tokens) and `forget-watch`, a deletion propagation monitor (verified vs observed sinks).
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward
 production: measure fetches over a real network; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
