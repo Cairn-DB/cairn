@@ -402,16 +402,29 @@ const NO_CHECKPOINT: u64 = u64::MAX - 1;
 
 /// A follower fetching a leader-built segment (ADR 0016).
 struct SegFetch {
-    id: SegmentId,
     /// A merged segment (ADR 0021) rather than a flushed one.
     compaction: bool,
     from: NodeId,
     req: u64,
+    /// File length, known from the first chunk.
+    total: Option<u64>,
+    /// Next offset to request.
+    next: u64,
+    /// Offsets requested and not received yet.
+    inflight: std::collections::BTreeSet<u64>,
     /// Bytes received so far.
-    have: u64,
-    /// Tick of the last chunk (or of the request).
+    got: u64,
+    /// Tick of the last chunk (or of the first request).
     progress_tick: u64,
+    /// Tick of the last re-request of the chunks in flight.
+    retry_tick: u64,
 }
+
+/// Segment files fetched at once (flushed or merged, ADR 0021): a replica that comes back
+/// late fetches what it missed in parallel instead of one file at a time.
+const MAX_SEG_FETCHES: usize = 4;
+/// Chunk requests in flight per fetched file (256 KiB each): no round trip per chunk.
+const FETCH_WINDOW: usize = 8;
 
 /// Files of segments replaced by a compaction are kept this many election timeouts (30 s at
 /// the server's 50 ms tick), so fetches and snapshot installs in flight can finish.
@@ -472,8 +485,8 @@ struct FlushState {
     /// Segments replaced by a compaction, with the tick they were retired: their files are
     /// purged after a grace period (ADR 0021).
     retired: std::collections::VecDeque<(SegmentId, u64)>,
-    /// Follower: the segment being fetched.
-    fetch: Option<SegFetch>,
+    /// Segments being fetched, by id (at most `MAX_SEG_FETCHES`).
+    fetches: std::collections::BTreeMap<SegmentId, SegFetch>,
     /// Freezes to build here although the leader ships them (fetch failed or never announced).
     fallback: std::collections::BTreeSet<SegmentId>,
     /// Tick at which each freeze was first seen without a commit.
@@ -1299,23 +1312,17 @@ impl<R: Runtime> Replica<R> {
         );
         self.flush.fallback.retain(|id| live.contains(id));
         self.flush.waiting_since.retain(|id, _| live.contains(id));
-        if self
-            .flush
-            .fetch
-            .as_ref()
-            .is_some_and(|f| !f.compaction && !live.contains(&f.id))
-        {
-            self.flush.fetch = None;
-        }
+        // Fetches of items published or replaced meanwhile are dropped.
+        self.flush.fetches.retain(|id, _| live.contains(id));
         let election = u64::from(self.cfg.election_ticks.max(1));
         let mut to_build = None;
-        let mut to_fetch = None;
+        let mut to_fetch: Vec<(SegmentId, NodeId)> = Vec::new();
         let me = self.cfg.id;
         for p in &pending {
             if p.has_file || p.empty {
                 continue;
             }
-            let fetching = self.flush.fetch.as_ref().is_some_and(|f| f.id == p.id);
+            let fetching = self.flush.fetches.contains_key(&p.id);
             // A committed file is fetched from the node that built it, whoever leads now (a
             // new leader included: rebuilding it was wasted work, and its followers then
             // asked it for a file it did not have yet). Built here: no commit yet and this
@@ -1331,8 +1338,8 @@ impl<R: Runtime> Replica<R> {
                 continue;
             }
             if let (Some(_), Some(src)) = (p.commit, p.commit_from) {
-                if to_fetch.is_none() && !fetching {
-                    to_fetch = Some((p.id, src));
+                if !fetching {
+                    to_fetch.push((p.id, src));
                 }
             } else if p.commit.is_none() {
                 let since = *self.flush.waiting_since.entry(p.id).or_insert(self.ticks);
@@ -1350,28 +1357,11 @@ impl<R: Runtime> Replica<R> {
         {
             self.start_flush_build(id)?;
         }
-        if let Some((id, from)) = to_fetch
-            && self.flush.fetch.is_none()
-        {
-            let req = self.next_read;
-            self.next_read += 1;
-            self.flush.fetch = Some(SegFetch {
-                id,
-                compaction: false,
-                from,
-                req,
-                have: 0,
-                progress_tick: self.ticks,
-            });
-            self.send(
-                from,
-                FrameBody::FetchFile {
-                    req,
-                    path: seg_rel(id),
-                    offset: 0,
-                },
-            )
-            .await;
+        for (id, from) in to_fetch {
+            if self.flush.fetches.len() >= MAX_SEG_FETCHES {
+                break;
+            }
+            self.start_seg_fetch(id, false, from).await?;
         }
         self.drive_compactions().await
     }
@@ -1448,12 +1438,52 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
-    /// Abandons the current segment fetch: the freeze is built here instead.
-    fn fetch_failed(&mut self, why: &str) {
-        if let Some(f) = self.flush.fetch.take() {
-            tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, id = %f.id, "segment fetch failed ({why}): building it here");
-            self.flush.fallback.insert(f.id);
+    /// Abandons the fetch of `id`: it is built here instead.
+    fn fetch_failed(&mut self, id: SegmentId, why: &str) {
+        if self.flush.fetches.remove(&id).is_some() {
+            tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "segment fetch failed ({why}): building it here");
+            self.flush.fallback.insert(id);
         }
+    }
+
+    /// Starts fetching segment `id` from `from`: the first chunk tells the length, then up to
+    /// `FETCH_WINDOW` chunks stay in flight.
+    async fn start_seg_fetch(
+        &mut self,
+        id: SegmentId,
+        compaction: bool,
+        from: NodeId,
+    ) -> Result<()> {
+        self.engine
+            .store()
+            .reset_fetch_staging(&Store::<R>::ship_staging(id))
+            .await?;
+        let req = self.next_read;
+        self.next_read += 1;
+        self.flush.fetches.insert(
+            id,
+            SegFetch {
+                compaction,
+                from,
+                req,
+                total: None,
+                next: CHUNK as u64,
+                inflight: [0u64].into_iter().collect(),
+                got: 0,
+                progress_tick: self.ticks,
+                retry_tick: self.ticks,
+            },
+        );
+        self.send(
+            from,
+            FrameBody::FetchFile {
+                req,
+                path: seg_rel(id),
+                offset: 0,
+            },
+        )
+        .await;
+        Ok(())
     }
 
     /// Builds the indexes of the freeze `id` off the actor (`Runtime::offload`); the result
@@ -1658,15 +1688,38 @@ impl<R: Runtime> Replica<R> {
             self.flush.retired.pop_front();
             self.engine.store().purge_segment_files(id).await?;
         }
-        // A stalled segment fetch falls back to a local build.
-        let stall = FETCH_STALL_ELECTIONS * u64::from(self.cfg.election_ticks.max(1));
-        if self
+        // Segment fetches: chunks lost in flight are asked again after an election timeout; a
+        // fetch with no chunk for several falls back to a local build.
+        let election = u64::from(self.cfg.election_ticks.max(1));
+        let stall = FETCH_STALL_ELECTIONS * election;
+        let ticks = self.ticks;
+        let stalled: Vec<SegmentId> = self
             .flush
-            .fetch
-            .as_ref()
-            .is_some_and(|f| self.ticks - f.progress_tick >= stall)
-        {
-            self.fetch_failed("no data");
+            .fetches
+            .iter()
+            .filter(|(_, f)| ticks - f.progress_tick >= stall)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stalled {
+            self.fetch_failed(id, "no data");
+        }
+        let mut resend: Vec<(NodeId, u64, SegmentId, u64)> = Vec::new();
+        for (id, f) in self.flush.fetches.iter_mut() {
+            if ticks - f.progress_tick.max(f.retry_tick) >= election {
+                f.retry_tick = ticks;
+                resend.extend(f.inflight.iter().map(|off| (f.from, f.req, *id, *off)));
+            }
+        }
+        for (from, req, id, offset) in resend {
+            self.send(
+                from,
+                FrameBody::FetchFile {
+                    req,
+                    path: seg_rel(id),
+                    offset,
+                },
+            )
+            .await;
         }
         // Builds may be waiting for a slot, fetches for a leader, freezes for a commit.
         self.drive_flushes().await?;
@@ -1811,41 +1864,31 @@ impl<R: Runtime> Replica<R> {
                 }
                 return Ok(());
             }
+            // Merges are fetched ahead of their turn, several at once (installation stays in
+            // log order), even while the oldest waits for flushes to publish here.
+            for (p, p_has_file, _) in &pending {
+                if self.flush.fetches.len() >= MAX_SEG_FETCHES {
+                    break;
+                }
+                let local = !self.cfg.ship_segments
+                    || self.flush.fallback.contains(&p.id)
+                    || p.from == self.cfg.id;
+                if !p_has_file && !local && !self.flush.fetches.contains_key(&p.id) {
+                    self.start_seg_fetch(p.id, true, p.from).await?;
+                }
+            }
             if !inputs_ready || has_file {
                 // Earlier flushes still to publish here.
                 return Ok(());
             }
-            let fetching = self.flush.fetch.as_ref().is_some_and(|f| f.id == c.id);
+            let fetching = self.flush.fetches.contains_key(&c.id);
             // From the node that built it, whoever leads now; here if it is ours (a restart
             // lost the file), without shipping, or after a failed fetch.
             let local = !self.cfg.ship_segments
                 || self.flush.fallback.contains(&c.id)
                 || c.from == self.cfg.id;
-            if local && !fetching {
-                if !self.busy() && self.flush.compacting != Some(c.id) {
-                    self.start_compaction_build(c.id, c.inputs.clone())?;
-                }
-            } else if self.flush.fetch.is_none() {
-                let from = c.from;
-                let req = self.next_read;
-                self.next_read += 1;
-                self.flush.fetch = Some(SegFetch {
-                    id: c.id,
-                    compaction: true,
-                    from,
-                    req,
-                    have: 0,
-                    progress_tick: self.ticks,
-                });
-                self.send(
-                    from,
-                    FrameBody::FetchFile {
-                        req,
-                        path: seg_rel(c.id),
-                        offset: 0,
-                    },
-                )
-                .await;
+            if local && !fetching && !self.busy() && self.flush.compacting != Some(c.id) {
+                self.start_compaction_build(c.id, c.inputs.clone())?;
             }
             return Ok(());
         }
@@ -1929,8 +1972,16 @@ impl<R: Runtime> Replica<R> {
         total: u64,
         data: Bytes,
     ) -> Result<()> {
-        if self.flush.fetch.as_ref().is_some_and(|f| f.req == req) {
-            return self.on_segment_chunk(from, path, offset, total, data).await;
+        if let Some(id) = self
+            .flush
+            .fetches
+            .iter()
+            .find(|(_, f)| f.req == req)
+            .map(|(id, _)| *id)
+        {
+            return self
+                .on_segment_chunk(id, from, path, offset, total, data)
+                .await;
         }
         let Some(f) = self.fetch.as_mut() else {
             return Ok(());
@@ -1995,17 +2046,19 @@ impl<R: Runtime> Replica<R> {
     /// local build.
     async fn on_segment_chunk(
         &mut self,
+        id: SegmentId,
         from: NodeId,
         path: String,
         offset: u64,
         total: u64,
         data: Bytes,
     ) -> Result<()> {
-        let Some(f) = self.flush.fetch.as_ref() else {
+        let Some(f) = self.flush.fetches.get(&id) else {
             return Ok(());
         };
-        let (id, req, have, compaction) = (f.id, f.req, f.have, f.compaction);
-        if f.from != from || path != seg_rel(id) || offset != have {
+        let (req, compaction) = (f.req, f.compaction);
+        if f.from != from || path != seg_rel(id) || !f.inflight.contains(&offset) {
+            // Another source, or a duplicate of a chunk already written.
             return Ok(());
         }
         let expected = if compaction {
@@ -2024,42 +2077,56 @@ impl<R: Runtime> Replica<R> {
                 .and_then(|p| p.commit)
         };
         let Some((len, _)) = expected else {
-            self.flush.fetch = None;
+            self.flush.fetches.remove(&id);
             return Ok(());
         };
         if total == u64::MAX {
-            // Gone on the leader (compacted away, or it never had this file).
-            self.fetch_failed("missing on the leader");
+            // Gone on the source (compacted away, or it never had this file).
+            self.fetch_failed(id, "missing on the source");
             return self.drive_flushes().await;
         }
         if total != len {
-            self.fetch_failed("length differs from the commit");
+            self.fetch_failed(id, "length differs from the commit");
             return self.drive_flushes().await;
         }
         let n = data.len() as u64;
         let staging = Store::<R>::ship_staging(id);
         self.engine
             .store()
-            .write_fetch_chunk(&staging, offset, data)
+            .write_fetch_chunk_at(&staging, offset, data)
             .await?;
-        let have = have + n;
-        if have < total && n > 0 {
-            if let Some(f) = self.flush.fetch.as_mut() {
-                f.have = have;
-                f.progress_tick = self.ticks;
+        let ticks = self.ticks;
+        let mut requests = Vec::new();
+        let done = {
+            let Some(f) = self.flush.fetches.get_mut(&id) else {
+                return Ok(());
+            };
+            f.inflight.remove(&offset);
+            f.got += n;
+            f.total = Some(total);
+            f.progress_tick = ticks;
+            while f.inflight.len() < FETCH_WINDOW && f.next < total {
+                requests.push(f.next);
+                f.inflight.insert(f.next);
+                f.next += CHUNK as u64;
             }
+            f.got >= total && f.inflight.is_empty()
+        };
+        for offset in requests {
             self.send(
                 from,
                 FrameBody::FetchFile {
                     req,
-                    path,
-                    offset: have,
+                    path: path.clone(),
+                    offset,
                 },
             )
             .await;
+        }
+        if !done {
             return Ok(());
         }
-        self.flush.fetch = None;
+        self.flush.fetches.remove(&id);
         self.engine.store().sync_fetched(&staging).await?;
         let installed = if compaction {
             self.engine
@@ -2071,7 +2138,7 @@ impl<R: Runtime> Replica<R> {
         };
         if installed {
             self.flush.fetched += 1;
-            tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, bytes = have, "segment fetched");
+            tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, bytes = total, "segment fetched");
         } else {
             tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "fetched segment does not match its commit: building it here");
             self.flush.fallback.insert(id);

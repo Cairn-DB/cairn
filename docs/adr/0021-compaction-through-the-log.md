@@ -133,7 +133,24 @@ then found three more bugs:
 - Log format: new command tag 5 (`CompactCommit`), and `FlushCommit` gains the builder; the
   manifest gains a field. Older binaries cannot decode these, so the protocol version is now 4
   and version 3 is refused: upgrading to this build needs a full-cluster restart once.
-- A replica that comes back far behind fetches the merged segments it missed one at a time.
-  In the simulator, rebuilding them used to take no simulated time: four campaign seeds needed
-  between 5 and 15 simulated seconds to converge, and the chaos test now waits 15 s instead
-  of 5. Pipelining these fetches is a follow-up.
+- A replica that comes back far behind fetches the segments it missed. At first it did so one
+  file at a time, with one 256 KiB chunk per round trip. Four campaign seeds then needed
+  between 5 and 15 simulated seconds to converge, where local rebuilds had taken no simulated
+  time. See "Pipelined fetches" below.
+
+## Pipelined fetches (2026-09-25)
+
+- Up to 4 segment files, flushed or merged, are fetched at once. Merges are fetched ahead of
+  their turn, even while the oldest waits for its inputs. Installation stays in log order.
+- Each file keeps up to 8 chunk requests of 256 KiB in flight once its length is known.
+  Chunks are written at their offset, so arrival order does not matter. Chunks in flight are
+  asked again after an election timeout without progress, and the fetch falls back to a local
+  build after 4.
+- The chaos test is back to a 5 s settle window. Seeds 0 to 60,000 show zero violations, with
+  3.0 million segments built and 5.6 million fetched, against 4.7 and 5.0 million before:
+  fewer stalled fetches fall back to local builds.
+- Local catch-up of a replica that missed 300k rows (`bench-results/phase4-adr0021-catchup.md`):
+  7.0 to 8.6 s pipelined against 7.2 to 9.5 s sequential, no measurable difference on
+  loopback. Log replay and local rebuilds of flushes that were already merged away dominate.
+  Skipping those rebuilds is the next lever. The gain is expected with network latency, and
+  was not measured on a real network.

@@ -516,10 +516,10 @@ fn run(seed: u64) -> (usize, usize, u64) {
     }
     *stop.borrow_mut() = true;
     let h = ex.handle();
-    // 15 s (was 5): since ADR 0021 a replica that comes back late fetches every merged segment
-    // it missed, one at a time, where it used to rebuild them (instant in simulated time).
-    // Seeds 16167, 20616, 40964 and 57668 converged between 5 and 15 s.
-    ex.block_on(h.sleep(Duration::from_secs(15)));
+    // 5 s. A replica that comes back late fetches the segments it missed (ADR 0021), several
+    // at a time and with chunks pipelined; one at a time, seeds 16167, 20616, 40964 and 57668
+    // needed up to 15 s.
+    ex.block_on(h.sleep(Duration::from_secs(5)));
     // Convergence: same applied index and same documents everywhere.
     let statuses: Vec<_> = ex.block_on({
         let hs = handles.clone();

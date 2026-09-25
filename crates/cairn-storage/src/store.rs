@@ -1728,6 +1728,30 @@ impl<R: Runtime> Store<R> {
         disk.write_at(&f, offset, data).await
     }
 
+    /// Starts (or restarts) a fetch into the staging file of `rel`: empties it.
+    pub async fn reset_fetch_staging(&self, rel: &str) -> Result<()> {
+        let path = format!("{}/{rel}.fetch", self.dir);
+        let disk = self.rt.disk();
+        let f = disk
+            .open(&path, cairn_core::OpenMode::CreateTruncate)
+            .await?;
+        disk.set_len(&f, 0).await
+    }
+
+    /// Writes one fetched chunk of `rel` at `offset` into its staging file, in any order (a
+    /// pipelined fetch has several chunks in flight, ADR 0021).
+    pub async fn write_fetch_chunk_at(
+        &self,
+        rel: &str,
+        offset: u64,
+        data: bytes::Bytes,
+    ) -> Result<()> {
+        let disk = self.rt.disk();
+        let path = format!("{}/{rel}.fetch", self.dir);
+        let f = disk.open(&path, cairn_core::OpenMode::CreateOrOpen).await?;
+        disk.write_at(&f, offset, data).await
+    }
+
     /// Makes a completely fetched staging file durable.
     pub async fn sync_fetched(&self, rel: &str) -> Result<()> {
         let disk = self.rt.disk();

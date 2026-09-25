@@ -175,6 +175,16 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         every: u64,
     },
+    /// Waits until every node holds the same state per shard (applied index, segment list,
+    /// nothing pending) and prints how long it took (catch-up measurements).
+    Converge {
+        /// Nodes as `id=addr` (repeatable).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 1800)]
+        timeout_secs: u64,
+    },
     /// Scale benchmark (10M-50M rows) against a running cluster, with recall.
     ClusterScale {
         /// Dataset.
@@ -664,6 +674,49 @@ fn main() -> anyhow::Result<()> {
                 build_threads,
                 &out,
             )
+        }
+        Cmd::Converge {
+            nodes,
+            timeout_secs,
+        } => {
+            let nodes: Vec<(u32, std::net::SocketAddr)> = nodes
+                .iter()
+                .map(|s| {
+                    let (i, a) = s.split_once('=').expect("node must be id=addr");
+                    (i.parse().expect("node id"), a.parse().expect("addr"))
+                })
+                .collect();
+            let t0 = Instant::now();
+            loop {
+                let mut all = Vec::new();
+                for (i, a) in &nodes {
+                    let mut c = cairn_client::Client::new(
+                        [(cairn_core::NodeId(*i), *a)].into_iter().collect(),
+                    );
+                    c.max_attempts = 1;
+                    all.push(c.status().ok());
+                }
+                let ok = all.iter().all(|s| s.is_some()) && {
+                    let st: Vec<_> = all.iter().flatten().collect();
+                    let shards = st[0].len();
+                    st.iter().all(|s| s.len() == shards)
+                        && (0..shards).all(|k| {
+                            st.iter().all(|s| {
+                                s[k].flushes[2] == 0
+                                    && s[k].applied == st[0][k].applied
+                                    && s[k].segments == st[0][k].segments
+                            })
+                        })
+                };
+                if ok {
+                    println!("converged after {:.1} s", t0.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+                if t0.elapsed().as_secs() > timeout_secs {
+                    anyhow::bail!("not converged after {timeout_secs} s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
         }
         Cmd::Status { nodes, every } => {
             let nodes: Vec<(u32, std::net::SocketAddr)> = nodes

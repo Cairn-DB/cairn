@@ -257,9 +257,19 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Chaos test settle window 5 s -> 15 s: a replica that comes back late fetches the merges it
     missed one at a time (was instant in simulated time). Pipelined fetches: follow-up.
 
+- Pipelined segment fetches (2026-09-25, owner: "vas-y pour les fetchs pipelines"): up to 4
+  files at once, 8 chunks of 256 KiB in flight per file, written at their offset, lost chunks
+  re-asked after an election timeout. Chaos settle window back to 5 s; campaign 0..60000 zero
+  violations (3.04M built, 5.58M fetched: fewer fallback builds); 108 tests.
+  - Local catch-up (bench-results/phase4-adr0021-catchup.md): no measurable gain on loopback
+    (7.0-8.6 s vs 7.2-9.5 s); dominated by log replay and by rebuilding flushes that were
+    already merged and purged on the source. Gain expected with network latency; NOT measured
+    (no tc/netem without root).
+
 ## Next step
-ADR 0016 is complete (steps 1-6, 2026-09-25). Remaining toward production: pipelined segment
-fetches (a late replica catches up one merge at a time); flush publication and compaction
+ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward
+production: a lagging replica rebuilds flushes already merged away on the source (skip them
+when a committed merge consumes them); measure fetches over a real network; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
 query latency during parallel builds, the bench settle test. Other levers: scan threshold for
