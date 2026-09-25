@@ -145,6 +145,17 @@ pub trait Runtime: Clone + 'static {
         work: impl FnOnce() -> T + Send + 'static,
     ) -> impl Future<Output = T>;
 
+    /// Runs short CPU work (a query's search, ADR 0025) off the core. Unlike [`Runtime::offload`],
+    /// whose builds may take minutes, this work never queues behind builds: production runs it
+    /// on a bounded pool of permanent threads, so concurrent searches are bounded too and pay
+    /// no thread start. By default it is `offload`.
+    fn offload_search<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        self.offload(work)
+    }
+
     /// The disk.
     fn disk(&self) -> &Self::Disk;
 

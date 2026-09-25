@@ -992,7 +992,7 @@ impl<R: Runtime> Replica<R> {
                     Ok(job) => {
                         let rt = self.rt.clone();
                         self.rt.spawn(async move {
-                            let r = rt.offload(move || job.run()).await;
+                            let r = rt.offload_search(move || job.run()).await;
                             done.send(r);
                         });
                     }

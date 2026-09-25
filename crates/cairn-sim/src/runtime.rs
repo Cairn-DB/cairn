@@ -82,6 +82,15 @@ impl Runtime for SimRuntime {
         }
     }
 
+    fn offload_search<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        // Inline and immediate: `offload_delay` models build time, not searches.
+        let v = work();
+        async move { v }
+    }
+
     fn disk(&self) -> &Self::Disk {
         &self.disk
     }

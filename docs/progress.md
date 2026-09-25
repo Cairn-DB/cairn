@@ -326,8 +326,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     in the replica actor, one at a time per shard.
   - Now: snapshot on the actor (`prepare_legs`), search on a helper thread (`LegsJob::run`).
   - A/B, 8 clients: filtered linearizable p99 34-40 -> 10 ms, 323-326 -> 1,154-1,199 QPS.
-    One client is 0.5-0.9 ms slower (a thread per offload).
-  - NOT measured on GCP yet. Next: a bounded persistent search pool.
+    One client is 0.5-0.9 ms slower.
+  - Search pool (`Runtime::offload_search`, one permanent thread per hardware thread):
+    bounds search threads. It did NOT recover the single-client overhead (3.7-4.0 vs
+    3.2 ms). The cause is not identified (suspects: the completion hop, cache locality).
+  - NOT measured on GCP yet.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
@@ -337,7 +340,8 @@ ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining 
 production: measure ingest with e5a466f + 9349678 on a real cluster; reach and measure 3
 segments per shard with this code; filtered linearizable p99: the cause (searches in the
 replica actor) is fixed by ADR 0025 and measured locally, not yet on GCP (the scan threshold
-was ruled out); a bounded search thread pool; leader balancing under continuous ingest; flush publication and compaction
+was ruled out); the single-client overhead of off-actor searches (about 0.5 ms, cause
+unknown); leader balancing under continuous ingest; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
 query latency during parallel builds, the bench settle test. Other levers: scan threshold for

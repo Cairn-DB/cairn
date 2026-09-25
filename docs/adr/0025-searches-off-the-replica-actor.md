@@ -83,9 +83,35 @@ searches of a shard ran one after another on a single core, and the shard's Raft
   shard is not held up by searches.
 - **Not measured on GCP.** The 118 ms p99 there came from the same queueing, with 8 shards
   over 3 nodes. The effect is expected to be large, but it has to be measured.
-- Concurrency is not bounded: each search starts a thread. Many clients at once can spawn
-  many threads. A persistent pool with a bound would cap that, and would also recover the
-  single-client overhead. This is the next step.
+- Concurrency was not bounded at first: each search started a thread. See the search pool
+  below.
 - Segments replaced by a merge stay in memory until the searches that captured them finish.
 - Searches still compete for CPU with index builds. Under the saturated build load of the
   GCP run, latency rose to seconds (ADR 0019).
+
+## Search pool (2026-09-26)
+
+- `Runtime::offload_search`, for short work that must not queue behind builds, which may
+  take minutes:
+  - production: a process-wide pool with one permanent thread per hardware thread, fed by a
+    queue;
+  - simulator: inline, without the build delay;
+  - default: `offload`.
+- The replica runs searches through it. A runtime test runs 500 concurrent jobs; they all
+  complete, on at most one thread per hardware thread.
+- A/B/C, alternating, 2 runs each (`bench-results/phase4-adr0025-pool.md`), 1% filter,
+  linearizable:
+
+  | | 1 client, p50 | 8 clients, throughput |
+  |---|---|---|
+  | actor | 3.2-3.3 ms | 320-324 QPS |
+  | thread per search | 4.1 ms | 1,216-1,224 QPS |
+  | pool | 3.7-4.0 ms | 1,139-1,184 QPS |
+
+- **The pool did not recover the single-client overhead**, contrary to what this ADR
+  expected. It gains 0.1 to 0.4 ms of about 0.8 ms, so thread start-up was not the main
+  cost; the cause is not identified. Suspects: the cross-thread completion hop that wakes the
+  executor, and cache locality.
+- At 8 clients the pool and a thread per search are equal within noise.
+- The pool is kept for what it bounds: search threads never exceed the machine's hardware
+  threads, whatever the number of clients.

@@ -178,6 +178,61 @@ pub fn offload<T: Send + 'static>(
     slot
 }
 
+type Job = Box<dyn FnOnce() + Send>;
+
+/// The process-wide search pool (ADR 0025): one permanent thread per hardware thread, fed by a
+/// queue. Searches from every core share it, so their concurrency is bounded by the machine.
+fn search_pool() -> &'static Mutex<Sender<Job>> {
+    static POOL: std::sync::OnceLock<Mutex<Sender<Job>>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for i in 0..n {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("search-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = rx.lock().expect("search queue").recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => return,
+                        }
+                    }
+                })
+                .expect("spawn search thread");
+        }
+        Mutex::new(tx)
+    })
+}
+
+/// Runs `work` on the search pool and resolves with its result on the executor.
+pub fn offload_search<T: Send + 'static>(
+    completer: &Completer,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Slot<T> {
+    let (slot, inner) = Slot::new();
+    completer.begin();
+    let c = completer.clone();
+    let job: Job = Box::new(move || {
+        let v = work();
+        c.complete(Box::new(move || {
+            let mut g = inner.lock().expect("slot poisoned");
+            g.value = Some(v);
+            if let Some(w) = g.waker.take() {
+                w.wake();
+            }
+        }));
+    });
+    search_pool()
+        .lock()
+        .expect("search pool")
+        .send(job)
+        .expect("search pool stopped");
+    slot
+}
+
 fn map_io(e: io::Error) -> Error {
     let kind = match e.kind() {
         io::ErrorKind::NotFound => IoErrorKind::NotFound,
@@ -397,11 +452,62 @@ impl<N: cairn_core::Network + Clone + 'static> Runtime for PoolRuntime<N> {
         offload(&self.disk.completer, work)
     }
 
+    fn offload_search<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> {
+        offload_search(&self.disk.completer, work)
+    }
+
     fn disk(&self) -> &Self::Disk {
         &self.disk
     }
 
     fn network(&self) -> &Self::Network {
         &self.network
+    }
+}
+
+#[cfg(test)]
+mod search_pool_tests {
+    use super::*;
+    use crate::executor::Executor;
+
+    /// Many concurrent searches complete, on the bounded pool of permanent threads.
+    #[test]
+    fn searches_run_on_a_bounded_pool() {
+        let reactor = ThreadReactor::new();
+        let completer = reactor.completer();
+        let mut ex = Executor::new(reactor);
+        let names = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+        let slots: Vec<Slot<u64>> = (0..500u64)
+            .map(|i| {
+                let names = names.clone();
+                offload_search(&completer, move || {
+                    let name = std::thread::current().name().unwrap_or("").to_owned();
+                    names.lock().unwrap().insert(name);
+                    (0..1000u64).fold(i, |a, b| a.wrapping_mul(31).wrapping_add(b))
+                })
+            })
+            .collect();
+        let got: Vec<u64> = ex.block_on(async move {
+            let mut out = Vec::new();
+            for s in slots {
+                out.push(s.await);
+            }
+            out
+        });
+        for (i, v) in got.iter().enumerate() {
+            let want = (0..1000u64).fold(i as u64, |a, b| a.wrapping_mul(31).wrapping_add(b));
+            assert_eq!(*v, want);
+        }
+        let names = names.lock().unwrap();
+        let max = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(names.iter().all(|n| n.starts_with("search-")), "{names:?}");
+        assert!(
+            names.len() <= max,
+            "{} threads for {max} hardware threads",
+            names.len()
+        );
     }
 }
