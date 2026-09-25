@@ -496,6 +496,8 @@ struct FlushState {
     announce: std::collections::BTreeMap<SegmentId, ((u64, u64), Option<Term>)>,
     built: u64,
     fetched: u64,
+    /// Flushes never built or fetched here because a merge consumed them (diagnostics).
+    skipped: u64,
     /// Leader balancing (ADR 0020): tick since which this replica leads, and the earliest tick
     /// for the next handover attempt.
     lead_since: Option<u64>,
@@ -1298,6 +1300,9 @@ impl<R: Runtime> Replica<R> {
         if self.engine.store_mut().publish_ready().await? > 0 {
             self.after_publish().await?;
         }
+        // Flushes a pending merge already consumes are not built or fetched: the merge is
+        // installed over them once its file is here (ADR 0021).
+        let skip = self.subsume_flushes().await?;
         let pending = self.engine.store().pending_flushes();
         let mut live: std::collections::BTreeSet<SegmentId> =
             pending.iter().map(|p| p.id).collect();
@@ -1319,7 +1324,7 @@ impl<R: Runtime> Replica<R> {
         let mut to_fetch: Vec<(SegmentId, NodeId)> = Vec::new();
         let me = self.cfg.id;
         for p in &pending {
-            if p.has_file || p.empty {
+            if p.has_file || p.empty || skip.contains(&p.id) {
                 continue;
             }
             let fetching = self.flush.fetches.contains_key(&p.id);
@@ -1435,6 +1440,61 @@ impl<R: Runtime> Replica<R> {
         if self.raft.transfer_leadership(pref).is_ok() {
             self.flush.handovers += 1;
             tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, to = %pref, "handing leadership to the preferred replica");
+        }
+    }
+
+    /// Installs merges that consume the oldest pending flushes as soon as their files are here,
+    /// and returns the flushes to leave alone meanwhile: those consumed by a merge still being
+    /// fetched. A merge whose fetch failed, or our own whose file was lost, gives way to the
+    /// normal path (build or fetch the flushes, then the merge).
+    async fn subsume_flushes(&mut self) -> Result<std::collections::BTreeSet<SegmentId>> {
+        loop {
+            let candidates = self.engine.store().subsumption_candidates();
+            if candidates.is_empty() {
+                return Ok(Default::default());
+            }
+            let files: std::collections::BTreeSet<SegmentId> = self
+                .engine
+                .store()
+                .pending_compactions()
+                .into_iter()
+                .filter(|(_, has_file, _)| *has_file)
+                .map(|(c, _, _)| c.id)
+                .collect();
+            if let Some((j, id, consumed)) = candidates.iter().find(|(_, id, _)| files.contains(id))
+            {
+                tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, flushes = consumed.len(), "merge installed over flushes not built here");
+                self.flush.skipped += consumed.len() as u64;
+                self.engine.store_mut().install_subsumed(*j).await?;
+                // Fetches of the consumed flushes are moot: drop them (late chunks are ignored).
+                for f in consumed {
+                    if self.flush.fetches.remove(f).is_some() {
+                        self.engine
+                            .store()
+                            .reset_fetch_staging(&Store::<R>::ship_staging(*f))
+                            .await?;
+                    }
+                }
+                self.after_publish().await?;
+                self.after_compaction_install().await?;
+                continue;
+            }
+            let me = self.cfg.id;
+            let origin: std::collections::BTreeMap<SegmentId, NodeId> = self
+                .engine
+                .store()
+                .pending_compactions()
+                .into_iter()
+                .map(|(c, _, _)| (c.id, c.from))
+                .collect();
+            let viable = candidates.iter().find(|(_, id, _)| {
+                self.cfg.ship_segments
+                    && !self.flush.fallback.contains(id)
+                    && origin.get(id).is_some_and(|f| *f != me)
+            });
+            return Ok(viable
+                .map(|(_, _, consumed)| consumed.iter().copied().collect())
+                .unwrap_or_default());
         }
     }
 

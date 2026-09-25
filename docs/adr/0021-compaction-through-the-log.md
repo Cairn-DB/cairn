@@ -152,5 +152,40 @@ then found three more bugs:
 - Local catch-up of a replica that missed 300k rows (`bench-results/phase4-adr0021-catchup.md`):
   7.0 to 8.6 s pipelined against 7.2 to 9.5 s sequential, no measurable difference on
   loopback. Log replay and local rebuilds of flushes that were already merged away dominate.
-  Skipping those rebuilds is the next lever. The gain is expected with network latency, and
-  was not measured on a real network.
+  Skipping those rebuilds was the next lever (next section). The gain from pipelining is
+  expected with network latency, and was not measured on a real network.
+
+## Merges installed over flushes never built here (2026-09-25)
+
+A replica that falls behind can hold committed flushes it never built, whose files the
+source has already merged away and purged after the grace period. It used to fetch or rebuild
+each such flush, only to replace it with the merge right after.
+
+- When the oldest pending flush has no file, the replica composes the committed merges over
+  its logical segment list (decision 7). A merge **subsumes** the flushes when, after it,
+  merge outputs no longer appear in the list except that merge's own, and the flushes it
+  consumed are the oldest pending ones.
+- Once that merge's file is here, the replica installs it in one manifest write:
+  - the consumed flushes are published without files, and their log prefix is truncated;
+  - the intermediate merges are dropped;
+  - the merge replaces the consumed segments.
+  Masking follows decision 4: a merged row stays visible only if its row is still live in a
+  consumed input. For a flush without a file, that row is a memtable row not changed since
+  the freeze.
+- While the merge is being fetched, the consumed flushes are neither built nor fetched, and
+  fetches already running for them are dropped. The normal path resumes if the merge's fetch
+  fails (local fallback) or if the merge was built here (its file lost in a restart).
+- Nothing changes on the wire or in the log. The manifest reaches the same state as with the
+  flushes built first, so the segment-list check holds. Status counters stay as they were,
+  and a subsumption logs at info level.
+
+Evidence:
+
+- Store test: a replica that never built a flush installs a merge of a merge over it, with
+  rows deleted and upserted between the freeze and each merge. Documents match the source's,
+  before and after a restart.
+- Campaign: seeds 0 to 60,000, zero violations (3.02 million segments built, 5.56 million
+  fetched). A trial run of 3,000 seeds with a temporary counter saw 4,060 such installs,
+  covering 4,215 flushes. Workspace: 109 tests pass.
+- Local catch-up (`bench-results/phase4-adr0021-catchup.md`, 3 alternating runs): 3.8 to
+  3.9 s against 4.7 to 8.9 s. The lagging node built 0 segments, against 1 to 3.

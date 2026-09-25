@@ -1375,6 +1375,191 @@ impl<R: Runtime> Store<R> {
         Ok(true)
     }
 
+    /// Ways to publish the oldest pending freeze without its own file (ADR 0021): the pending
+    /// merges, composed in log order over the published segments and pending freezes, reach
+    /// a merge that is then the only output left, consumes that freeze, and consumes only a
+    /// prefix of the freeze queue. Each candidate is `(position in the compaction queue, merge
+    /// id, freezes it consumes)`, earliest first. Installing one skips building the freezes and intermediate merges
+    /// it consumes: a replica that fell behind no longer rebuilds flushes the others merged
+    /// away long ago.
+    pub fn subsumption_candidates(&self) -> Vec<(usize, SegmentId, Vec<SegmentId>)> {
+        let Some(head) = self.pending.front() else {
+            return Vec::new();
+        };
+        if head.file.is_some() || head.mem.docs().next().is_none() {
+            return Vec::new();
+        }
+        let freezes: Vec<SegmentId> = self
+            .pending
+            .iter()
+            .filter(|p| p.mem.docs().next().is_some())
+            .map(|p| p.id)
+            .collect();
+        let mut v: Vec<SegmentId> = self.segments.iter().map(|s| s.meta.id).collect();
+        v.extend(freezes.iter().copied());
+        let mut produced: Vec<SegmentId> = Vec::new();
+        let mut out = Vec::new();
+        for (j, c) in self.manifest.compactions.iter().enumerate() {
+            if !Self::apply_to_logical(&mut v, &c.inputs, c.id) {
+                break;
+            }
+            produced.push(c.id);
+            let single_root =
+                produced.iter().filter(|id| v.contains(id)).count() == 1 && v.contains(&c.id);
+            let consumed = freezes.iter().take_while(|f| !v.contains(f)).count();
+            let prefix = freezes.iter().skip(consumed).all(|f| v.contains(f));
+            if single_root && consumed > 0 && prefix {
+                out.push((j, c.id, freezes[..consumed].to_vec()));
+            }
+        }
+        out
+    }
+
+    /// Installs candidate `j` from [`Store::subsumption_candidates`] (its merged file must be
+    /// here): publishes the freezes it consumes without files, drops the intermediate merges,
+    /// and replaces the consumed segments with the merge, in one manifest write. A merged row
+    /// is masked unless its row is still live in a consumed input: a published segment, or a
+    /// consumed freeze's rows not changed since the freeze.
+    pub async fn install_subsumed(&mut self, j: usize) -> Result<()> {
+        let target = self
+            .manifest
+            .compactions
+            .get(j)
+            .cloned()
+            .ok_or_else(|| Error::Internal("no such compaction".into()))?;
+        let Some(&(file_len, file_hash)) = self.compaction_files.get(&target.id) else {
+            return Err(Error::Internal("subsuming merge has no file".into()));
+        };
+        self.persist_dirty_deletions().await?;
+        let freezes: Vec<SegmentId> = self
+            .pending
+            .iter()
+            .filter(|p| p.mem.docs().next().is_some())
+            .map(|p| p.id)
+            .collect();
+        let physical: Vec<SegmentId> = self.segments.iter().map(|s| s.meta.id).collect();
+        let mut v = physical.clone();
+        v.extend(freezes.iter().copied());
+        for c in &self.manifest.compactions[..=j] {
+            if !Self::apply_to_logical(&mut v, &c.inputs, c.id) {
+                return Err(Error::Internal("subsumption no longer applies".into()));
+            }
+        }
+        let consumed_freezes: Vec<SegmentId> =
+            freezes.iter().copied().filter(|f| !v.contains(f)).collect();
+        let last_consumed = *consumed_freezes
+            .last()
+            .ok_or_else(|| Error::Internal("subsumption consumes no freeze".into()))?;
+        // Every row still live in a consumed input.
+        let mut live: cairn_core::HashSet<u64> = cairn_core::HashSet::default();
+        let mut log_last = LogIndex(0);
+        for s in self.segments.iter().filter(|s| !v.contains(&s.meta.id)) {
+            log_last = log_last.max(s.meta.log_last);
+            for (row, id) in s.docs.docids().iter().enumerate() {
+                if !s.deletions.contains(row as u32) {
+                    live.insert(*id);
+                }
+            }
+        }
+        // Publish the freezes up to the last consumed one (empty ones included) without files.
+        let pos = self
+            .pending
+            .iter()
+            .position(|p| p.id == last_consumed)
+            .expect("consumed freeze is pending");
+        let popped: Vec<PendingFlush> = self.pending.drain(..=pos).collect();
+        for p in &popped {
+            log_last = log_last.max(p.last);
+            for d in p.mem.docs() {
+                if !p.masked.contains(&d.id) {
+                    live.insert(d.id.get());
+                }
+            }
+        }
+        let last = popped.last().expect("popped").last;
+        let path = seg_path(&self.dir, target.id);
+        let reader = SegmentReader::open(self.rt.clone(), &path).await?;
+        let docstore = DocStore::open(&reader).await?;
+        let doc_count = docstore.doc_count();
+        let mut deletions = DeletionSet::new(doc_count);
+        let mut dirty = false;
+        for (row, id) in docstore.docids().iter().enumerate() {
+            if !live.contains(id) {
+                deletions.set(row as u32);
+                dirty = true;
+            }
+        }
+        if dirty {
+            ManifestStore::new(self.rt.clone(), del_path(&self.dir, target.id))
+                .store(&deletions)
+                .await?;
+        }
+        let meta = SegmentMeta {
+            id: target.id,
+            doc_count,
+            log_last,
+            file_len,
+            file_hash,
+        };
+        // New physical list: the composed list without the freezes still pending.
+        let remaining: cairn_core::HashSet<SegmentId> = self.pending.iter().map(|p| p.id).collect();
+        let new_ids: Vec<SegmentId> = v.into_iter().filter(|id| !remaining.contains(id)).collect();
+        let mut new_manifest = self.manifest.clone();
+        new_manifest.segments = new_ids
+            .iter()
+            .map(|id| {
+                if *id == target.id {
+                    meta.clone()
+                } else {
+                    self.segments
+                        .iter()
+                        .find(|s| s.meta.id == *id)
+                        .expect("kept segment")
+                        .meta
+                        .clone()
+                }
+            })
+            .collect();
+        let dropped: Vec<SegmentId> = new_manifest.compactions[..=j]
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        new_manifest.compactions.drain(..=j);
+        new_manifest.applied_index = last.max(new_manifest.applied_index);
+        new_manifest.applied_term = self.log.read(last).await?.term;
+        self.manifest_store.store(&new_manifest).await?;
+        self.manifest = new_manifest;
+        for id in &dropped {
+            self.compaction_files.remove(id);
+        }
+        // Rebuild the open segment list in the new order.
+        let mut old: Vec<OpenSegment<R>> = std::mem::take(&mut self.segments);
+        let mut next = Vec::with_capacity(new_ids.len());
+        let mut new_seg = Some(OpenSegment {
+            meta,
+            reader,
+            docs: docstore,
+            deletions,
+            deletions_dirty: false,
+        });
+        for id in &new_ids {
+            if *id == target.id {
+                next.push(new_seg.take().expect("once"));
+            } else if let Some(k) = old.iter().position(|s| s.meta.id == *id) {
+                next.push(old.swap_remove(k));
+            }
+        }
+        self.segments = next;
+        // Consumed segments and intermediate merges: files kept for the grace period.
+        self.retired.extend(old.iter().map(|s| s.meta.id));
+        self.retired
+            .extend(dropped.iter().copied().filter(|id| *id != target.id));
+        self.memtable_version += 1;
+        self.segments_version += 1;
+        self.log.truncate_prefix(last.next()).await?;
+        Ok(())
+    }
+
     /// Installs, in log order, every committed compaction whose file is present and whose
     /// inputs are all published (ADR 0021). A merged row is masked when its input row is
     /// deleted now: input deletion bits carry every change applied here since the rows were
@@ -2521,6 +2706,124 @@ mod tests {
             assert!(b.pending_compactions().is_empty());
             assert_eq!(b.get(DocId(3)).await.unwrap(), None);
             assert_eq!(b.get(DocId(15)).await.unwrap(), Some(doc(15, 2)));
+        });
+    }
+
+    /// ADR 0021: a lagging replica installs a merge (here a merge of a merge) over a flush it
+    /// never built, publishing the flush without a file.
+    #[test]
+    fn merge_installed_over_a_flush_never_built() {
+        let (sim, mut ex) = Simulation::new(13, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let cfg = StoreConfig {
+                memtable_max_bytes: usize::MAX,
+                ..small_cfg()
+            };
+            let mut a = Store::open(rt.clone(), "sa", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let mut b = Store::open(rt.clone(), "sb", schema(), cfg.clone())
+                .await
+                .unwrap();
+            let run = async |a: &mut Store<_>, b: &mut Store<_>, cmd: Command| {
+                let ia = a.write(&cmd).await.unwrap();
+                assert_eq!(ia, b.write(&cmd).await.unwrap());
+                ia
+            };
+            // Segment A on both; freeze F built on a only.
+            for i in 1..=10u64 {
+                run(&mut a, &mut b, Command::Upsert(vec![doc(i, 1)])).await;
+            }
+            let sa = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+            for st in [&mut a, &mut b] {
+                build_local(st, sa).await;
+                st.publish_ready().await.unwrap();
+            }
+            for i in 11..=20u64 {
+                run(&mut a, &mut b, Command::Upsert(vec![doc(i, 1)])).await;
+            }
+            let sf = SegmentId(run(&mut a, &mut b, Command::FlushBegin).await.get());
+            let (fl, fh) = build_local(&mut a, sf).await;
+            a.publish_ready().await.unwrap();
+            run(
+                &mut a,
+                &mut b,
+                Command::FlushCommit {
+                    id: sf,
+                    len: fl,
+                    hash: fh,
+                    from: NodeId(1),
+                },
+            )
+            .await;
+            // Changed after F's freeze, before the merges.
+            run(&mut a, &mut b, Command::Delete(vec![DocId(15)])).await;
+            // a merges [A, F] into C1, then rewrites C1 alone into C2.
+            a.set_compaction_namespace(1);
+            let merge = async |a: &mut Store<_>, b: &mut Store<_>, inputs: Vec<SegmentId>| {
+                let id = a.reserve_compaction_id().await.unwrap();
+                let job = a.compaction_rows(id, &inputs).await.unwrap().unwrap();
+                let sections = Store::<cairn_sim::SimRuntime>::build_sections(
+                    &a.manifest.schema,
+                    &job.docs,
+                    a.indexer.as_ref(),
+                )
+                .unwrap();
+                let (len, hash) = a.write_compaction_file(&job, sections).await.unwrap();
+                let cmd = Command::CompactCommit {
+                    id,
+                    inputs,
+                    len,
+                    hash,
+                    from: NodeId(1),
+                };
+                run(a, b, cmd).await;
+                a.set_compaction_file(id, (len, hash));
+                assert_eq!(a.install_compactions().await.unwrap(), 1);
+                id
+            };
+            let c1 = merge(&mut a, &mut b, vec![sa, sf]).await;
+            // Changed between the two merges.
+            run(&mut a, &mut b, Command::Upsert(vec![doc(3, 7)])).await;
+            let c2 = merge(&mut a, &mut b, vec![c1]).await;
+            run(&mut a, &mut b, Command::Delete(vec![DocId(18)])).await;
+            // b never built F: both merges are candidates, only C2's file is shipped.
+            let cands = b.subsumption_candidates();
+            assert_eq!(
+                cands
+                    .iter()
+                    .map(|(j, id, f)| (*j, *id, f.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(0, c1, vec![sf]), (1, c2, vec![sf])]
+            );
+            ship(&a, &b, c2, false).await;
+            assert!(b.install_fetched_compaction(c2).await.unwrap());
+            b.install_subsumed(1).await.unwrap();
+            assert!(b.pending_flushes().is_empty());
+            assert!(b.pending_compactions().is_empty());
+            assert_eq!(b.segments().map(|m| m.id).collect::<Vec<_>>(), vec![c2]);
+            assert_eq!(b.applied_index(), a.applied_index());
+            for i in 1..=20u64 {
+                assert_eq!(
+                    b.get(DocId(i)).await.unwrap(),
+                    a.get(DocId(i)).await.unwrap(),
+                    "doc {i}"
+                );
+            }
+            assert_eq!(b.get(DocId(15)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(18)).await.unwrap(), None);
+            assert_eq!(b.get(DocId(3)).await.unwrap(), Some(doc(3, 7)));
+            drop(b);
+            let b = Store::open(rt.clone(), "sb", schema(), cfg).await.unwrap();
+            assert_eq!(b.segments().map(|m| m.id).collect::<Vec<_>>(), vec![c2]);
+            for i in 1..=20u64 {
+                assert_eq!(
+                    b.get(DocId(i)).await.unwrap(),
+                    a.get(DocId(i)).await.unwrap(),
+                    "doc {i}"
+                );
+            }
         });
     }
 }

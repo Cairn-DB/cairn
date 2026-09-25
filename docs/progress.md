@@ -265,11 +265,22 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     (7.0-8.6 s vs 7.2-9.5 s); dominated by log replay and by rebuilding flushes that were
     already merged and purged on the source. Gain expected with network latency; NOT measured
     (no tc/netem without root).
+- Merges installed over unbuilt flushes (2026-09-25, owner: "vas-y pour eviter les rebuilds
+  des flushs deja merges"): a lagging replica whose oldest pending flushes are consumed by a
+  committed merge (possibly a chain of merges) installs that merge directly once its file is
+  fetched. The flushes are published without files, and nothing is built or fetched for them
+  (Store::subsumption_candidates / install_subsumed, replica subsume_flushes). No wire or log
+  change. The status counter was not added: status is a wire type, so it would need a
+  protocol bump.
+  - Evidence: store test; 109 tests; campaign 0..60000 zero violations (3.02M built, 5.56M
+    fetched); catch-up 3.8-3.9 s vs 4.7-8.9 s, node 3 builds 0 vs 1-3
+    (bench-results/phase4-adr0021-catchup.md).
+  - Campaign tool note: `campaign.sh 20000 14` skips seeds 19992..19999 (integer split); ran
+    them separately, OK.
 
 ## Next step
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward
-production: a lagging replica rebuilds flushes already merged away on the source (skip them
-when a committed merge consumes them); measure fetches over a real network; flush publication and compaction
+production: measure fetches over a real network; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
 query latency during parallel builds, the bench settle test. Other levers: scan threshold for

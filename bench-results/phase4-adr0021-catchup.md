@@ -25,9 +25,26 @@
 - **The rebuilds are the largest cost.** They happen because node 3 was down for longer than
   the 30 s grace for retired files, so the flushes it missed had already been merged and
   purged on the source. Building such a flush, only to merge it right after, is avoidable.
-  That is the next lever (not done).
+  Done since: see the next section.
 - **Where pipelining matters.** With network latency, a single chunk per round trip caps
   throughput at 256 KiB per RTT: about 25 MB/s at 10 ms. In the simulator, which models
   latency, four campaign seeds had needed up to 15 s to converge. Now all 60,000 seeds
   converge within the original 5 s. This host cannot add latency (`tc` needs root), so it was
   not measured on a real network.
+
+## Merges installed over flushes never built here
+
+- Same scenario and client, 3 alternating runs each. "before": commit fa6069e (pipelined
+  fetches). "after": the lagging replica installs a merge directly over the flushes it
+  consumes, without building or fetching them (ADR 0021). Driver: `data/run-subsume-ab.sh`.
+
+| run | before | after | node 3 built / fetched, before | after |
+|---|---|---|---|---|
+| r1 | 8.9 s | 3.8 s | 3 / 5 | 0 / 4 |
+| r2 | 6.8 s | 3.9 s | 2 / 6 | 0 / 4 |
+| r3 | 4.7 s | 3.9 s | 1 / 7 | 0 / 4 |
+
+- **Catch-up 3.8 to 3.9 s against 4.7 to 8.9 s.** The spread before came from the number
+  of flushes rebuilt locally (1 to 3). After the change, node 3 builds nothing in all three
+  runs, and the time no longer varies.
+- The remaining time is log replay (about 180 MB) and the 4 merged files fetched.
