@@ -69,9 +69,17 @@ impl Runtime for SimRuntime {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> impl Future<Output = T> {
-        // Inline: deterministic, and the only option without threads.
+        // Inline: deterministic, and the only option without threads. An optional delay
+        // stands for the time the work would take (`SimConfig::offload_delay`).
         let v = work();
-        async move { v }
+        let delay = self.sim.inner.config.offload_delay;
+        let done = (!delay.is_zero()).then(|| self.handle.sleep_until(self.handle.now() + delay));
+        async move {
+            if let Some(d) = done {
+                d.await;
+            }
+            v
+        }
     }
 
     fn disk(&self) -> &Self::Disk {

@@ -434,10 +434,12 @@ const RETIRED_GRACE_ELECTIONS: u64 = 60;
 /// local build.
 const FETCH_STALL_ELECTIONS: u64 = 4;
 /// A follower that waited this many election timeouts for the `FlushCommit` of a freeze, with
-/// no sign of progress from the same leader meanwhile, builds it itself (a lost announcement).
-/// A leader with a queue of builds commits them one after another, which restarts the wait:
-/// on the GCP 50M run a fixed wait made every follower rebuild everything.
-const COMMIT_WAIT_ELECTIONS: u64 = 200;
+/// no sign of progress from the same leader meanwhile, builds it itself. This is a safety net
+/// for a lost announcement, not a failure detector: a leader that fails is replaced, and the
+/// new leader builds or re-announces what is pending. A slow leader is not a failed one. With
+/// 200 (100 s in production), a single 256 MB build on the GCP 50M run outlasted the wait and
+/// every follower rebuilt every segment. 2400 is 20 minutes with 500 ms election timeouts.
+const COMMIT_WAIT_ELECTIONS: u64 = 2400;
 
 /// A leader keeps log entries a follower has not matched yet, up to this many payload bytes,
 /// instead of compacting them at a flush: a follower one flush behind then catches up from

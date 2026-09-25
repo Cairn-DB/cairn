@@ -20,6 +20,10 @@ pub struct SimConfig {
     pub net: NetConfig,
     /// How many recent trace events to keep in clear text.
     pub trace_keep: usize,
+    /// Simulated time each `Runtime::offload` call takes (index builds, file hashing). Zero
+    /// by default, which keeps every existing trace unchanged. Scenarios where a leader's
+    /// builds outlast follower timeouts set it.
+    pub offload_delay: Duration,
 }
 
 impl Default for SimConfig {
@@ -28,6 +32,7 @@ impl Default for SimConfig {
             disk: DiskConfig::default(),
             net: NetConfig::default(),
             trace_keep: 64,
+            offload_delay: Duration::ZERO,
         }
     }
 }

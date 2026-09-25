@@ -587,6 +587,59 @@ fn followers_install_leader_built_segments() {
     });
 }
 
+/// A leader whose builds take longer than a follower's commit wait (each build 30 simulated
+/// seconds here) is slow, not gone: followers keep waiting for its `FlushCommit` and fetch its
+/// files instead of rebuilding them. On the GCP 50M run, followers timed out and every node
+/// built every segment.
+#[test]
+fn followers_wait_for_a_slow_leader() {
+    init_tracing();
+    let cfg = SimConfig {
+        offload_delay: Duration::from_secs(30),
+        ..SimConfig::default()
+    };
+    let (sim, mut ex) = Simulation::new(24, cfg);
+    let handles = spawn_three(&sim, &mut ex, 6000, true);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    ex.block_on(async move {
+        let li = wait_leader(&rt, &hs).await;
+        for i in 1..=90u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+        }
+        wait_converged(&rt, &hs, 90).await;
+        let mut st = Vec::new();
+        for _ in 0..600 {
+            st.clear();
+            for h in &hs {
+                st.push(h.status().await.unwrap());
+            }
+            if st
+                .iter()
+                .all(|s| s.flushes[2] == 0 && s.segments == st[0].segments)
+                && !st[0].segments.is_empty()
+            {
+                break;
+            }
+            rt.sleep(Duration::from_secs(1)).await;
+        }
+        assert!(st.iter().all(|s| s.flushes[2] == 0), "not settled: {st:#?}");
+        assert_eq!(st[li].role, Role::Leader, "no leadership change expected");
+        assert!(st[li].flushes[0] >= 2, "leader built: {:?}", st[li].flushes);
+        for (i, s) in st.iter().enumerate() {
+            if i != li {
+                assert_eq!(
+                    s.flushes[0], 0,
+                    "follower {} rebuilt: {:?}",
+                    s.id, s.flushes
+                );
+                assert_eq!(s.flushes[1], st[li].flushes[0], "follower {} fetched", s.id);
+            }
+        }
+        check_all_docs(&hs, 90, &[]).await;
+    });
+}
+
 /// ADR 0016 fallback: a follower that cannot reach the leader's file server (its requests are
 /// dropped, while it still receives the log) builds its segments itself.
 #[test]
