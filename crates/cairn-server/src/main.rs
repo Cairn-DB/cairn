@@ -76,8 +76,9 @@ struct Cli {
     /// Let application clients connect without a certificate (peers always need one).
     #[arg(long)]
     tls_anonymous_clients: bool,
-    /// Threads per index build, flush or compaction (0: all hardware threads). Builds give the
-    /// same segments whatever the count (ADR 0019); --compaction-slots bounds concurrent builds.
+    /// Threads per index build, flush or compaction (0: hardware threads / (2 x
+    /// --compaction-slots), so builds use at most half the machine). Builds give the same
+    /// segments whatever the count (ADR 0019).
     #[arg(long, default_value_t = 0)]
     build_threads: usize,
     /// Do not move shard leaderships to their preferred replicas (ADR 0020).

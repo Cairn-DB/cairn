@@ -58,7 +58,7 @@ pub struct NodeConfig {
     pub ship_segments: bool,
     /// mTLS for all connections (ADR 0018); `None`: plaintext (development only).
     pub tls: Option<cairn_runtime::tls::NodeTls>,
-    /// Threads per index build (ADR 0019); 0: all hardware threads.
+    /// Threads per index build (ADR 0019); 0: [`auto_build_threads`].
     pub build_threads: usize,
     /// Hand each shard's leadership to its first host in the placement (ADR 0020).
     pub leader_balancing: bool,
@@ -124,6 +124,14 @@ pub struct Node {
 }
 
 /// Compaction slots shared by every core of this process (one node per process).
+/// Threads per build when not set: all concurrent builds together use at most half the
+/// hardware threads, leaving the rest to the executors (Raft, replication, queries). With every
+/// hardware thread per build, 4 slots ran 32 build threads on an 8-vCPU VM, starved the Raft
+/// actors, and leadership churned (GCP 50M run, 2026-09-25).
+pub fn auto_build_threads(hardware_threads: usize, slots: usize) -> usize {
+    (hardware_threads / (2 * slots.max(1))).max(1)
+}
+
 fn job_slots(max: usize) -> std::sync::Arc<cairn_query::JobSlots> {
     static SLOTS: std::sync::OnceLock<std::sync::Arc<cairn_query::JobSlots>> =
         std::sync::OnceLock::new();
@@ -294,11 +302,16 @@ impl Node {
                     .leader_balancing
                     .then(|| placement(&cfg, shard).first().copied())
                     .flatten(),
-                build_parallel: Some(std::sync::Arc::new(if cfg.build_threads == 0 {
-                    cairn_runtime::ThreadParallel::available()
-                } else {
-                    cairn_runtime::ThreadParallel::new(cfg.build_threads)
-                })),
+                build_parallel: Some(std::sync::Arc::new(cairn_runtime::ThreadParallel::new(
+                    if cfg.build_threads == 0 {
+                        auto_build_threads(
+                            std::thread::available_parallelism().map_or(1, |n| n.get()),
+                            cfg.compaction_slots,
+                        )
+                    } else {
+                        cfg.build_threads
+                    },
+                ))),
             };
             match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
                 Ok(h) => {
@@ -890,5 +903,19 @@ impl Node {
         for t in self.threads {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_build_threads;
+
+    #[test]
+    fn builds_leave_half_the_machine_to_the_executors() {
+        assert_eq!(auto_build_threads(8, 4), 1);
+        assert_eq!(auto_build_threads(8, 2), 2);
+        assert_eq!(auto_build_threads(16, 2), 4);
+        assert_eq!(auto_build_threads(2, 2), 1);
+        assert_eq!(auto_build_threads(64, 0), 32);
     }
 }

@@ -70,3 +70,16 @@ Option 3, for both HNSW and Vamana.
 - On one thread the batched HNSW build is 20% slower than the old builder (intra-batch
   candidates). Nodes sharing a machine should set `--build-threads`. Query latency during a
   parallel build has not been measured.
+
+## Default revised (2026-09-25)
+
+- On the GCP 50M run (3 × 8 vCPU), `--compaction-slots 4` with the old default ran up to
+  32 build threads per VM. The Raft actors starved and could no longer answer a status
+  request. Leadership piled up on one node (8 of 8 shards), and ingest fell from about
+  40k to 4.7k docs/s.
+- The default is now `hardware threads / (2 × compaction slots)`, at least 1. All
+  concurrent builds together use at most half the machine, and the executors keep the
+  rest. Results do not change: builds are identical whatever the thread count.
+- On this 16-thread development machine with 2 slots, a build now gets 4 threads instead
+  of 16, so a single large build takes longer. Pass `--build-threads` explicitly when
+  builds do not compete with serving.
