@@ -356,3 +356,18 @@ Files: `bench-results/phase4-adr0016-bigann2m-ship.md` and `...-noship.md`.
   per-node breakdown would be needed to explain it. See
   `bench-results/phase4-adr0016-takedown-rerun.md`.
 - Query latency and recall are unchanged within noise.
+
+# Part 5 (2026-09-25): 50M on GCP again, after ADR 0016-0023
+
+See `bench-results/phase4-gcp-bigann50m-2026-09-25.md`.
+
+- Idle cluster, about 9 segments per shard: unfiltered p99 65 ms (stale) and 68 ms
+  (linearizable); 1% filter p99 93 ms (stale) and **118 ms (linearizable, target missed)**;
+  recall 0.985 and 0.991; takedowns visible on all 3 machines at p99 107 ms.
+- At a comparable segment count, every latency is lower than in the 2026-09-24 run.
+- Ingest averaged 6,839 docs/s. Merge-induced stalls took 75% of the time, and the fix is
+  committed but not yet measured.
+- The run found five problems. Four are fixed with tests: build-thread oversubscription,
+  followers timing out a slow leader, merges starving flushes of build slots, and a restart
+  deleting committed merge files. Leader balancing under continuous ingest is still open.
+

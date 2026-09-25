@@ -302,13 +302,32 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Hetzner provisioning refused again: "dedicated core limit exceeded". Nothing created.
     The owner is checking the quota, or an alternative provider.
   - Podman lesson: `localhost` -> ::1 is reset by rootless port forwarding; use 127.0.0.1.
+- 50M on GCP again (2026-09-25, owner: "feu vert pour gcp"; Hetzner still refused, dedicated
+  core limit). bench-results/phase4-gcp-bigann50m-2026-09-25.md. Fleet deleted and checked
+  (about 6 h, estimated 11 USD).
+  - Idle, about 9 seg/shard: unfiltered p99 65/68 ms, 1% filter p99 93 ms stale, **118 ms
+    linearizable (target 100 ms MISSED)**, recall 0.985/0.991, takedown p99 107 ms.
+    Ingest 6,839 docs/s on average, 25-33k outside stalls.
+  - Fixed and committed from what the run exposed:
+    - 3e9bf12: build threads default to hardware threads / (2 x slots);
+    - e97f01e: a slow leader is not a failed one (20 min commit wait, new
+      `SimConfig::offload_delay` test);
+    - e5a466f: merges never take the last build slot (stalls; not measured yet);
+    - 9349678: committed merge files survive a restart.
+  - Open: leader balancing blocked under continuous ingest; a merge of a merge purged before
+    a lagging replica fetches it; the settle test passes during long merges; the filtered
+    linearizable p99; query latency collapses when builds saturate the CPU.
+  - Lesson: remote `pkill -f` / `pgrep -f` match their own `bash -c`; kill by pid from `ps`
+    and check that exactly one process remains.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
 tokens) and `forget-watch`, a deletion propagation monitor (verified vs observed sinks).
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward
-production: measure fetches over a real network; flush publication and compaction
+production: measure ingest with e5a466f + 9349678 on a real cluster; reach and measure 3
+segments per shard with this code; filtered linearizable p99 (scan threshold for large
+segments); leader balancing under continuous ingest; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
 query latency during parallel builds, the bench settle test. Other levers: scan threshold for
