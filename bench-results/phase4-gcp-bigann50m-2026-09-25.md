@@ -4,7 +4,16 @@
   e2-standard-4 client, europe-west1-b, private network; scripts in `tools/scripts/gcp/`.
   Up from 17:10 to 23:07 local time (about 6 h), then deleted. Checked afterwards: no
   instances, disks, firewall rules or network left.
-- Cost: estimated from list prices at about 11 USD. Not checked on the billing console.
+- Cost: **11.71 USD** computed from exact durations and official prices:
+  - durations from the Compute Engine audit logs: instances created at 15:09:39 UTC and
+    deleted at 21:06:59 UTC, 5.96 h;
+  - prices from the Cloud Billing catalog API, europe-west1 on demand (N2 core 0.034773 and
+    RAM 0.004661 USD/h per GiB; E2 core 0.023993 and RAM 0.003216; SSD PD 0.17 USD/GiB-month;
+    external IP 0.005 USD/h);
+  - breakdown: 3 × n2-highmem-8 10.30, e2-standard-4 0.88, 300 GB pd-ssd 0.42, 4 IPs 0.12.
+  - Network was ingress only (free), apart from a few MB of logs.
+  - The project has no billing export, so the invoiced amount can only be read in the
+    console (Billing > Reports), and it appears with up to 24 h delay.
 - Data: the first 50M rows of BigANN (128-d, u8) with bench-gen attributes; brute-force
   ground truth; 1,000 queries per kind from 8 threads, k = 10, ef = 128; 200 takedowns.
 - Compared with the previous GCP run (2026-09-24, commit before ADR 0016, no compaction during

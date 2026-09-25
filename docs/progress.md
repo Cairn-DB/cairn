@@ -304,7 +304,8 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Podman lesson: `localhost` -> ::1 is reset by rootless port forwarding; use 127.0.0.1.
 - 50M on GCP again (2026-09-25, owner: "feu vert pour gcp"; Hetzner still refused, dedicated
   core limit). bench-results/phase4-gcp-bigann50m-2026-09-25.md. Fleet deleted and checked
-  (about 6 h, estimated 11 USD).
+  (5.96 h; 11.71 USD computed from audit-log durations and catalog prices; invoice not
+  readable from the CLI, no billing export).
   - Idle, about 9 seg/shard: unfiltered p99 65/68 ms, 1% filter p99 93 ms stale, **118 ms
     linearizable (target 100 ms MISSED)**, recall 0.985/0.991, takedown p99 107 ms.
     Ingest 6,839 docs/s on average, 25-33k outside stalls.
