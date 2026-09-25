@@ -42,9 +42,120 @@ struct MemtableIndexes {
 pub struct ShardEngine<R: Runtime> {
     store: Store<R>,
     cfg: EngineConfig,
-    indexes: HashMap<SegmentId, SegmentIndexes>,
+    indexes: HashMap<SegmentId, std::sync::Arc<SegmentIndexes>>,
     segments_version: Option<u64>,
-    memtable: Option<MemtableIndexes>,
+    memtable: Option<std::sync::Arc<MemtableIndexes>>,
+}
+
+/// Runs every leg of `q` over one segment's (or the memtable's) indexes, restricted to
+/// `allowed` rows.
+fn run_legs(
+    q: &Query,
+    per_leg: usize,
+    allowed: &Bitmap,
+    doc_ids: &[u64],
+    vectors: &HashMap<usize, VectorIndex>,
+    texts: &HashMap<usize, TextIndex>,
+    legs: &mut [Vec<(DocId, f32)>],
+) -> Result<()> {
+    for (li, leg) in q.vectors.iter().enumerate() {
+        let Some(idx) = vectors.get(&leg.field) else {
+            continue;
+        };
+        let mut vq = VectorQuery::new(per_leg);
+        vq.exact = q.exact;
+        if leg.ef > 0 {
+            vq.ef = leg.ef;
+        }
+        let (res, _) = idx.search(&leg.vector, Some(allowed), vq)?;
+        legs[li].extend(
+            res.into_iter()
+                .map(|(d, row)| (DocId(doc_ids[row as usize]), d)),
+        );
+    }
+    if let Some(t) = &q.text
+        && let Some(idx) = texts.get(&t.field)
+    {
+        let res = idx.search(
+            &TextQuery {
+                field: t.field,
+                text: t.text.clone(),
+                all_terms: t.all_terms,
+            },
+            per_leg,
+            Some(allowed),
+            Bm25Params::default(),
+        );
+        let li = q.vectors.len();
+        legs[li].extend(
+            res.into_iter()
+                .map(|(s, row)| (DocId(doc_ids[row as usize]), s)),
+        );
+    }
+    Ok(())
+}
+
+/// A query's search over a snapshot of one shard (ADR 0025), from
+/// [`ShardEngine::prepare_legs`]: the indexes it reads are shared with the engine and
+/// immutable, and the allowed rows were fixed at capture time, so takedowns applied by then are
+/// honoured. `run` needs nothing else and can run on any thread.
+pub struct LegsJob {
+    q: Query,
+    parts: Vec<(std::sync::Arc<SegmentIndexes>, Bitmap)>,
+    mem: Option<(std::sync::Arc<MemtableIndexes>, Bitmap)>,
+    ready: Option<Vec<LegList>>,
+}
+
+impl LegsJob {
+    fn ready(lists: Vec<LegList>) -> Self {
+        LegsJob {
+            q: Query::new(0),
+            parts: Vec::new(),
+            mem: None,
+            ready: Some(lists),
+        }
+    }
+
+    /// Runs the search: one ranked list per leg (vectors, then text).
+    pub fn run(self) -> Result<Vec<LegList>> {
+        if let Some(lists) = self.ready {
+            return Ok(lists);
+        }
+        let q = &self.q;
+        let per_leg = q.per_leg();
+        let n_legs = q.leg_count();
+        let mut legs: Vec<Vec<(DocId, f32)>> = vec![Vec::new(); n_legs];
+        for (idx, allowed) in &self.parts {
+            run_legs(
+                q,
+                per_leg,
+                allowed,
+                &idx.doc_ids,
+                &idx.vectors,
+                &idx.texts,
+                &mut legs,
+            )?;
+        }
+        if let Some((m, allowed)) = &self.mem {
+            let ids: Vec<u64> = m.docs.iter().map(|d| d.id.get()).collect();
+            run_legs(q, per_leg, allowed, &ids, &m.vectors, &m.texts, &mut legs)?;
+        }
+        let mut lists = Vec::with_capacity(n_legs);
+        for (li, mut hits) in legs.into_iter().enumerate() {
+            let higher_is_better = li >= q.vectors.len();
+            if higher_is_better {
+                hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            } else {
+                hits.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            }
+            hits.truncate(per_leg);
+            lists.push(LegList {
+                hits,
+                higher_is_better,
+            });
+        }
+        Ok(lists)
+    }
 }
 
 impl<R: Runtime> ShardEngine<R> {
@@ -155,19 +266,19 @@ impl<R: Runtime> ShardEngine<R> {
             let doc_ids = view.docs.docids().to_vec();
             self.indexes.insert(
                 id,
-                SegmentIndexes {
+                std::sync::Arc::new(SegmentIndexes {
                     doc_ids,
                     structured,
                     texts,
                     vectors,
-                },
+                }),
             );
         }
         self.segments_version = Some(self.store.segments_version());
         Ok(())
     }
 
-    fn memtable_indexes(&mut self) -> &MemtableIndexes {
+    fn memtable_indexes(&mut self) -> std::sync::Arc<MemtableIndexes> {
         let version = self.store.memtable_version();
         if self.memtable.as_ref().is_none_or(|m| m.version != version) {
             let schema = self.store.schema().clone();
@@ -204,15 +315,15 @@ impl<R: Runtime> ShardEngine<R> {
                     vectors.insert(i, idx);
                 }
             }
-            self.memtable = Some(MemtableIndexes {
+            self.memtable = Some(std::sync::Arc::new(MemtableIndexes {
                 version,
                 docs,
                 structured,
                 texts,
                 vectors,
-            });
+            }));
         }
-        self.memtable.as_ref().expect("just built")
+        self.memtable.clone().expect("just built")
     }
 
     /// Executes a hybrid query.
@@ -248,6 +359,13 @@ impl<R: Runtime> ShardEngine<R> {
     /// Runs every leg of `q` over this shard and returns the per-leg candidate lists (each of
     /// size `q.per_leg()`), unfused, for a coordinator that merges several shards (ADR 0007).
     pub async fn query_legs(&mut self, q: &Query) -> Result<Vec<LegList>> {
+        self.prepare_legs(q).await?.run()
+    }
+
+    /// Captures what `q` needs from the shard as it is now (ADR 0025): the loaded indexes, and
+    /// per segment the rows allowed now (the filter minus deletions). The returned job runs
+    /// the search without the engine, so a replica runs it off its actor, several at a time.
+    pub async fn prepare_legs(&mut self, q: &Query) -> Result<LegsJob> {
         let schema = self.store.schema().clone();
         q.filter.validate(&schema)?;
         for leg in &q.vectors {
@@ -270,7 +388,7 @@ impl<R: Runtime> ShardEngine<R> {
             )));
         }
         if q.k == 0 {
-            return Ok(Vec::new());
+            return Ok(LegsJob::ready(Vec::new()));
         }
         self.refresh().await?;
         if q.leg_count() == 0 {
@@ -282,14 +400,12 @@ impl<R: Runtime> ShardEngine<R> {
                 .into_iter()
                 .map(|(d, _, _)| (d, 0.0))
                 .collect();
-            return Ok(vec![LegList {
+            return Ok(LegsJob::ready(vec![LegList {
                 hits,
                 higher_is_better: true,
-            }]);
+            }]));
         }
-        let per_leg = q.per_leg();
-        let n_legs = q.leg_count();
-        let mut legs: Vec<Vec<(DocId, f32)>> = vec![Vec::new(); n_legs];
+        let mut parts = Vec::new();
         let seg_ids: Vec<SegmentId> = self.store.segments().map(|m| m.id).collect();
         for id in seg_ids {
             let Some(view) = self.store.segment(id) else {
@@ -300,44 +416,23 @@ impl<R: Runtime> ShardEngine<R> {
             };
             let mut allowed = idx.structured.evaluate(&q.filter);
             allowed.and_not_with(&Bitmap::from_deletions(view.deletions));
-            if allowed.count() == 0 {
-                continue;
-            }
-            Self::run_legs(
-                q,
-                per_leg,
-                &allowed,
-                &idx.doc_ids,
-                &idx.vectors,
-                &idx.texts,
-                &mut legs,
-            )?;
-        }
-        {
-            let m = self.memtable_indexes();
-            if !m.docs.is_empty() {
-                let allowed = m.structured.evaluate(&q.filter);
-                if allowed.count() > 0 {
-                    let ids: Vec<u64> = m.docs.iter().map(|d| d.id.get()).collect();
-                    Self::run_legs(q, per_leg, &allowed, &ids, &m.vectors, &m.texts, &mut legs)?;
-                }
+            if allowed.count() > 0 {
+                parts.push((idx.clone(), allowed));
             }
         }
-        let mut lists = Vec::with_capacity(n_legs);
-        for (li, mut hits) in legs.into_iter().enumerate() {
-            let higher_is_better = li >= q.vectors.len();
-            if higher_is_better {
-                hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            } else {
-                hits.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-            }
-            hits.truncate(per_leg);
-            lists.push(LegList {
-                hits,
-                higher_is_better,
-            });
-        }
-        Ok(lists)
+        let m = self.memtable_indexes();
+        let mem = if m.docs.is_empty() {
+            None
+        } else {
+            let allowed = m.structured.evaluate(&q.filter);
+            (allowed.count() > 0).then_some((m, allowed))
+        };
+        Ok(LegsJob {
+            q: q.clone(),
+            parts,
+            mem,
+            ready: None,
+        })
     }
 
     /// Documents matching the filter only (no legs), in id order, up to `q.k`.
@@ -372,52 +467,6 @@ impl<R: Runtime> ShardEngine<R> {
         ids.sort_unstable();
         ids.truncate(q.k);
         Ok(ids.into_iter().map(|d| (d, 0.0, Vec::new())).collect())
-    }
-
-    fn run_legs(
-        q: &Query,
-        per_leg: usize,
-        allowed: &Bitmap,
-        doc_ids: &[u64],
-        vectors: &HashMap<usize, VectorIndex>,
-        texts: &HashMap<usize, TextIndex>,
-        legs: &mut [Vec<(DocId, f32)>],
-    ) -> Result<()> {
-        for (li, leg) in q.vectors.iter().enumerate() {
-            let Some(idx) = vectors.get(&leg.field) else {
-                continue;
-            };
-            let mut vq = VectorQuery::new(per_leg);
-            vq.exact = q.exact;
-            if leg.ef > 0 {
-                vq.ef = leg.ef;
-            }
-            let (res, _) = idx.search(&leg.vector, Some(allowed), vq)?;
-            legs[li].extend(
-                res.into_iter()
-                    .map(|(d, row)| (DocId(doc_ids[row as usize]), d)),
-            );
-        }
-        if let Some(t) = &q.text
-            && let Some(idx) = texts.get(&t.field)
-        {
-            let res = idx.search(
-                &TextQuery {
-                    field: t.field,
-                    text: t.text.clone(),
-                    all_terms: t.all_terms,
-                },
-                per_leg,
-                Some(allowed),
-                Bm25Params::default(),
-            );
-            let li = q.vectors.len();
-            legs[li].extend(
-                res.into_iter()
-                    .map(|(s, row)| (DocId(doc_ids[row as usize]), s)),
-            );
-        }
-        Ok(())
     }
 
     /// Number of loaded segment indexes (diagnostics).
@@ -497,4 +546,11 @@ impl<R: Runtime> ShardEngine<R> {
             .map(|x| x.0)
             .collect()
     }
+}
+
+/// A job crosses to a helper thread (ADR 0025).
+#[allow(dead_code)]
+fn _legs_job_is_send() {
+    fn check<T: Send + 'static>() {}
+    check::<LegsJob>();
 }

@@ -8,7 +8,7 @@ use crate::scan::{TopK, exact_scan};
 use crate::vectors::Vectors;
 use cairn_core::{Metric, Result, Runtime};
 use cairn_storage::SegmentReader;
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 /// Build-time parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,9 +101,15 @@ pub struct VectorIndex {
     hnsw: Option<Hnsw>,
     disk: Option<DiskAnn>,
     params: VectorIndexParams,
-    scratch: RefCell<SearchScratch>,
-    disk_scratch: RefCell<DiskScratch>,
+    /// Search scratch reused across searches, which may run concurrently on several threads
+    /// (ADR 0025): at most `SCRATCH_KEEP` are kept, and extra concurrent searches allocate
+    /// their own.
+    scratch: Mutex<Vec<SearchScratch>>,
+    disk_scratch: Mutex<Vec<DiskScratch>>,
 }
+
+/// Scratch buffers kept per index for reuse.
+const SCRATCH_KEEP: usize = 2;
 
 impl VectorIndex {
     /// Builds the index for schema field `field` from row-major `rows`; `present` marks rows
@@ -154,8 +160,8 @@ impl VectorIndex {
                 hnsw: None,
                 disk: Some(disk),
                 params,
-                scratch: RefCell::new(SearchScratch::new(0)),
-                disk_scratch: RefCell::new(DiskScratch::default()),
+                scratch: Mutex::new(Vec::new()),
+                disk_scratch: Mutex::new(Vec::new()),
             };
         }
         let vectors = Vectors::from_rows(metric, dims, rows, params.sq8);
@@ -169,7 +175,6 @@ impl VectorIndex {
                 par,
             ))
         };
-        let n = vectors.len();
         VectorIndex {
             field,
             vectors,
@@ -177,8 +182,8 @@ impl VectorIndex {
             hnsw,
             disk: None,
             params,
-            scratch: RefCell::new(SearchScratch::new(n)),
-            disk_scratch: RefCell::new(DiskScratch::default()),
+            scratch: Mutex::new(Vec::new()),
+            disk_scratch: Mutex::new(Vec::new()),
         }
     }
 
@@ -193,7 +198,6 @@ impl VectorIndex {
         params: VectorIndexParams,
     ) -> Self {
         let vectors = Vectors::from_rows(metric, dims, rows, params.sq8);
-        let n = vectors.len();
         VectorIndex {
             field,
             vectors,
@@ -201,8 +205,8 @@ impl VectorIndex {
             hnsw: None,
             disk: None,
             params,
-            scratch: RefCell::new(SearchScratch::new(n)),
-            disk_scratch: RefCell::new(DiskScratch::default()),
+            scratch: Mutex::new(Vec::new()),
+            disk_scratch: Mutex::new(Vec::new()),
         }
     }
 
@@ -264,8 +268,8 @@ impl VectorIndex {
                 hnsw: None,
                 disk: Some(disk),
                 params,
-                scratch: RefCell::new(SearchScratch::new(0)),
-                disk_scratch: RefCell::new(DiskScratch::default()),
+                scratch: Mutex::new(Vec::new()),
+                disk_scratch: Mutex::new(Vec::new()),
             });
         }
         let col = reader.read_section(&format!("col.{field}")).await?;
@@ -311,8 +315,8 @@ impl VectorIndex {
             hnsw,
             disk: None,
             params,
-            scratch: RefCell::new(SearchScratch::new(n)),
-            disk_scratch: RefCell::new(DiskScratch::default()),
+            scratch: Mutex::new(Vec::new()),
+            disk_scratch: Mutex::new(Vec::new()),
         })
     }
 
@@ -397,11 +401,20 @@ impl VectorIndex {
                 },
                 beam: 4,
             };
-            let mut s = self.disk_scratch.borrow_mut();
+            let mut s = self
+                .disk_scratch
+                .lock()
+                .expect("scratch pool")
+                .pop()
+                .unwrap_or_default();
             let res = match strategy {
                 Strategy::Scan => d.search_scan(&qv, eff, opts, &mut s),
                 _ => d.search_graph(&qv, eff, opts, &mut s),
             };
+            let mut pool = self.disk_scratch.lock().expect("scratch pool");
+            if pool.len() < SCRATCH_KEEP {
+                pool.push(s);
+            }
             return Ok((res, strategy));
         }
         let res = match strategy {
@@ -414,7 +427,12 @@ impl VectorIndex {
                     max_visits: q.max_visits,
                     exact: q.exact,
                 };
-                let mut scratch = self.scratch.borrow_mut();
+                let mut scratch = self
+                    .scratch
+                    .lock()
+                    .expect("scratch pool")
+                    .pop()
+                    .unwrap_or_else(|| SearchScratch::new(self.vectors.len()));
                 let cands = h.search(
                     &self.vectors,
                     &qv,
@@ -423,6 +441,12 @@ impl VectorIndex {
                     opts,
                     &mut scratch,
                 );
+                {
+                    let mut pool = self.scratch.lock().expect("scratch pool");
+                    if pool.len() < SCRATCH_KEEP {
+                        pool.push(scratch);
+                    }
+                }
                 if self.vectors.has_sq8() && self.vectors.has_f32() && !q.exact {
                     let rows: Vec<u32> = cands.iter().map(|c| c.1).collect();
                     let mut d = vec![0f32; rows.len()];
@@ -441,6 +465,13 @@ impl VectorIndex {
         };
         Ok((res, strategy))
     }
+}
+
+/// Searches share an index across threads (ADR 0025).
+#[allow(dead_code)]
+fn _vector_index_is_shareable() {
+    fn check<T: Send + Sync>() {}
+    check::<VectorIndex>();
 }
 
 #[cfg(test)]

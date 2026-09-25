@@ -320,6 +320,14 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     linearizable p99; query latency collapses when builds saturate the CPU.
   - Lesson: remote `pkill -f` / `pgrep -f` match their own `bash -c`; kill by pid from `ps`
     and check that exactly one process remains.
+- Filtered latency (2026-09-26, owner: "vas-y pour la latence filtree"): ADR 0025.
+  - The scan threshold was ruled out by the SIFT1M sweep: at 1% the graph is worse.
+  - A local reproduction (2 shards of 6.25M, 9 seg/shard) showed the cause: searches ran
+    in the replica actor, one at a time per shard.
+  - Now: snapshot on the actor (`prepare_legs`), search on a helper thread (`LegsJob::run`).
+  - A/B, 8 clients: filtered linearizable p99 34-40 -> 10 ms, 323-326 -> 1,154-1,199 QPS.
+    One client is 0.5-0.9 ms slower (a thread per offload).
+  - NOT measured on GCP yet. Next: a bounded persistent search pool.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
@@ -327,8 +335,9 @@ end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, 
 tokens) and `forget-watch`, a deletion propagation monitor (verified vs observed sinks).
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward
 production: measure ingest with e5a466f + 9349678 on a real cluster; reach and measure 3
-segments per shard with this code; filtered linearizable p99 (scan threshold for large
-segments); leader balancing under continuous ingest; flush publication and compaction
+segments per shard with this code; filtered linearizable p99: the cause (searches in the
+replica actor) is fixed by ADR 0025 and measured locally, not yet on GCP (the scan threshold
+was ruled out); a bounded search thread pool; leader balancing under continuous ingest; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
 query latency during parallel builds, the bench settle test. Other levers: scan threshold for

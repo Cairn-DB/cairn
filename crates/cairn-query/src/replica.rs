@@ -985,8 +985,19 @@ impl<R: Runtime> Replica<R> {
                 done.send(r);
             }
             Event::QueryLegs(q, _, done) => {
-                let r = self.engine.query_legs(&q).await;
-                done.send(r);
+                // The snapshot is taken here, when the read is released (after ReadIndex or
+                // the token's index), and the search runs on a helper thread (ADR 0025):
+                // searches of one shard overlap, and never hold up its Raft work.
+                match self.engine.prepare_legs(&q).await {
+                    Ok(job) => {
+                        let rt = self.rt.clone();
+                        self.rt.spawn(async move {
+                            let r = rt.offload(move || job.run()).await;
+                            done.send(r);
+                        });
+                    }
+                    Err(e) => done.send(Err(e)),
+                }
             }
             Event::Get(id, _, done) => {
                 let r = self.engine.get(id).await;
