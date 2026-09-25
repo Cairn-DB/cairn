@@ -59,3 +59,9 @@ The Rust client is `cairn-client` (`Client::new(addrs)`, `upsert`, `delete`, `ge
 ## Licence
 
 Apache-2.0
+
+## Contributing and license
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) (sign-off with `git commit -s`),
+the [code of conduct](CODE_OF_CONDUCT.md), and [SECURITY.md](SECURITY.md) for reporting
+vulnerabilities privately. Cairn is licensed under the [Apache License 2.0](LICENSE).

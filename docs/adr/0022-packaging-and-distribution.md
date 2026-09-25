@@ -64,10 +64,15 @@ priorities, in order:
   file pins IPs. Kubernetes (StatefulSet DNS names, Helm) needs name resolution at dial time.
 - **One schema per cluster**, read at startup: no collections yet.
 - **Before publishing** (checklist):
-  - add a LICENSE file, CONTRIBUTING, SECURITY and a code of conduct, and set the
-    repository URL in `Cargo.toml`;
-  - remove the names of the owner's other servers and cloud projects from `docs/` and
-    `tools/scripts/`;
+  - done 2026-09-25: LICENSE (Apache-2.0 text), CONTRIBUTING (the project's rules, and a DCO
+    sign-off instead of a CLA: less friction for occasional contributors), SECURITY (GitHub
+    private reporting), CODE_OF_CONDUCT (Contributor Covenant 2.1; the contact address is
+    still to be set). Still to set: the repository URL in `Cargo.toml`, once the organization
+    exists;
+  - done 2026-09-25 in the current files: the names of the owner's other servers and cloud
+    projects removed from `docs/` and `tools/scripts/` (the GCP project is now read from
+    `CAIRN_GCP_PROJECT`). Older commits still carry them, so the history rewrite below must
+    scrub them as well;
   - decide whether to publish the history, which carries the owner's personal e-mail in
     every commit, or to rewrite it with a GitHub no-reply address;
   - add CI: format, lint, tests, a short simulation campaign, and the image build and push.
