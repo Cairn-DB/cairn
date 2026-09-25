@@ -308,7 +308,6 @@ property test, byte-level truncation/corruption proptest, real-fs smoke test.
 - Vote barrier liveness (ADR 0017): a replica that dropped a stale snapshot cannot vote until
   it catches up; if another replica of the shard is down at the same time, the shard has no
   leader until it returns. Safe, but a double fault stalls the shard.
-- Build load concentrates on leaders (ADR 0016); no leader balancing yet.
 - Security limits of ADR 0018: no certificate revocation or hot rotation, no authorization
   (any client certificate may write and take down), no connection limits.
 
