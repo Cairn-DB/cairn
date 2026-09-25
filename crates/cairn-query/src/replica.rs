@@ -433,8 +433,10 @@ const RETIRED_GRACE_ELECTIONS: u64 = 60;
 /// A segment fetch that gets no chunk for this many election timeouts is abandoned for a
 /// local build.
 const FETCH_STALL_ELECTIONS: u64 = 4;
-/// A follower that waited this many election timeouts for the `FlushCommit` of a freeze builds
-/// it itself (the leader that would announce it may have crashed after publishing it).
+/// A follower that waited this many election timeouts for the `FlushCommit` of a freeze, with
+/// no sign of progress from the same leader meanwhile, builds it itself (a lost announcement).
+/// A leader with a queue of builds commits them one after another, which restarts the wait:
+/// on the GCP 50M run a fixed wait made every follower rebuild everything.
 const COMMIT_WAIT_ELECTIONS: u64 = 200;
 
 /// A leader keeps log entries a follower has not matched yet, up to this many payload bytes,
@@ -489,8 +491,11 @@ struct FlushState {
     fetches: std::collections::BTreeMap<SegmentId, SegFetch>,
     /// Freezes to build here although the leader ships them (fetch failed or never announced).
     fallback: std::collections::BTreeSet<SegmentId>,
-    /// Tick at which each freeze was first seen without a commit.
+    /// Tick from which each freeze has waited for its commit: first seen without one, or
+    /// the last sign of the leader's progress (a `FlushCommit` applied, a new leader).
     waiting_since: HashMap<SegmentId, u64>,
+    /// Leader when `waiting_since` was last reset.
+    waiting_leader: Option<NodeId>,
     /// Segments built here whose `FlushCommit` has not been applied yet: `(len, hash)` and the
     /// term in which this replica last proposed the commit.
     announce: std::collections::BTreeMap<SegmentId, ((u64, u64), Option<Term>)>,
@@ -1137,6 +1142,11 @@ impl<R: Runtime> Replica<R> {
                 let cmd = Command::from_bytes(&e.payload)?;
                 if let Command::FlushCommit { id, .. } = &cmd {
                     self.flush.announce.remove(id);
+                    // The leader is making progress on this shard's builds: freezes still
+                    // waiting for their commit start their wait again (it builds in order,
+                    // and may be busy with a queue of them).
+                    let now = self.ticks;
+                    self.flush.waiting_since.values_mut().for_each(|t| *t = now);
                 }
                 let compact_id = match &cmd {
                     Command::CompactCommit { id, .. } => Some(*id),
@@ -1317,6 +1327,13 @@ impl<R: Runtime> Replica<R> {
         );
         self.flush.fallback.retain(|id| live.contains(id));
         self.flush.waiting_since.retain(|id, _| live.contains(id));
+        // A new leader rebuilds or re-announces what is pending: the wait starts again.
+        let leader_now = self.raft.leader();
+        if leader_now != self.flush.waiting_leader {
+            self.flush.waiting_leader = leader_now;
+            let now = self.ticks;
+            self.flush.waiting_since.values_mut().for_each(|t| *t = now);
+        }
         // Fetches of items published or replaced meanwhile are dropped.
         self.flush.fetches.retain(|id, _| live.contains(id));
         let election = u64::from(self.cfg.election_ticks.max(1));
