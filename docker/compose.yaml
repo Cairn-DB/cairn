@@ -1,0 +1,9 @@
+# One development node: podman compose -f docker/compose.yaml up (or docker compose).
+services:
+  cairn:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    image: cairn:dev
+    ports: ["7100:7100"]
+    volumes: ["cairn-data:/data"]
+volumes:
+  cairn-data:

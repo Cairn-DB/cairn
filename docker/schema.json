@@ -1,0 +1,10 @@
+{
+ "fields": [
+  { "name": "embedding", "kind": { "Vector": { "dims": 384, "metric": "Cosine" } } },
+  { "name": "text", "kind": "Text" },
+  { "name": "source", "kind": "Enum" },
+  { "name": "tags", "kind": "Set" },
+  { "name": "created", "kind": "Date" },
+  { "name": "payload", "kind": "Blob" }
+ ]
+}

@@ -1,0 +1,31 @@
+# Three replicated nodes on one host: podman compose -f docker/compose.cluster.yaml up.
+# Peers are addressed by IP: the server does not resolve host names yet.
+x-node: &node
+  build: { context: .., dockerfile: docker/Dockerfile }
+  image: cairn:dev
+  environment: &env
+    CAIRN_PEERS: "1=172.28.0.11:7100 2=172.28.0.12:7100 3=172.28.0.13:7100"
+    CAIRN_CORES: "2"
+services:
+  node1:
+    <<: *node
+    environment: { <<: *env, CAIRN_NODE_ID: "1" }
+    networks: { cairn: { ipv4_address: 172.28.0.11 } }
+    ports: ["7101:7100"]
+    volumes: ["node1:/data"]
+  node2:
+    <<: *node
+    environment: { <<: *env, CAIRN_NODE_ID: "2" }
+    networks: { cairn: { ipv4_address: 172.28.0.12 } }
+    ports: ["7102:7100"]
+    volumes: ["node2:/data"]
+  node3:
+    <<: *node
+    environment: { <<: *env, CAIRN_NODE_ID: "3" }
+    networks: { cairn: { ipv4_address: 172.28.0.13 } }
+    ports: ["7103:7100"]
+    volumes: ["node3:/data"]
+networks:
+  cairn:
+    ipam: { config: [{ subnet: 172.28.0.0/16 }] }
+volumes: { node1: {}, node2: {}, node3: {} }

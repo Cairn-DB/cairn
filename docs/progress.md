@@ -277,6 +277,16 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     (bench-results/phase4-adr0021-catchup.md).
   - Campaign tool note: `campaign.sh 20000 14` skips seeds 19992..19999 (integer split); ran
     them separately, OK.
+- Packaging (2026-09-25, owner: open source, community around deletion guarantees, Docker
+  image first): ADR 0022. Image
+  (docker/Dockerfile, 122 MB, non-root, env configuration), compose for 1 and 3 nodes.
+  Verified with podman: single node, 3-node cluster bench (100k SIFT, takedowns), kill and
+  restart converges in 1.1 s. Podman lesson: compose needs `podman system service` on a short
+  socket path (DOCKER_HOST); /run/user/1000/podman does not exist here, and the scratchpad
+  path is too long for a unix socket.
+  - Owner priorities: (1) 50M latency on real machines (GCP ready; needs the owner's explicit
+    go for billing), (2) product: familiar UI, HTTP/JSON API, Python client, publication on
+    GitHub/GHCR (checklist in ADR 0022).
 
 ## Next step
 ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining toward

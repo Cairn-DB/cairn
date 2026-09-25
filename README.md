@@ -20,6 +20,17 @@ permissions).
 See [`SPEC.md`](SPEC.md) for goals, decisions, roadmap and success criteria, and
 [`docs/adr/`](docs/adr) for architecture decision records.
 
+## Run with Docker
+
+```bash
+docker build -f docker/Dockerfile -t cairn:dev .       # or podman
+docker run -p 7100:7100 -v cairn-data:/data cairn:dev  # one development node
+docker compose -f docker/compose.cluster.yaml up -d    # three replicated nodes (ports 7101-7103)
+```
+
+Configuration is by environment variables (`CAIRN_NODE_ID`, `CAIRN_PEERS`, `CAIRN_SCHEMA`,
+`CAIRN_TLS_DIR`, ...): see `docker/entrypoint.sh` and ADR 0022.
+
 ## Build and test
 
 ```bash
