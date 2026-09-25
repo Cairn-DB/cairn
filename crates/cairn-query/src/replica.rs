@@ -69,6 +69,20 @@ impl JobSlots {
             .is_ok()
     }
 
+    /// Takes a slot for a merge, which may hold it for minutes: never the last free one when
+    /// there are two or more, so a flush always finds one. Without this, two merges on a
+    /// 2-slot node held off every flush, memtables filled, and writes stalled for up to 15
+    /// minutes (GCP 50M run, 2026-09-25).
+    pub fn try_acquire_merge(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let limit = if self.max >= 2 { self.max - 1 } else { 1 };
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |u| {
+                (u < limit).then_some(u + 1)
+            })
+            .is_ok()
+    }
+
     /// Returns a slot.
     pub fn release(&self) {
         self.used.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -1864,7 +1878,7 @@ impl<R: Runtime> Replica<R> {
             return Ok(());
         };
         if let Some(slots) = &self.cfg.compaction_slots {
-            if !slots.try_acquire() {
+            if !slots.try_acquire_merge() {
                 return Ok(());
             }
             self.holds_slot = true;
@@ -2297,4 +2311,35 @@ impl<R: Runtime> Replica<R> {
 
 fn seg_rel(id: SegmentId) -> String {
     format!("segs/{:016x}.seg", id.get())
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::JobSlots;
+
+    #[test]
+    fn merges_leave_a_slot_for_flushes() {
+        let s = JobSlots::new(2);
+        assert!(s.try_acquire_merge());
+        assert!(
+            !s.try_acquire_merge(),
+            "a second merge would take the last slot"
+        );
+        assert!(s.try_acquire(), "a flush still finds one");
+        assert!(!s.try_acquire());
+        s.release();
+        s.release();
+        // A flush holds one: the other is the last free slot, so no merge starts.
+        assert!(s.try_acquire());
+        assert!(!s.try_acquire_merge());
+        s.release();
+        // One slot: no reservation is possible, merges still run.
+        let one = JobSlots::new(1);
+        assert!(one.try_acquire_merge());
+        assert!(!one.try_acquire());
+        let four = JobSlots::new(4);
+        assert!((0..3).all(|_| four.try_acquire_merge()));
+        assert!(!four.try_acquire_merge());
+        assert!(four.try_acquire());
+    }
 }
