@@ -440,12 +440,20 @@ impl<R: Runtime> Store<R> {
                 ]
             })
             .collect();
+        // Merged segments not installed yet are judged after replay (`adopt_merge_files`): a
+        // committed merge's file is kept and reused, so a restart does not make every replica
+        // rebuild it (GCP 50M run, 2026-09-25).
+        let merge_seg = |name: &str| {
+            name.strip_suffix(".seg")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .is_some_and(|id| id & COMPACT_ID_BIT != 0)
+        };
         for name in disk.list(&format!("{dir}/segs")).await? {
             if name.ends_with(".tmp")
                 || name.ends_with(".fetch")
                 || name.ends_with(".built")
                 || (!referenced.contains(&name)
-                    && (name.ends_with(".seg") || name.ends_with(".del")))
+                    && ((name.ends_with(".seg") && !merge_seg(&name)) || name.ends_with(".del")))
             {
                 disk.remove(&format!("{dir}/segs/{name}")).await?;
             }
@@ -532,7 +540,50 @@ impl<R: Runtime> Store<R> {
                 store.apply(e.index, &cmd)?;
             }
         }
+        store.adopt_merge_files().await?;
         Ok(store)
+    }
+
+    /// After replay: reuses the file of every committed, uninstalled merge found on disk with
+    /// the committed length and hash, and removes merge files nothing refers to.
+    async fn adopt_merge_files(&mut self) -> Result<()> {
+        let disk = self.rt.disk();
+        for name in disk.list(&format!("{}/segs", self.dir)).await? {
+            let Some(id) = name
+                .strip_suffix(".seg")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .filter(|id| id & COMPACT_ID_BIT != 0)
+                .map(SegmentId)
+            else {
+                continue;
+            };
+            if self.segments.iter().any(|s| s.meta.id == id) {
+                continue;
+            }
+            let path = seg_path(&self.dir, id);
+            let wanted = self
+                .manifest
+                .compactions
+                .iter()
+                .find(|c| c.id == id)
+                .cloned();
+            let ok = match &wanted {
+                Some(c) => match SegmentReader::open(self.rt.clone(), &path).await {
+                    Ok(r) => {
+                        r.len() == c.len && r.file_hash() == c.hash && r.verify_file_hash().await?
+                    }
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            match wanted {
+                Some(c) if ok => {
+                    self.compaction_files.insert(id, (c.len, c.hash));
+                }
+                _ => disk.remove(&path).await?,
+            }
+        }
+        Ok(())
     }
 
     /// Sets the namespace of this replica's compaction ids (a replicated shard passes its node
@@ -2823,6 +2874,78 @@ mod tests {
                     a.get(DocId(i)).await.unwrap(),
                     "doc {i}"
                 );
+            }
+        });
+    }
+
+    /// A committed merge not yet installed keeps its file across a restart, and the file is
+    /// reused; a merge file nothing refers to is removed. Before this, a restart deleted the
+    /// builder's file and every replica rebuilt the merge (GCP 50M run).
+    #[test]
+    fn committed_merge_file_survives_a_restart() {
+        let (sim, mut ex) = Simulation::new(14, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let cfg = StoreConfig {
+                memtable_max_bytes: usize::MAX,
+                ..small_cfg()
+            };
+            let mut a = Store::open(rt.clone(), "sm", schema(), cfg.clone())
+                .await
+                .unwrap();
+            a.set_compaction_namespace(1);
+            let mut segs = Vec::new();
+            for batch in 0..2u64 {
+                for i in 1..=10u64 {
+                    a.write(&Command::Upsert(vec![doc(batch * 10 + i, 1)]))
+                        .await
+                        .unwrap();
+                }
+                let id = SegmentId(a.write(&Command::FlushBegin).await.unwrap().get());
+                build_local(&mut a, id).await;
+                a.publish_ready().await.unwrap();
+                segs.push(id);
+            }
+            let id = a.reserve_compaction_id().await.unwrap();
+            let job = a.compaction_rows(id, &segs).await.unwrap().unwrap();
+            let sections = Store::<cairn_sim::SimRuntime>::build_sections(
+                &a.manifest.schema,
+                &job.docs,
+                a.indexer.as_ref(),
+            )
+            .unwrap();
+            let (len, hash) = a.write_compaction_file(&job, sections).await.unwrap();
+            a.write(&Command::CompactCommit {
+                id,
+                inputs: segs.clone(),
+                len,
+                hash,
+                from: NodeId(1),
+            })
+            .await
+            .unwrap();
+            a.set_compaction_file(id, (len, hash));
+            // A stray merge file (another id, committed nowhere).
+            let stray = SegmentId(id.get() + 1);
+            let disk = rt.disk();
+            let f = disk
+                .open(&seg_path("sm", stray), cairn_core::OpenMode::CreateTruncate)
+                .await
+                .unwrap();
+            disk.write_at(&f, 0, Bytes::from_static(b"not a segment"))
+                .await
+                .unwrap();
+            disk.sync(&f).await.unwrap();
+            drop(a);
+            let mut a = Store::open(rt.clone(), "sm", schema(), cfg).await.unwrap();
+            let pending = a.pending_compactions();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].1, "the committed merge's file was not kept");
+            assert!(!disk.exists(&seg_path("sm", stray)).await.unwrap());
+            assert_eq!(a.install_compactions().await.unwrap(), 1);
+            assert_eq!(a.segments().map(|m| m.id).collect::<Vec<_>>(), vec![id]);
+            for i in 1..=20u64 {
+                assert_eq!(a.get(DocId(i)).await.unwrap(), Some(doc(i, 1)));
             }
         });
     }
