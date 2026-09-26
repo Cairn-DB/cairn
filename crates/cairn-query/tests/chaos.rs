@@ -418,6 +418,15 @@ fn check(history: &[Record]) -> (usize, usize) {
 fn run(seed: u64) -> (usize, usize, u64) {
     let mut cfg = SimConfig::default();
     cfg.net.drop_prob = 0.03;
+    // Slow syncs on two thirds of the seeds (ADR 0027): up to 30 ms, or up to 150 ms (beyond
+    // the 100 ms election timeout), so that asynchronous persistence interleaves with
+    // elections, appends and crashes.
+    let sync_extra = match seed % 3 {
+        1 => Duration::from_millis(30),
+        2 => Duration::from_millis(150),
+        _ => Duration::ZERO,
+    };
+    cfg.disk.sync_extra_max = sync_extra;
     let (sim, mut ex) = Simulation::new(seed, cfg);
     let mut handles: Vec<ReplicaHandle> = Vec::new();
     for n in 1..=3u32 {
@@ -519,7 +528,8 @@ fn run(seed: u64) -> (usize, usize, u64) {
     // 5 s. A replica that comes back late fetches the segments it missed (ADR 0021), several
     // at a time and with chunks pipelined; one at a time, seeds 16167, 20616, 40964 and 57668
     // needed up to 15 s.
-    ex.block_on(h.sleep(Duration::from_secs(5)));
+    // Convergence takes longer when syncs are slow: every acknowledgement waits for one.
+    ex.block_on(h.sleep(Duration::from_secs(5) + sync_extra * 100));
     // Convergence: same applied index and same documents everywhere.
     let statuses: Vec<_> = ex.block_on({
         let hs = handles.clone();
@@ -603,8 +613,11 @@ fn run(seed: u64) -> (usize, usize, u64) {
             )
         })
         .count();
+    // With syncs slower than an election timeout, acknowledged writes are scarce under the
+    // injected faults (synchronous persistence made none at all there): require some.
+    let least = if sync_extra > Duration::from_millis(100) { 1 } else { 5 };
     assert!(
-        writes >= 5 && reads >= 5,
+        writes >= least && reads >= least,
         "seed {seed}: too little activity: {writes} writes, {reads} reads"
     );
     (reads, checked, sim.digest())

@@ -11,13 +11,13 @@ use crate::query::{Hit, Query};
 use crate::wire::{Frame, FrameBody};
 use bytes::Bytes;
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::sync::{LocalQueue, Sender, oneshot};
+use cairn_core::sync::{LocalQueue, Receiver, Sender, oneshot};
 use cairn_core::{
     Disk, DocId, Document, Duration, Error, HashMap, LogIndex, Network, NodeId, Result, Runtime,
     Schema, SegmentId, ShardId, Term,
 };
 use cairn_index::DefaultIndexer;
-use cairn_raft::{Entry, HardState, InitialState, Raft, Ready, Role, Snapshot};
+use cairn_raft::{Entry, HardState, InitialState, Message, Raft, Ready, Role, Snapshot};
 use cairn_storage::manifest::{Manifest, ManifestStore};
 use cairn_storage::{Command, LogEntry, Store};
 
@@ -186,6 +186,8 @@ enum Event {
         generation: u64,
         file: Result<(u64, u64)>,
     },
+    /// The persistence task with this sequence number finished (ADR 0027).
+    Persisted(u64),
     /// A segment's indexes were decoded outside the actor, ahead of its publication (ADR 0026).
     IndexesReady {
         id: SegmentId,
@@ -206,6 +208,7 @@ impl Event {
             Event::FlushWritten { .. } => "flush_written",
             Event::CompactWritten { .. } => "compact_written",
             Event::IndexesReady { .. } => "indexes_ready",
+            Event::Persisted(_) => "persisted",
         }
     }
 }
@@ -239,6 +242,7 @@ impl Drop for AliveGuard {
                 | Event::Net(..)
                 | Event::FlushWritten { .. }
                 | Event::CompactWritten { .. }
+                | Event::Persisted(_)
                 | Event::IndexesReady { .. } => {}
             }
         }
@@ -508,6 +512,30 @@ pub struct Replica<R: Runtime> {
     deferred: std::collections::VecDeque<(Command, Sender<Result<Token>>)>,
     /// Flush state (ADR 0016), reset when the replica reopens.
     flush: FlushState,
+    persist: Persistence,
+}
+
+/// What a persistence task reports: its sequence, the log index it made durable, the outcome.
+type PersistOutcome = (u64, Option<LogIndex>, Result<()>);
+
+/// Asynchronous persistence of the Raft log and state (ADR 0027). At most one task runs; work
+/// written meanwhile goes to the next one, so one sync covers many batches.
+#[derive(Default)]
+struct Persistence {
+    /// Sequence number of the running task.
+    running: Option<u64>,
+    /// The running task's outcome.
+    done: Option<Receiver<PersistOutcome>>,
+    /// Sequence the next task will carry.
+    next_seq: u64,
+    /// Written log entries or a state change not covered by any task yet.
+    work: bool,
+    /// `state` changed since it was last stored.
+    state_dirty: bool,
+    /// The log is durable through this index.
+    durable: LogIndex,
+    /// Messages waiting for durability, with the task sequence that makes them durable.
+    held: std::collections::VecDeque<(u64, Vec<(NodeId, Message)>)>,
 }
 
 /// Per-replica flush bookkeeping (ADR 0016). Not persisted: after a restart the pending
@@ -669,6 +697,10 @@ impl<R: Runtime> Replica<R> {
     /// Reopens everything from disk after a fatal error (the in-memory equivalent of a crash and
     /// restart); pending requests are failed.
     async fn reopen(&mut self) -> Result<()> {
+        // A running persistence task must not write the state file after it is reread.
+        if let Some(rx) = self.persist.done.take() {
+            let _ = rx.await;
+        }
         let (engine, raft, state, state_store, resume) =
             Self::open_state(&self.rt, &self.cfg, &self.schema).await?;
         self.engine = engine;
@@ -677,6 +709,11 @@ impl<R: Runtime> Replica<R> {
         self.state_store = state_store;
         self.fetch = None;
         self.flush = FlushState::default();
+        self.persist = Persistence {
+            next_seq: self.persist.next_seq + 1,
+            ..Persistence::default()
+        };
+        self.persist.durable = self.log_durable_now();
         if let Some((s, from)) = resume {
             self.start_fetch(s, from).await?;
         }
@@ -739,7 +776,10 @@ impl<R: Runtime> Replica<R> {
             holds_slot: false,
             deferred: std::collections::VecDeque::new(),
             flush: FlushState::default(),
+            persist: Persistence::default(),
         };
+        replica.persist.durable = replica.log_durable_now();
+        replica.persist.next_seq = 1;
         // Ticker.
         let (h, r2, tick) = (handle.clone(), rt.clone(), cfg.tick);
         rt.spawn(async move {
@@ -781,6 +821,7 @@ impl<R: Runtime> Replica<R> {
                         | Event::Net(..)
                         | Event::FlushWritten { .. }
                         | Event::CompactWritten { .. }
+                        | Event::Persisted(_)
                         | Event::IndexesReady { .. } => {}
                     }
                 }
@@ -889,6 +930,18 @@ impl<R: Runtime> Replica<R> {
                     }
                 }
                 self.drive_flushes().await?;
+            }
+            Event::Persisted(seq) => {
+                if self.persist.running == Some(seq)
+                    && let Some(rx) = self.persist.done.take()
+                {
+                    let (seq, up_to, r) = rx.await.unwrap_or((
+                        seq,
+                        None,
+                        Err(Error::Internal("persistence task dropped".into())),
+                    ));
+                    self.finish_persistence(seq, up_to, r).await?;
+                }
             }
             Event::IndexesReady { id, indexes } => {
                 self.flush.preparing.remove(&id);
@@ -1166,80 +1219,251 @@ impl<R: Runtime> Replica<R> {
     }
 
     /// Runs the persist → send → apply → advance cycle until Raft has nothing more.
+    /// The log's last index, or the applied index when the log holds nothing after it.
+    fn log_durable_now(&self) -> LogIndex {
+        self.engine
+            .store()
+            .log()
+            .last_index()
+            .unwrap_or(self.engine.store().manifest().applied_index)
+    }
+
+    /// Starts a persistence task if there is work and none is running (ADR 0027). It syncs
+    /// the log files written since the last sync, then stores the Raft state, in that order (a
+    /// commit index must never be durable before the entries it covers, chaos seed 2227; it is
+    /// also capped at the synced index). Its end comes back as `Event::Persisted`.
+    fn start_persistence(&mut self) {
+        if self.persist.running.is_some() || !self.persist.work {
+            return;
+        }
+        let seq = self.persist.next_seq;
+        self.persist.next_seq += 1;
+        self.persist.work = false;
+        let plan = self.engine.store_mut().log_mut().sync_plan();
+        let up_to = plan.as_ref().and_then(|p| p.up_to);
+        let state = if self.persist.state_dirty {
+            self.persist.state_dirty = false;
+            let mut st = self.state;
+            let cap = up_to
+                .unwrap_or(self.persist.durable)
+                .max(self.persist.durable);
+            st.hs.commit = st.hs.commit.min(cap);
+            Some(st)
+        } else {
+            None
+        };
+        let store = ManifestStore::<R>::new(self.rt.clone(), self.state_store.path().to_owned());
+        let (tx, rx) = oneshot();
+        let inbox = self.inbox.clone();
+        self.persist.running = Some(seq);
+        self.persist.done = Some(rx);
+        self.rt.spawn(async move {
+            let mut r = Ok(());
+            if let Some(plan) = plan {
+                r = plan.run().await;
+            }
+            if r.is_ok()
+                && let Some(st) = state
+            {
+                r = store.store(&st).await;
+            }
+            tx.send((seq, up_to, r));
+            inbox.push(Event::Persisted(seq));
+        });
+    }
+
+    /// Records a finished persistence task: what it made durable, the messages that waited
+    /// for it, and Raft's durable index. Starts the next task if work accumulated.
+    async fn finish_persistence(
+        &mut self,
+        seq: u64,
+        up_to: Option<LogIndex>,
+        r: Result<()>,
+    ) -> Result<()> {
+        self.persist.running = None;
+        self.persist.done = None;
+        r?;
+        if let Some(i) = up_to {
+            self.persist.durable = self.persist.durable.max(i);
+            self.engine.store_mut().log_mut().mark_synced(Some(i));
+        }
+        while self.persist.held.front().is_some_and(|(s, _)| *s <= seq) {
+            let (_, msgs) = self.persist.held.pop_front().expect("checked");
+            for (to, m) in msgs {
+                self.send(to, FrameBody::Raft(m)).await;
+            }
+        }
+        let applied = self.engine.store().applied_index();
+        self.raft.advance(self.persist.durable, applied);
+        self.start_persistence();
+        Ok(())
+    }
+
+    /// Waits for the running persistence task, and for any it chains, to finish.
+    async fn settle_persistence(&mut self) -> Result<()> {
+        while let Some(rx) = self.persist.done.take() {
+            let seq = self.persist.running.unwrap_or_default();
+            let (seq, up_to, r) = rx.await.unwrap_or((
+                seq,
+                None,
+                Err(Error::Internal("persistence task dropped".into())),
+            ));
+            self.finish_persistence(seq, up_to, r).await?;
+        }
+        Ok(())
+    }
+
+    /// Makes everything written durable and stores the Raft state now, on the actor: for the
+    /// rare writes (vote barrier, snapshot term, read floor) that must not race a persistence
+    /// task storing an older state.
+    async fn store_state_now(&mut self) -> Result<()> {
+        self.settle_persistence().await?;
+        self.engine.store_mut().log_mut().sync().await?;
+        self.persist.durable = self.persist.durable.max(self.log_durable_now());
+        self.state_store.store(&self.state).await?;
+        self.persist.state_dirty = false;
+        self.persist.work = false;
+        self.release_all_held().await;
+        Ok(())
+    }
+
+    /// Everything is durable: every held message may leave.
+    async fn release_all_held(&mut self) {
+        while let Some((_, msgs)) = self.persist.held.pop_front() {
+            for (to, m) in msgs {
+                self.send(to, FrameBody::Raft(m)).await;
+            }
+        }
+    }
+
     async fn drain_ready(&mut self) -> Result<()> {
         loop {
             let ready: Ready = self.raft.ready();
             if ready.is_empty() {
                 return Ok(());
             }
-            // Entries before the hard state: the hard state carries the commit index, and a
-            // crash between the two writes must leave a commit index that is too low (harmless:
-            // Raft re-sends), never one that covers a stale entry still on disk. Writing the hard
-            // state first let a restart replay a conflicting entry from an earlier term as
-            // committed (chaos seed 2227).
-            // An accepted snapshot first: it is persisted, and the log restarts after it,
-            // before any entry that follows it is appended or acknowledged.
-            if let Some(snap) = ready.snapshot {
-                tracing::info!(node = %self.cfg.id, last_index = %snap.last_index, applied = %self.engine.store().applied_index(), "snapshot accepted");
-                // Raft records the sender as leader when it accepts a snapshot.
-                let source = self.raft.leader();
-                ManifestStore::<R>::new(self.rt.clone(), format!("{}/SNAPSHOT", self.cfg.dir))
-                    .store(&PendingSnapshot {
-                        last_index: snap.last_index,
-                        last_term: snap.last_term,
-                        data: snap.data.clone(),
-                        from: source,
-                    })
-                    .await?;
-                self.engine
-                    .store_mut()
-                    .log_mut()
-                    .reset(snap.last_index.next())
-                    .await?;
-                self.start_fetch(snap, source).await?;
-            }
-            if let Some(t) = ready.truncate_from {
-                self.engine.store_mut().log_mut().truncate_suffix(t).await?;
-            }
-            if !ready.entries.is_empty() {
-                let entries: Vec<LogEntry> = ready
-                    .entries
-                    .iter()
-                    .map(|e| LogEntry {
-                        index: e.index,
-                        term: e.term,
-                        payload: e.payload.clone(),
-                    })
-                    .collect();
-                let log = self.engine.store_mut().log_mut();
-                let first = entries[0].index;
-                if first < log.first_index() {
-                    // Raft restarted below the on-disk log (crash mid snapshot install).
-                    log.reset(first).await?;
-                } else if log.next_index() != first {
-                    // The on-disk log is ahead of Raft's view; align.
-                    log.truncate_suffix(first).await?;
+            // Snapshots, truncations and a log out of line with Raft are rare: they wait for the
+            // running persistence task, then persist synchronously as before. Everything else
+            // is appended here and synced by a persistence task (ADR 0027).
+            let realign = ready.entries.first().is_some_and(|e| {
+                let log = self.engine.store().log();
+                e.index < log.first_index() || log.next_index() != e.index
+            });
+            if ready.snapshot.is_some() || ready.truncate_from.is_some() || realign {
+                self.settle_persistence().await?;
+                // Entries before the hard state: the hard state carries the commit index, and a
+                // crash between the two writes must leave a commit index that is too low (harmless:
+                // Raft re-sends), never one that covers a stale entry still on disk. Writing the hard
+                // state first let a restart replay a conflicting entry from an earlier term as
+                // committed (chaos seed 2227).
+                // An accepted snapshot first: it is persisted, and the log restarts after it,
+                // before any entry that follows it is appended or acknowledged.
+                if let Some(snap) = ready.snapshot {
+                    tracing::info!(node = %self.cfg.id, last_index = %snap.last_index, applied = %self.engine.store().applied_index(), "snapshot accepted");
+                    // Raft records the sender as leader when it accepts a snapshot.
+                    let source = self.raft.leader();
+                    ManifestStore::<R>::new(self.rt.clone(), format!("{}/SNAPSHOT", self.cfg.dir))
+                        .store(&PendingSnapshot {
+                            last_index: snap.last_index,
+                            last_term: snap.last_term,
+                            data: snap.data.clone(),
+                            from: source,
+                        })
+                        .await?;
+                    self.engine
+                        .store_mut()
+                        .log_mut()
+                        .reset(snap.last_index.next())
+                        .await?;
+                    self.start_fetch(snap, source).await?;
                 }
-                let t = self.rt.now();
-                log.append(&entries).await?;
-                log.sync().await?;
-                let took = self.rt.now() - t;
-                if took >= SLOW_STEP / 2 {
-                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, entries = entries.len(), ms = took.as_millis() as u64, "slow Raft log append and sync");
+                if let Some(t) = ready.truncate_from {
+                    self.engine.store_mut().log_mut().truncate_suffix(t).await?;
                 }
-            }
-            if let Some(hs) = ready.hard_state {
-                self.state.hs = hs;
-                let t = self.rt.now();
-                self.state_store.store(&self.state).await?;
-                let took = self.rt.now() - t;
-                if took >= SLOW_STEP / 2 {
-                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, ms = took.as_millis() as u64, "slow hard-state store");
+                if !ready.entries.is_empty() {
+                    let entries: Vec<LogEntry> = ready
+                        .entries
+                        .iter()
+                        .map(|e| LogEntry {
+                            index: e.index,
+                            term: e.term,
+                            payload: e.payload.clone(),
+                        })
+                        .collect();
+                    let log = self.engine.store_mut().log_mut();
+                    let first = entries[0].index;
+                    if first < log.first_index() {
+                        // Raft restarted below the on-disk log (crash mid snapshot install).
+                        log.reset(first).await?;
+                    } else if log.next_index() != first {
+                        // The on-disk log is ahead of Raft's view; align.
+                        log.truncate_suffix(first).await?;
+                    }
+                    let t = self.rt.now();
+                    log.append(&entries).await?;
+                    log.sync().await?;
+                    let took = self.rt.now() - t;
+                    if took >= SLOW_STEP / 2 {
+                        tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, entries = entries.len(), ms = took.as_millis() as u64, "slow Raft log append and sync");
+                    }
                 }
-            }
-            // Synchronous persistence: everything is durable here, both lists may leave.
-            for (to, m) in ready.messages.into_iter().chain(ready.persisted_messages) {
-                self.send(to, FrameBody::Raft(m)).await;
+                if let Some(hs) = ready.hard_state {
+                    self.state.hs = hs;
+                    let t = self.rt.now();
+                    self.state_store.store(&self.state).await?;
+                    let took = self.rt.now() - t;
+                    if took >= SLOW_STEP / 2 {
+                        tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, ms = took.as_millis() as u64, "slow hard-state store");
+                    }
+                }
+                self.persist.state_dirty = false;
+                self.persist.work = false;
+                self.persist.durable = self.persist.durable.max(self.log_durable_now());
+                self.release_all_held().await;
+                for (to, m) in ready.messages.into_iter().chain(ready.persisted_messages) {
+                    self.send(to, FrameBody::Raft(m)).await;
+                }
+            } else {
+                if !ready.entries.is_empty() {
+                    let entries: Vec<LogEntry> = ready
+                        .entries
+                        .iter()
+                        .map(|e| LogEntry {
+                            index: e.index,
+                            term: e.term,
+                            payload: e.payload.clone(),
+                        })
+                        .collect();
+                    self.engine.store_mut().log_mut().append(&entries).await?;
+                    self.persist.work = true;
+                }
+                if let Some(hs) = ready.hard_state {
+                    self.state.hs = hs;
+                    self.persist.state_dirty = true;
+                    self.persist.work = true;
+                }
+                // A leader's appends leave before its own copy is durable (ADR 0027).
+                for (to, m) in ready.messages {
+                    self.send(to, FrameBody::Raft(m)).await;
+                }
+                // The rest waits for the task that makes this ready durable: the next one if
+                // this ready wrote something, else the running one, else nothing.
+                if !ready.persisted_messages.is_empty() {
+                    let after = if self.persist.work {
+                        Some(self.persist.next_seq)
+                    } else {
+                        self.persist.running
+                    };
+                    match after {
+                        Some(seq) => self.persist.held.push_back((seq, ready.persisted_messages)),
+                        None => {
+                            for (to, m) in ready.persisted_messages {
+                                self.send(to, FrameBody::Raft(m)).await;
+                            }
+                        }
+                    }
+                }
+                self.start_persistence();
             }
             for e in &ready.committed {
                 let cmd = Command::from_bytes(&e.payload)?;
@@ -1327,14 +1551,8 @@ impl<R: Runtime> Replica<R> {
                     }));
                 }
             }
-            let persisted = self
-                .engine
-                .store()
-                .log()
-                .last_index()
-                .unwrap_or(self.engine.store().manifest().applied_index);
             let applied = self.engine.store().applied_index();
-            self.raft.advance(persisted, applied);
+            self.raft.advance(self.persist.durable, applied);
         }
     }
 
@@ -1861,7 +2079,7 @@ impl<R: Runtime> Replica<R> {
             };
             self.compact_raft_log(snap);
             self.state.snapshot_term = term;
-            self.state_store.store(&self.state).await?;
+            self.store_state_now().await?;
         }
         // A full memtable flushes before any compaction: compactions are long, and writes are
         // held back while the memtable is over its limit.
@@ -2395,7 +2613,7 @@ impl<R: Runtime> Replica<R> {
             self.state.vote_barrier = self.raft.last_index();
             self.state.vote_barrier_term = self.raft.last_log_term();
         }
-        self.state_store.store(&self.state).await?;
+        self.store_state_now().await?;
         let pending = format!("{}/SNAPSHOT", self.cfg.dir);
         if self.rt.disk().exists(&pending).await? {
             self.rt.disk().remove(&pending).await?;
@@ -2413,7 +2631,7 @@ impl<R: Runtime> Replica<R> {
         // follower then refused every append at that index, forever).
         self.state.read_floor = self.state.read_floor.max(f.floor);
         self.state.snapshot_term = f.last_term;
-        self.state_store.store(&self.state).await?;
+        self.store_state_now().await?;
         let files: Vec<String> = f
             .needed
             .iter()
@@ -2441,7 +2659,7 @@ impl<R: Runtime> Replica<R> {
         debug_assert_eq!(applied, f.last_index);
         // Term of the snapshot point as Raft recorded it.
         self.state.snapshot_term = self.raft.snapshot_term();
-        self.state_store.store(&self.state).await?;
+        self.store_state_now().await?;
         // Offer the installed state to lagging followers should this replica become leader:
         // without it, a leader whose log starts after a follower's next index sent that
         // follower nothing at all, not even heartbeats (chaos seed 1431, found once the
@@ -2451,6 +2669,7 @@ impl<R: Runtime> Replica<R> {
             last_term: self.raft.snapshot_term(),
             data: self.engine.store().manifest_bytes(),
         });
+        self.persist.durable = self.persist.durable.max(applied);
         self.raft.advance(applied, applied);
         // Anyone waiting on an index at or below the snapshot can proceed.
         self.serve_waiting().await

@@ -30,6 +30,9 @@ pub struct DiskConfig {
     pub read_bitflip_prob: f64,
     /// Probability that a write or sync fails with an injected I/O error.
     pub io_error_prob: f64,
+    /// Extra latency of a sync, drawn up to this bound: a sync that waits behind other writes
+    /// (ADR 0027). Zero by default, which keeps existing traces unchanged.
+    pub sync_extra_max: Duration,
 }
 
 impl Default for DiskConfig {
@@ -41,6 +44,7 @@ impl Default for DiskConfig {
             torn_writes: true,
             read_bitflip_prob: 0.0,
             io_error_prob: 0.0,
+            sync_extra_max: Duration::ZERO,
         }
     }
 }
@@ -325,9 +329,12 @@ impl SimDisk {
     }
 
     /// Completion time for an operation on `inode`, preserving per-file order.
-    fn completion_time(&self, inode: Option<u64>) -> Instant {
+    fn completion_time(&self, inode: Option<u64>, extra_max: Duration) -> Instant {
         let cfg = &self.sim.inner.config.disk;
-        let at = self.sim.now() + self.sim.latency(cfg.latency_min, cfg.latency_max);
+        let mut at = self.sim.now() + self.sim.latency(cfg.latency_min, cfg.latency_max);
+        if !extra_max.is_zero() {
+            at += self.sim.latency(Duration::ZERO, extra_max);
+        }
         match inode {
             None => at,
             Some(id) => self.with_state(|d| {
@@ -346,7 +353,18 @@ impl SimDisk {
         kind: &'static str,
         op: impl FnOnce(&mut DiskState, &mut SeededRng) -> Result<T> + 'static,
     ) -> Result<T> {
-        let at = self.completion_time(inode);
+        self.deferred_after(inode, kind, Duration::ZERO, op).await
+    }
+
+    /// As `deferred`, with up to `extra_max` of additional latency.
+    async fn deferred_after<T: 'static>(
+        &self,
+        inode: Option<u64>,
+        kind: &'static str,
+        extra_max: Duration,
+        op: impl FnOnce(&mut DiskState, &mut SeededRng) -> Result<T> + 'static,
+    ) -> Result<T> {
+        let at = self.completion_time(inode, extra_max);
         let (c, completer) = completion();
         let sim = self.sim.clone();
         let node = self.node;
@@ -455,7 +473,8 @@ impl Disk for SimDisk {
     async fn sync(&self, file: &Self::File) -> Result<()> {
         let id = file.inode;
         let cfg = self.sim.inner.config.disk.clone();
-        self.deferred(Some(id), "disk.sync", move |d, rng| {
+        let extra = cfg.sync_extra_max;
+        self.deferred_after(Some(id), "disk.sync", extra, move |d, rng| {
             Self::maybe_io_error(&cfg, rng, "sync")?;
             d.syncs += 1;
             let inode = d

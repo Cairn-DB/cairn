@@ -5,9 +5,11 @@
 //! crc) followed by records `[len u32][crc32 u32][term u64][index u64][payload]`. Recovery scans
 //! each file and truncates it at the first record that is short, has a bad checksum or an
 //! unexpected index; a torn tail therefore costs at most the unsynced suffix, never an
-//! acknowledged entry. Files roll over at [`LogConfig::max_file_bytes`]; the previous file is
-//! synced before the next is created, so a gap between files means the later files are garbage
-//! from an interrupted rollover and they are removed.
+//! acknowledged entry. Files roll over at [`LogConfig::max_file_bytes`]. A rollover does not
+//! sync the previous file itself (ADR 0027): the next sync covers every file written since the
+//! last one, in file order, and nothing counts as durable before the whole sync completes. A
+//! gap between files after a crash therefore means the later files were never acknowledged:
+//! they are removed.
 
 use crate::codec::{Reader, Writer, crc32};
 use bytes::Bytes;
@@ -159,7 +161,30 @@ pub struct Log<R: Runtime> {
     files: Vec<LogFile<<R::Disk as Disk>::File>>,
     /// Last index known to be durable.
     synced: Option<u64>,
+    /// The active file has writes not synced yet.
     dirty: bool,
+    /// Earlier files with writes not synced yet (left by a rollover, ADR 0027).
+    dirty_prev: Vec<<R::Disk as Disk>::File>,
+}
+
+/// Files to sync to make the log durable up to `up_to` (from [`Log::sync_plan`]). It needs
+/// only the runtime, so it runs outside the replica actor while appends continue (ADR 0027).
+pub struct SyncPlan<R: Runtime> {
+    rt: R,
+    files: Vec<<R::Disk as Disk>::File>,
+    /// Last index the plan covers.
+    pub up_to: Option<LogIndex>,
+}
+
+impl<R: Runtime> SyncPlan<R> {
+    /// Syncs the planned files.
+    pub async fn run(self) -> Result<()> {
+        let disk = self.rt.disk();
+        for f in &self.files {
+            disk.sync(f).await?;
+        }
+        Ok(())
+    }
 }
 
 impl<R: Runtime> Log<R> {
@@ -183,6 +208,7 @@ impl<R: Runtime> Log<R> {
             files: Vec::new(),
             synced: None,
             dirty: false,
+            dirty_prev: Vec::new(),
         };
         let mut expected_next: Option<u64> = None;
         let mut garbage_from = None;
@@ -323,8 +349,9 @@ impl<R: Runtime> Log<R> {
             // Roll over when the active file is full (and holds at least one entry).
             let active = self.files.last().expect("at least one log file");
             if active.len >= self.cfg.max_file_bytes && !active.entries.is_empty() {
+                // Synced with the next sync, not here: a rollover must not make an append wait.
                 if self.dirty {
-                    disk.sync(&active.file).await?;
+                    self.dirty_prev.push(active.file.clone());
                     self.dirty = false;
                 }
                 let lf = self.create_file(entries[i].index.get()).await?;
@@ -359,13 +386,43 @@ impl<R: Runtime> Log<R> {
 
     /// Makes every appended entry durable.
     pub async fn sync(&mut self) -> Result<()> {
-        if self.dirty {
-            let active = self.files.last().expect("at least one log file");
-            self.rt.disk().sync(&active.file).await?;
-            self.dirty = false;
+        if let Some(plan) = self.sync_plan() {
+            plan.run().await?;
         }
         self.synced = self.last_index().map(LogIndex::get);
         Ok(())
+    }
+
+    /// The files written since the last sync, and the index they cover; `None` when nothing
+    /// is waiting. The caller runs the plan (possibly elsewhere) and then reports it with
+    /// [`Log::mark_synced`]. Appends may continue meanwhile: they go into the next plan.
+    pub fn sync_plan(&mut self) -> Option<SyncPlan<R>> {
+        let mut files = std::mem::take(&mut self.dirty_prev);
+        if self.dirty {
+            files.push(
+                self.files
+                    .last()
+                    .expect("at least one log file")
+                    .file
+                    .clone(),
+            );
+            self.dirty = false;
+        }
+        if files.is_empty() {
+            return None;
+        }
+        Some(SyncPlan {
+            rt: self.rt.clone(),
+            files,
+            up_to: self.last_index(),
+        })
+    }
+
+    /// Records that a plan covering entries up to `up_to` completed.
+    pub fn mark_synced(&mut self, up_to: Option<LogIndex>) {
+        if let Some(i) = up_to {
+            self.synced = Some(self.synced.map_or(i.get(), |s| s.max(i.get())));
+        }
     }
 
     fn locate(&self, index: u64) -> Option<(usize, u64, u32)> {
@@ -445,6 +502,9 @@ impl<R: Runtime> Log<R> {
             active.len = off;
             disk.set_len(&active.file, off).await?;
         }
+        for f in std::mem::take(&mut self.dirty_prev) {
+            disk.sync(&f).await?;
+        }
         disk.sync(&active.file).await?;
         self.dirty = false;
         self.synced = self.last_index().map(LogIndex::get);
@@ -475,6 +535,7 @@ impl<R: Runtime> Log<R> {
         let lf = self.create_file(first_index.get()).await?;
         self.files.push(lf);
         self.dirty = false;
+        self.dirty_prev.clear();
         self.synced = None;
         Ok(())
     }
