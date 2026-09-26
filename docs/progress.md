@@ -342,6 +342,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Mistake: `git checkout -- segment.rs` to revert the chunked writes also reverted the
     uncommitted MappedSegment code; it was reapplied from the session. Revert edits
     precisely, not whole files, while work is uncommitted.
+- GCP 50M run 6 (2026-09-26, owner: "go gcp"): bench-results/phase4-gcp-bigann50m-2026-09-26.md.
+  - **Filtered linearizable p99 40 ms: target MET** (was 118 ms), with about 12 seg/shard.
+    Unfiltered p99 34/33 ms, throughput doubled, takedown p99 108 ms.
+  - Ingest not improved: 6,493 docs/s, stalls caused by synchronous syncs on the actor
+    (instrumented locally).
+  - Cost 27.46 USD, of which about 21 USD was a deploy blocked for 10.7 h on stale SSH host
+    keys (scripts fixed in 4833326). Fleet deleted and checked.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
@@ -351,7 +358,8 @@ ADR 0016 is complete (steps 1-6, 2026-09-25), with pipelined fetches. Remaining 
 production: measure ingest with e5a466f + 9349678 on a real cluster; reach and measure 3
 segments per shard with this code; filtered linearizable p99: the cause (searches in the
 replica actor) is fixed by ADR 0025 and measured locally, not yet on GCP (the scan threshold
-was ruled out); the single-client overhead of off-actor searches (about 0.5 ms, cause
+was ruled out) is MET on GCP (40 ms); asynchronous Raft persistence for the ingest stalls;
+the single-client overhead of off-actor searches (about 0.5 ms, cause
 unknown); leader balancing under continuous ingest; flush publication and compaction
 install still read section headers on the actor; takedown p99 with balancing (open);
 from ADR 0018: CRL / certificate rotation, authorization, connection limits; from ADR 0019:
