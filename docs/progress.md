@@ -365,6 +365,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     0.6-1 s: most likely the Raft log append (page-cache write throttled under dirty
     pressure), not measured separately. Next: time the append, or the GCP run (owner's go).
 
+- GCP 50M run 7 (2026-09-26, owner: "go gcp"): bench-results/phase4-gcp-bigann50m-run7-ingest.md.
+  - Ingest 5,542 docs/s (run 6: 6,493): **no gain**. The actor now blocks about 0.4% of the
+    time. Stalls are build throughput: 2 slots x 2 threads use at most half of 8 vCPU,
+    leaders are unbalanced (the leader builds), and some fetches fall back to local builds.
+  - Bug: too many open files (fetch writes unbounded since 3f4e21d), fixed in a7520b9.
+  - Query phase dropped: merges kept running after the restart without merges. Fleet
+    deleted at 23:31 UTC, about 7.7 USD. Owner's rule: always put a hard deadline on a
+    cloud run (a watchdog that tears the fleet down).
+  - Next levers: build parallelism (threads per slot now that the actor does not block),
+    leader balancing, the `flush_written` handle time (1 to 3 s), and merges that ignore
+    `--max-segments` after a restart.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
