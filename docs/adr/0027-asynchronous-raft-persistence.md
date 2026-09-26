@@ -81,3 +81,39 @@ time the shard's actor serves nothing: no writes, no reads, no heartbeats (elect
   separately with its tests, and the campaign runs before any measurement.
 - The actor still syncs at publication (manifest, deletion files). It is measured after this
   change before anything else is moved.
+
+## Implementation and evidence (2026-09-26)
+
+- **Raft** (c8cf067): a `handed` mark; `Ready.messages` and `Ready.persisted_messages`.
+  - The Raft chaos harness gained an asynchronous mode: syncs at random steps, held
+    messages, and crashes that lose anything unsynced. It found a bug: the commit index at
+    restart came from the stored hard state, which may lag what was applied, and that moved
+    `applied` back. The commit index now covers applied entries.
+  - 660 asynchronous seeds pass, with 3 and 5 nodes, in-order and reordered delivery.
+  - Positive control: sending follower acknowledgements before the sync makes the harness
+    report a lost committed entry.
+- **Replica and log** (d215697), as decided above. A log rollover no longer syncs on the
+  spot: the next sync covers every file written, in order, and a gap after a crash still
+  means unacknowledged files.
+- **Simulator**: `DiskConfig::sync_extra_max`. The chaos test runs a third of its seeds with
+  syncs up to 30 ms and a third up to 150 ms, beyond the 100 ms election timeout.
+- **A bug older than this ADR** (5a3a787) came out of the slow-sync seeds. Snapshot
+  installation renamed files before storing the manifest, so a crash in between broke the
+  next open. It now stores an intent, then the manifest, then renames, and the open rolls the
+  intent forward. The synchronous code hits the same bug (seed 266).
+- **Liveness under 150 ms syncs**, on the same 1,000 seeds of that class:
+
+  | | acknowledged no write | other failures |
+  |---|---|---|
+  | synchronous (before) | 10 | 1 (the snapshot bug above) |
+  | asynchronous | 0 | 0 |
+
+  Over the 60,000-seed campaign, about 0.1% of the 150 ms seeds (15 found) still
+  acknowledge no write under the injected faults. Proposals keep meeting a node that is not
+  leader or is handing leadership over. This is **open**. Those seeds still check every
+  safety property.
+- Campaign: seeds 0 to 60,000, **zero violations**, 1.72 million segments built and 2.99
+  million fetched. Two thirds of the seeds ran with slow syncs. The 150 ms seeds require no
+  minimum activity (see above); every other seed requires at least 5 acknowledged writes
+  and 5 checked reads.
+
