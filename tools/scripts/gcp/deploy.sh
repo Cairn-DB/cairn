@@ -5,7 +5,18 @@ set -euo pipefail
 cd "$(dirname "$0")"; source ./common.sh
 ROOT="$(cd ../../.. && pwd)"
 ssh_to() { ssh $SSH_OPTS "$SSH_USER@$(public_ip "$1")" "${@:2}"; }
-wait_ssh() { local ip; ip="$(public_ip "$1")"; until ssh $SSH_OPTS "$SSH_USER@$ip" true 2>/dev/null; do sleep 5; done; }
+# Waits for SSH, at most 10 minutes, and fails loudly (a silent endless retry once billed
+# 10 hours of idle VMs: GCP reused public IPs whose old host keys were still known).
+wait_ssh() {
+  local ip i; ip="$(public_ip "$1")"
+  for i in $(seq 120); do
+    ssh $SSH_OPTS -o BatchMode=yes "$SSH_USER@$ip" true 2>/dev/null && return 0
+    sleep 5
+  done
+  echo "SSH to $1 ($ip) failed for 10 minutes:" >&2
+  ssh $SSH_OPTS -o BatchMode=yes "$SSH_USER@$ip" true >&2 || true
+  exit 1
+}
 for n in $(seq 1 "$NODES"); do wait_ssh "$(node_name "$n")"; done; wait_ssh "$BENCH_NAME"
 B="$(node_name 1)"; BIP="$(public_ip "$B")"
 ssh_to "$B" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential rsync curl >/dev/null

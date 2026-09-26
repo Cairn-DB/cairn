@@ -23,4 +23,9 @@ create() { # name type ip disk_gb
 }
 for i in $(seq 1 "$NODES"); do create "$(node_name "$i")" "$NODE_TYPE" "$(node_ip "$i")" 80; done
 create "$BENCH_NAME" "$BENCH_TYPE" "$BENCH_IP" 60
+# New VMs have new host keys, and GCP may hand out public IPs used by earlier fleets: forget
+# the keys recorded for these IPs.
+for vm in $(for i in $(seq 1 "$NODES"); do node_name "$i"; done) "$BENCH_NAME"; do
+  ssh-keygen -R "$(public_ip "$vm")" -f "$HOME/.ssh/cairn_gcp_known_hosts" >/dev/null 2>&1 || true
+done
 $G compute instances list --filter="labels.project=cairn" --format="table(name,machineType.basename(),status,networkInterfaces[0].networkIP,networkInterfaces[0].accessConfigs[0].natIP)"
