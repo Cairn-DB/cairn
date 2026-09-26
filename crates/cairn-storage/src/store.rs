@@ -378,6 +378,37 @@ pub async fn read_compaction_rows<R: Runtime>(
     Ok(docs)
 }
 
+/// A snapshot installation in progress (`Store::install_snapshot`): the staged files (paths
+/// relative to the shard directory, without `.fetch`) to move into place once the manifest at
+/// `applied` is stored.
+struct InstallIntent {
+    applied: LogIndex,
+    renames: Vec<String>,
+}
+
+impl Manifest for InstallIntent {
+    fn encode(&self, w: &mut Writer) {
+        w.u64(self.applied.get()).u32(self.renames.len() as u32);
+        for r in &self.renames {
+            w.str(r);
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        let applied = LogIndex(r.u64()?);
+        let n = r.u32()? as usize;
+        let mut renames = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            renames.push(r.str()?.to_owned());
+        }
+        Ok(InstallIntent { applied, renames })
+    }
+}
+
+fn intent_path(dir: &str) -> String {
+    format!("{dir}/INSTALL")
+}
+
 fn seg_path(dir: &str, id: SegmentId) -> String {
     format!("{dir}/segs/{:016x}.seg", id.get())
 }
@@ -429,6 +460,23 @@ impl<R: Runtime> Store<R> {
                 m
             }
         };
+        // Finish a snapshot installation a crash interrupted (see `install_snapshot`): when the
+        // manifest it stored is in place, the staged files it had not moved yet are moved now.
+        // Otherwise the installation never took effect and its staged files are dropped below.
+        let intent_store = ManifestStore::<R>::new(rt.clone(), intent_path(dir));
+        if let Some(intent) = intent_store.load::<InstallIntent>().await? {
+            if manifest.applied_index == intent.applied {
+                for rel in &intent.renames {
+                    let path = format!("{dir}/{rel}");
+                    let staged = format!("{path}.fetch");
+                    if disk.exists(&staged).await? {
+                        disk.rename(&staged, &path).await?;
+                    }
+                }
+                tracing::warn!(dir, applied = %intent.applied, "finished an interrupted snapshot installation");
+            }
+            disk.remove(&intent_path(dir)).await?;
+        }
         // Remove leftovers: temp files and segment files the manifest does not reference.
         let referenced: Vec<String> = manifest
             .segments
@@ -2092,26 +2140,61 @@ impl<R: Runtime> Store<R> {
                 )));
             }
         }
-        // A local deletion checkpoint is only valid for the local file it was written for:
-        // when the segment file itself is replaced (same id, other content: ids of local
-        // compactions and fallback builds are per replica) and the leader had no checkpoint to
-        // send, the local one must go, or its row numbers would mask the wrong rows.
+        // Every replaced segment gets a staged deletion checkpoint: the fetched one, or an
+        // empty one when the sender had none. A local checkpoint is only valid for the local
+        // file it was written for (same id, other content: ids of local compactions and
+        // fallback builds are per replica), or its row numbers would mask the wrong rows.
+        let mut renames: Vec<String> = fetched
+            .iter()
+            .filter(|r| r.ends_with(".del"))
+            .cloned()
+            .collect();
         for meta in &m.segments {
             let seg = format!("segs/{:016x}.seg", meta.id.get());
+            if !fetched.contains(&seg) {
+                continue;
+            }
             let del = format!("segs/{:016x}.del", meta.id.get());
-            if fetched.contains(&seg) && !fetched.contains(&del) {
-                let path = del_path(&self.dir, meta.id);
-                if disk.exists(&path).await? {
-                    disk.remove(&path).await?;
-                }
+            if !fetched.contains(&del) {
+                ManifestStore::new(
+                    self.rt.clone(),
+                    format!("{}.fetch", del_path(&self.dir, meta.id)),
+                )
+                .store(&DeletionSet::new(meta.doc_count))
+                .await?;
+                renames.push(del);
             }
         }
-        // Fetched files were streamed to `<rel>.fetch` and synced; publish them by rename.
-        for rel in fetched {
+        renames.extend(fetched.iter().filter(|r| r.ends_with(".seg")).cloned());
+        // Intent, manifest, renames, in that order: a crash before the manifest is stored
+        // leaves the old state (the intent is dropped at open), a crash after it leaves an
+        // intent that `Store::open` completes. Renaming before storing the manifest let a crash
+        // leave the old manifest over a replaced file: "segment does not match the manifest"
+        // at the next open (chaos campaign with slow syncs, seed 350: a merge built locally
+        // after a failed fetch had the leader's id and other bytes).
+        let intent_store = ManifestStore::<R>::new(self.rt.clone(), intent_path(&self.dir));
+        intent_store
+            .store(&InstallIntent {
+                applied: m.applied_index,
+                renames: renames.clone(),
+            })
+            .await?;
+        #[cfg(test)]
+        if tests::INSTALL_FAILPOINT.with(|f| f.get()) == 1 {
+            return Err(Error::Internal(
+                "failpoint: after the install intent".into(),
+            ));
+        }
+        self.manifest_store.store(&m).await?;
+        #[cfg(test)]
+        if tests::INSTALL_FAILPOINT.with(|f| f.get()) == 2 {
+            return Err(Error::Internal("failpoint: after the manifest".into()));
+        }
+        for rel in &renames {
             let path = format!("{}/{rel}", self.dir);
             disk.rename(&format!("{path}.fetch"), &path).await?;
         }
-        self.manifest_store.store(&m).await?;
+        disk.remove(&intent_path(&self.dir)).await?;
         self.segments.clear();
         for meta in &m.segments {
             let reader =
@@ -2992,5 +3075,63 @@ mod tests {
                 assert_eq!(a.get(DocId(i)).await.unwrap(), Some(doc(i, 1)));
             }
         });
+    }
+
+    thread_local! {
+        /// Stops `install_snapshot` early: 1 after the intent, 2 after the manifest.
+        pub(super) static INSTALL_FAILPOINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A snapshot installation interrupted before or after its manifest is stored: reopening
+    /// keeps the old state, or completes the installation (the intent log).
+    #[test]
+    fn interrupted_snapshot_install_rolls_forward_or_back() {
+        for stop in [1u8, 2] {
+            let (sim, mut ex) = Simulation::new(15, SimConfig::default());
+            let rt = sim.runtime(NodeId(1), &ex.handle());
+            ex.block_on(async move {
+                let cfg = StoreConfig {
+                    memtable_max_bytes: usize::MAX,
+                    ..small_cfg()
+                };
+                let mut a = Store::open(rt.clone(), "ia", schema(), cfg.clone())
+                    .await
+                    .unwrap();
+                for i in 1..=20u64 {
+                    a.write(&Command::Upsert(vec![doc(i, 1)])).await.unwrap();
+                }
+                let id = SegmentId(a.write(&Command::FlushBegin).await.unwrap().get());
+                build_local(&mut a, id).await;
+                a.publish_ready().await.unwrap();
+                let mut b = Store::open(rt.clone(), "ib", schema(), cfg.clone())
+                    .await
+                    .unwrap();
+                b.write(&Command::Upsert(vec![doc(99, 1)])).await.unwrap();
+                let rel = format!("segs/{:016x}.seg", id.get());
+                let (_, data) = a.read_file_range(&rel, 0, 1 << 30).await.unwrap().unwrap();
+                b.write_fetch_chunk(&rel, 0, data).await.unwrap();
+                b.sync_fetched(&rel).await.unwrap();
+                INSTALL_FAILPOINT.with(|f| f.set(stop));
+                let r = b
+                    .install_snapshot(&a.manifest_bytes(), vec![rel.clone()])
+                    .await;
+                INSTALL_FAILPOINT.with(|f| f.set(0));
+                assert!(r.is_err(), "the failpoint stops the installation");
+                drop(b);
+                let b = Store::open(rt.clone(), "ib", schema(), cfg).await.unwrap();
+                if stop == 1 {
+                    // Before the manifest: nothing changed.
+                    assert!(b.segments().next().is_none());
+                    assert_eq!(b.get(DocId(99)).await.unwrap(), Some(doc(99, 1)));
+                } else {
+                    // After it: the installation is completed at open.
+                    assert_eq!(b.segments().map(|m| m.id).collect::<Vec<_>>(), vec![id]);
+                    for i in 1..=20u64 {
+                        assert_eq!(b.get(DocId(i)).await.unwrap(), Some(doc(i, 1)));
+                    }
+                }
+                assert!(!rt.disk().exists("ib/INSTALL").await.unwrap());
+            });
+        }
     }
 }
