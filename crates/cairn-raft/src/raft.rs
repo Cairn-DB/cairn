@@ -131,8 +131,15 @@ pub struct Ready {
     pub truncate_from: Option<LogIndex>,
     /// Append and sync these entries before sending `messages`.
     pub entries: Vec<Entry>,
-    /// Messages to send, after persistence.
+    /// Messages that may leave now, before this ready is persisted (ADR 0027): a leader's
+    /// appends, snapshots, read-index answers and `TimeoutNow`. A leader's term and vote are
+    /// durable (it was elected on votes requested after persisting them), and a leader may
+    /// replicate entries before its own copy is durable.
     pub messages: Vec<(NodeId, Message)>,
+    /// Messages to send only once this ready (and every earlier one) is persisted: follower
+    /// acknowledgements, everything about votes and terms. A synchronous driver sends both
+    /// lists after persisting.
+    pub persisted_messages: Vec<(NodeId, Message)>,
     /// Entries to apply, in order.
     pub committed: Vec<Entry>,
     /// A snapshot to install into the state machine (replaces everything).
@@ -151,6 +158,7 @@ impl Ready {
             && self.truncate_from.is_none()
             && self.entries.is_empty()
             && self.messages.is_empty()
+            && self.persisted_messages.is_empty()
             && self.committed.is_empty()
             && self.snapshot.is_none()
             && self.read_states.is_empty()
@@ -184,6 +192,8 @@ pub struct Raft {
     applied: LogIndex,
     /// Last index known durable on this node.
     persisted: LogIndex,
+    /// Last index handed to the driver in a `Ready` (written, maybe not synced yet, ADR 0027).
+    handed: LogIndex,
     /// Set when a conflict truncated below `persisted`.
     pending_truncate: Option<LogIndex>,
     progress: HashMap<NodeId, Progress>,
@@ -232,7 +242,16 @@ impl Raft {
         );
         let timeout =
             cfg.election_ticks + cfg.rng.below(u64::from(cfg.election_ticks.max(1))) as u32;
-        let commit = init.hard_state.commit.min(last).max(init.snapshot.0);
+        // Applied entries were committed. With asynchronous persistence (ADR 0027) the stored
+        // hard state, and its commit index, may lag what the state machine already applied:
+        // taking the commit from it alone moved `applied` back and re-applied entries (Raft
+        // chaos harness, asynchronous mode).
+        let commit = init
+            .hard_state
+            .commit
+            .max(init.applied)
+            .min(last)
+            .max(init.snapshot.0);
         Raft {
             role: Role::Follower,
             term: init.hard_state.term,
@@ -247,6 +266,7 @@ impl Raft {
                 .max(init.snapshot.0)
                 .min(commit.max(init.snapshot.0)),
             persisted: last,
+            handed: last,
             pending_truncate: None,
             progress: HashMap::default(),
             votes: HashMap::default(),
@@ -507,13 +527,15 @@ impl Raft {
         }
         let keep = (from.get() - self.first_index.get()) as usize;
         self.entries.truncate(keep);
-        if self.persisted >= from {
+        if self.handed >= from {
+            // The driver has these entries on disk (synced or not): it must cut them too.
             let cut = match self.pending_truncate {
                 Some(t) => t.min(from),
                 None => from,
             };
             self.pending_truncate = Some(cut);
-            self.persisted = LogIndex(from.get() - 1);
+            self.handed = LogIndex(from.get() - 1);
+            self.persisted = self.persisted.min(self.handed);
         }
     }
 
@@ -998,6 +1020,7 @@ impl Raft {
                 self.commit = snapshot.last_index;
                 self.applied = snapshot.last_index;
                 self.persisted = snapshot.last_index;
+                self.handed = snapshot.last_index;
                 self.pending_truncate = None;
                 self.hs_dirty = true;
                 self.installing = true;
@@ -1373,11 +1396,27 @@ impl Raft {
             self.hs_dirty = false;
         }
         ready.truncate_from = self.pending_truncate.take();
-        if self.last_index() > self.persisted {
-            let start = (self.persisted.get() + 1 - self.first_index.get()) as usize;
+        if self.last_index() > self.handed {
+            let start = (self.handed.get() + 1 - self.first_index.get()) as usize;
             ready.entries = self.entries[start..].to_vec();
+            self.handed = self.last_index();
         }
-        ready.messages = std::mem::take(&mut self.msgs);
+        let leader = self.role == Role::Leader;
+        for (to, m) in std::mem::take(&mut self.msgs) {
+            let now = leader
+                && matches!(
+                    m,
+                    Message::Append { .. }
+                        | Message::InstallSnapshot { .. }
+                        | Message::ReadIndexResp { .. }
+                        | Message::TimeoutNow { .. }
+                );
+            if now {
+                ready.messages.push((to, m));
+            } else {
+                ready.persisted_messages.push((to, m));
+            }
+        }
         ready.snapshot = self.snapshot_to_install.take();
         let apply_to = self.commit.min(self.persisted);
         if !self.installing && apply_to > self.applied && self.applied.next() >= self.first_index {
@@ -1396,7 +1435,9 @@ impl Raft {
             self.installing = false;
         }
         if persisted > self.persisted {
-            self.persisted = persisted.min(self.last_index());
+            // Only what was handed out can be durable (a report from before a truncation may
+            // name a higher index).
+            self.persisted = persisted.min(self.handed);
         }
         if applied > self.applied {
             self.applied = applied.min(self.commit);
@@ -1427,6 +1468,12 @@ mod tests {
         alive: bool,
         read_states: Vec<(u64, LogIndex)>,
         failed_reads: Vec<u64>,
+        /// Asynchronous persistence (ADR 0027): written, not synced yet (lost on a crash).
+        unsynced: Vec<Entry>,
+        /// Hard state to store with the next sync.
+        pending_hs: Option<HardState>,
+        /// `persisted_messages` waiting for the next sync.
+        held: Vec<(NodeId, Message)>,
     }
 
     struct Cluster {
@@ -1439,6 +1486,8 @@ mod tests {
         in_order: bool,
         proposed: u64,
         drop_prob: f64,
+        /// Persist asynchronously: syncs happen at random steps (ADR 0027).
+        async_persist: bool,
     }
 
     fn config(id: NodeId, n: u32, seed: u64) -> Config {
@@ -1471,6 +1520,9 @@ mod tests {
                     alive: true,
                     read_states: Vec::new(),
                     failed_reads: Vec::new(),
+                    unsynced: Vec::new(),
+                    pending_hs: None,
+                    held: Vec::new(),
                 })
                 .collect();
             Cluster {
@@ -1483,17 +1535,140 @@ mod tests {
                 in_order: false,
                 proposed: 0,
                 drop_prob,
+                async_persist: false,
             }
         }
 
+        /// Makes node `i`'s written entries and hard state durable, and releases the messages
+        /// that waited for them.
+        fn sync(&mut self, i: usize) {
+            let node = &mut self.nodes[i];
+            node.disk.entries.append(&mut node.unsynced);
+            if let Some(hs) = node.pending_hs.take() {
+                node.disk.hs = hs;
+            }
+            let from = node.raft.id();
+            for (to, m) in node.held.drain(..) {
+                self.inflight.push((from, to, m));
+            }
+            let node = &mut self.nodes[i];
+            let persisted = node
+                .disk
+                .entries
+                .last()
+                .map_or(node.disk.snapshot.0, |e| e.index);
+            let applied = node
+                .disk
+                .applied
+                .last()
+                .map_or(node.disk.snapshot.0, |e| e.index);
+            node.raft.advance(persisted, applied);
+            self.drain_ready(i);
+        }
+
         fn drain_ready(&mut self, i: usize) {
+            if self.async_persist {
+                let r = &self.nodes[i].raft;
+                // Truncations and snapshots first make everything durable, then run
+                // synchronously, as the replica does (ADR 0027).
+                let peek_sync = r.pending_truncate.is_some() || r.snapshot_to_install.is_some();
+                if peek_sync
+                    && (!self.nodes[i].unsynced.is_empty() || self.nodes[i].pending_hs.is_some())
+                {
+                    let node = &mut self.nodes[i];
+                    node.disk.entries.append(&mut node.unsynced);
+                    if let Some(hs) = node.pending_hs.take() {
+                        node.disk.hs = hs;
+                    }
+                    let from = node.raft.id();
+                    for (to, m) in node.held.drain(..) {
+                        self.inflight.push((from, to, m));
+                    }
+                }
+            }
+            let async_persist = self.async_persist;
             let node = &mut self.nodes[i];
             let ready = node.raft.ready();
+            let sync_now =
+                !async_persist || ready.truncate_from.is_some() || ready.snapshot.is_some();
             if let Some(hs) = ready.hard_state {
-                node.disk.hs = hs;
+                if sync_now {
+                    node.disk.hs = hs;
+                    node.pending_hs = None;
+                } else {
+                    node.pending_hs = Some(hs);
+                }
             }
             if let Some(t) = ready.truncate_from {
                 node.disk.entries.retain(|e| e.index < t);
+            }
+            if async_persist && !sync_now {
+                for e in &ready.entries {
+                    let last = node
+                        .unsynced
+                        .last()
+                        .or(node.disk.entries.last())
+                        .map_or(node.disk.snapshot.0, |x| x.index);
+                    assert_eq!(
+                        e.index,
+                        last.next(),
+                        "node {} written log not contiguous",
+                        i + 1
+                    );
+                    node.unsynced.push(e.clone());
+                }
+                let from = node.raft.id();
+                node.held.extend(ready.persisted_messages);
+                node.read_states.extend(ready.read_states.iter().copied());
+                node.failed_reads.extend(ready.failed_reads.iter().copied());
+                let persisted = node
+                    .disk
+                    .entries
+                    .last()
+                    .map_or(node.disk.snapshot.0, |e| e.index);
+                for e in &ready.committed {
+                    let expect = node
+                        .disk
+                        .applied
+                        .last()
+                        .map_or(node.disk.snapshot.0, |x| x.index)
+                        .next();
+                    assert_eq!(e.index, expect, "node {} applied out of order", i + 1);
+                    assert!(
+                        e.index <= persisted,
+                        "node {} applied a non-durable entry",
+                        i + 1
+                    );
+                    node.disk.applied.push(e.clone());
+                    match self.committed.get(&e.index) {
+                        Some(prev) => {
+                            assert_eq!(prev, e, "state machine safety violated at {}", e.index)
+                        }
+                        None => {
+                            self.committed.insert(e.index, e.clone());
+                        }
+                    }
+                }
+                let node = &mut self.nodes[i];
+                let applied = node
+                    .disk
+                    .applied
+                    .last()
+                    .map_or(node.disk.snapshot.0, |e| e.index);
+                node.raft.advance(persisted, applied);
+                if node.raft.role() == Role::Leader {
+                    let term = node.raft.term();
+                    match self.leaders_by_term.get(&term) {
+                        Some(l) => assert_eq!(*l, from, "two leaders in term {term}"),
+                        None => {
+                            self.leaders_by_term.insert(term, from);
+                        }
+                    }
+                }
+                for (to, m) in ready.messages {
+                    self.inflight.push((from, to, m));
+                }
+                return;
             }
             for e in &ready.entries {
                 assert_eq!(
@@ -1556,7 +1731,7 @@ mod tests {
                     }
                 }
             }
-            for (to, m) in ready.messages {
+            for (to, m) in ready.messages.into_iter().chain(ready.persisted_messages) {
                 self.inflight.push((from, to, m));
             }
         }
@@ -1639,6 +1814,10 @@ mod tests {
 
         fn crash(&mut self, i: usize) {
             self.nodes[i].alive = false;
+            // Anything not synced is lost.
+            self.nodes[i].unsynced.clear();
+            self.nodes[i].pending_hs = None;
+            self.nodes[i].held.clear();
             self.inflight
                 .retain(|(_, to, _)| (to.get() - 1) as usize != i);
         }
@@ -2028,10 +2207,11 @@ mod tests {
                 },
             },
         );
-        let resp = f
-            .ready()
+        let r = f.ready();
+        let resp = r
             .messages
             .into_iter()
+            .chain(r.persisted_messages)
             .find_map(|(_, m)| match m {
                 Message::SnapshotResp { index, .. } => Some(index),
                 _ => None,
@@ -2079,8 +2259,13 @@ mod tests {
     }
 
     fn chaos_with(seed: u64, nodes: u32, steps: usize, in_order: bool) {
+        chaos_full(seed, nodes, steps, in_order, false);
+    }
+
+    fn chaos_full(seed: u64, nodes: u32, steps: usize, in_order: bool, async_persist: bool) {
         let mut c = Cluster::new(nodes, seed, 0.05);
         c.in_order = in_order;
+        c.async_persist = async_persist;
         let mut crashed: Vec<(usize, u32)> = Vec::new();
         for step in 0..steps {
             let r = c.rng.below(100);
@@ -2125,6 +2310,13 @@ mod tests {
             } else {
                 c.blocked.clear();
             }
+            // Asynchronous persistence: a random live node's sync completes.
+            if c.async_persist && c.rng.chance(0.3) {
+                let i = c.rng.below(u64::from(nodes)) as usize;
+                if c.nodes[i].alive {
+                    c.sync(i);
+                }
+            }
             // Restart crashed nodes when their timer expires.
             let mut still = Vec::new();
             for (i, t) in crashed.drain(..) {
@@ -2146,6 +2338,13 @@ mod tests {
         for _ in 0..200 {
             c.tick();
             c.deliver_some(200);
+            if c.async_persist {
+                for i in 0..nodes as usize {
+                    if c.nodes[i].alive {
+                        c.sync(i);
+                    }
+                }
+            }
         }
         c.check_log_matching();
         c.check_leader_completeness();
@@ -2171,6 +2370,21 @@ mod tests {
     fn chaos_three_nodes_in_order_delivery() {
         for seed in 0..500u64 {
             chaos_with(seed, 3, 600, true);
+        }
+    }
+
+    /// ADR 0027: entries and hard state become durable at random later steps, crashes lose
+    /// what was not synced, and messages that rely on durability wait for the sync.
+    #[test]
+    fn chaos_async_persistence() {
+        for seed in 0..300u64 {
+            chaos_full(seed, 3, 600, false, true);
+        }
+        for seed in 0..300u64 {
+            chaos_full(seed, 3, 600, true, true);
+        }
+        for seed in 0..60u64 {
+            chaos_full(seed, 5, 600, false, true);
         }
     }
 

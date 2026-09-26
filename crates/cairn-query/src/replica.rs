@@ -1237,7 +1237,8 @@ impl<R: Runtime> Replica<R> {
                     tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, ms = took.as_millis() as u64, "slow hard-state store");
                 }
             }
-            for (to, m) in ready.messages {
+            // Synchronous persistence: everything is durable here, both lists may leave.
+            for (to, m) in ready.messages.into_iter().chain(ready.persisted_messages) {
                 self.send(to, FrameBody::Raft(m)).await;
             }
             for e in &ready.committed {
