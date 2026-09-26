@@ -7,7 +7,7 @@ use crate::hnsw::{Hnsw, HnswParams, SearchOptions, SearchScratch};
 use crate::scan::{TopK, exact_scan};
 use crate::vectors::Vectors;
 use cairn_core::{Metric, Result, Runtime};
-use cairn_storage::SegmentReader;
+use cairn_storage::{MappedSegment, SegmentReader};
 use std::sync::Mutex;
 
 /// Build-time parameters.
@@ -242,25 +242,39 @@ impl VectorIndex {
         dims: usize,
         params: VectorIndexParams,
     ) -> Result<Self> {
-        let nulls = reader.read_section(&format!("nulls.{field}")).await?;
+        let mapped = reader.mapped().await?;
+        let prefetch = reader.prefetcher();
+        // Hashing and decoding read whole sections: off the core.
+        reader
+            .runtime()
+            .offload(move || Self::decode(&mapped, field, metric, dims, params, prefetch))
+            .await
+    }
+
+    /// Decodes from a mapped segment, on any thread (ADR 0026). `prefetch` is the runtime's
+    /// readahead hint for disk-resident blocks.
+    pub fn decode(
+        reader: &MappedSegment,
+        field: usize,
+        metric: Metric,
+        dims: usize,
+        params: VectorIndexParams,
+        prefetch: Option<fn(&[u8])>,
+    ) -> Result<Self> {
+        let nulls = reader.read_section(&format!("nulls.{field}"))?;
         let n = nulls.len() as u32;
+        let mut present = Bitmap::empty(n);
+        for (i, &p) in nulls.iter().enumerate() {
+            if p != 0 {
+                present.set(i as u32);
+            }
+        }
         let vamana_name = format!("vamana.{field}");
         if reader.has_section(&vamana_name) {
             // Disk-resident: PQ codes in RAM, blocks mapped; the f32 column is never read.
-            let pq = reader.read_section(&format!("pq.{field}")).await?;
-            let blocks = reader.map_section(&vamana_name).await?;
-            // Validation scans every block: off the core.
-            let prefetch = reader.prefetcher();
-            let disk = reader
-                .runtime()
-                .offload(move || DiskAnn::load_with(metric, dims, n, &pq, blocks, prefetch))
-                .await?;
-            let mut present = Bitmap::empty(n);
-            for (i, &p) in nulls.iter().enumerate() {
-                if p != 0 {
-                    present.set(i as u32);
-                }
-            }
+            let pq = reader.read_section(&format!("pq.{field}"))?;
+            let blocks = reader.read_section(&vamana_name)?;
+            let disk = DiskAnn::load_with(metric, dims, n, &pq, blocks, prefetch)?;
             return Ok(VectorIndex {
                 field,
                 vectors: Vectors::header_only(metric, dims, n),
@@ -274,64 +288,34 @@ impl VectorIndex {
         }
         let sq8_name = format!("sq8.{field}");
         let hnsw_name = format!("hnsw.{field}");
-        if !params.keep_f32 && reader.has_section(&sq8_name) {
+        let vectors = if !params.keep_f32 && reader.has_section(&sq8_name) {
             // SQ8 residency (ADR 0013): the f32 column would be dropped right away, so it is
-            // not read at all. This load runs on the replica actor.
-            let mut present = Bitmap::empty(n);
-            for (i, &p) in nulls.iter().enumerate() {
-                if p != 0 {
-                    present.set(i as u32);
-                }
+            // not read at all.
+            Vectors::from_sq8_only(metric, dims, n, &reader.read_section(&sq8_name)?)?
+        } else {
+            let col = reader.read_section(&format!("col.{field}"))?;
+            if col.len() != n as usize * dims * 4 {
+                return Err(cairn_core::Error::corruption(format!(
+                    "vector column {field} length"
+                )));
             }
-            let vectors =
-                Vectors::from_sq8_only(metric, dims, n, &reader.read_section(&sq8_name).await?)?;
-            let hnsw = if reader.has_section(&hnsw_name) {
-                let h = Hnsw::decode(&reader.read_section(&hnsw_name).await?)?;
-                if h.len() != n {
-                    return Err(cairn_core::Error::corruption("hnsw row count mismatch"));
-                }
-                Some(h)
+            let rows: Vec<f32> = col
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let sq8 = if reader.has_section(&sq8_name) {
+                Some(reader.read_section(&sq8_name)?)
             } else {
                 None
             };
-            return Ok(VectorIndex {
-                field,
-                vectors,
-                present,
-                hnsw,
-                disk: None,
-                params,
-                scratch: Mutex::new(Vec::new()),
-                disk_scratch: Mutex::new(Vec::new()),
-            });
-        }
-        let col = reader.read_section(&format!("col.{field}")).await?;
-        if col.len() != n as usize * dims * 4 {
-            return Err(cairn_core::Error::corruption(format!(
-                "vector column {field} length"
-            )));
-        }
-        let rows: Vec<f32> = col
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let mut present = Bitmap::empty(n);
-        for (i, &p) in nulls.iter().enumerate() {
-            if p != 0 {
-                present.set(i as u32);
+            let mut vectors = Vectors::from_rows_and_sq8(metric, dims, rows, sq8.as_deref())?;
+            if !params.keep_f32 {
+                vectors.drop_f32();
             }
-        }
-        let sq8 = if reader.has_section(&sq8_name) {
-            Some(reader.read_section(&sq8_name).await?)
-        } else {
-            None
+            vectors
         };
-        let mut vectors = Vectors::from_rows_and_sq8(metric, dims, rows, sq8.as_deref())?;
-        if !params.keep_f32 {
-            vectors.drop_f32();
-        }
         let hnsw = if reader.has_section(&hnsw_name) {
-            let h = Hnsw::decode(&reader.read_section(&hnsw_name).await?)?;
+            let h = Hnsw::decode(&reader.read_section(&hnsw_name)?)?;
             if h.len() != n {
                 return Err(cairn_core::Error::corruption("hnsw row count mismatch"));
             }

@@ -9,7 +9,7 @@ use crate::bitmap::Bitmap;
 use crate::scan::TopK;
 use cairn_core::codec::{Reader, Writer};
 use cairn_core::{Document, Error, FieldKind, Result, Runtime, Schema, Value};
-use cairn_storage::SegmentReader;
+use cairn_storage::{MappedSegment, SegmentReader};
 
 /// BM25 parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -185,7 +185,12 @@ impl TextIndex {
 
     /// Loads the index of `field` from a segment.
     pub async fn load<R: Runtime>(reader: &SegmentReader<R>, field: usize) -> Result<Self> {
-        let bytes = reader.read_section(&format!("text.{field}")).await?;
+        Self::decode(&reader.mapped().await?, field)
+    }
+
+    /// Decodes from a mapped segment, on any thread (ADR 0026).
+    pub fn decode(reader: &MappedSegment, field: usize) -> Result<Self> {
+        let bytes = reader.read_section(&format!("text.{field}"))?;
         let mut r = Reader::new(&bytes);
         let rows = r.u32()?;
         let n = r.u32()? as usize;

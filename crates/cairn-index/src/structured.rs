@@ -9,7 +9,7 @@ use crate::bitmap::Bitmap;
 use cairn_core::codec::{Reader, Writer};
 use cairn_core::filter::order_key;
 use cairn_core::{Document, Error, FieldKind, Predicate, Result, Runtime, Schema, Value};
-use cairn_storage::SegmentReader;
+use cairn_storage::{MappedSegment, SegmentReader};
 
 #[derive(Debug, Clone, PartialEq)]
 enum FieldIndex {
@@ -241,11 +241,16 @@ impl StructuredIndex {
 
     /// Loads from a segment.
     pub async fn load<R: Runtime>(reader: &SegmentReader<R>, schema: &Schema) -> Result<Self> {
+        Self::decode(&reader.mapped().await?, schema)
+    }
+
+    /// Decodes from a mapped segment, on any thread (ADR 0026).
+    pub fn decode(reader: &MappedSegment, schema: &Schema) -> Result<Self> {
         let mut fields = Vec::with_capacity(schema.fields.len());
         let mut present = Vec::with_capacity(schema.fields.len());
         let mut rows = None;
         for (i, f) in schema.fields.iter().enumerate() {
-            let nulls = reader.read_section(&format!("nulls.{i}")).await?;
+            let nulls = reader.read_section(&format!("nulls.{i}"))?;
             let n = nulls.len() as u32;
             if *rows.get_or_insert(n) != n {
                 return Err(Error::corruption("nulls columns disagree on row count"));
@@ -259,7 +264,7 @@ impl StructuredIndex {
             present.push(b);
             let name = format!("sidx.{i}");
             if f.kind.is_filterable() && reader.has_section(&name) {
-                let bytes = reader.read_section(&name).await?;
+                let bytes = reader.read_section(&name)?;
                 let mut r = Reader::new(&bytes);
                 let idx = FieldIndex::decode(&mut r, n)?;
                 r.finish()?;

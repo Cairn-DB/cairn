@@ -981,11 +981,36 @@ impl<R: Runtime> Store<R> {
     /// Publishes, in order, every frozen memtable at the head of the queue whose segment file is
     /// present (or which holds no rows). Returns how many were published.
     pub async fn publish_ready(&mut self) -> Result<usize> {
+        self.publish_ready_where(|_| true).await
+    }
+
+    /// Path of segment `id`'s file.
+    pub fn segment_path(&self, id: SegmentId) -> String {
+        seg_path(&self.dir, id)
+    }
+
+    /// Freezes at the head of the queue that have a file, in order (with empty freezes
+    /// skipped): what `publish_ready` would publish.
+    pub fn publishable_flushes(&self) -> Vec<SegmentId> {
+        self.pending
+            .iter()
+            .take_while(|p| p.file.is_some() || p.mem.docs().next().is_none())
+            .filter(|p| p.file.is_some())
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// As [`Store::publish_ready`], stopping at the first freeze with a file for which `ready`
+    /// is false (its indexes are still being prepared, ADR 0026).
+    pub async fn publish_ready_where(
+        &mut self,
+        ready: impl Fn(SegmentId) -> bool,
+    ) -> Result<usize> {
         let mut n = 0;
         while self
             .pending
             .front()
-            .is_some_and(|p| p.file.is_some() || p.mem.docs().next().is_none())
+            .is_some_and(|p| p.mem.docs().next().is_none() || (p.file.is_some() && ready(p.id)))
         {
             self.persist_dirty_deletions().await?;
             let p = self.pending.pop_front().expect("checked");
@@ -1616,8 +1641,27 @@ impl<R: Runtime> Store<R> {
     /// deleted now: input deletion bits carry every change applied here since the rows were
     /// read, and nothing beyond. Returns how many were installed.
     pub async fn install_compactions(&mut self) -> Result<usize> {
+        self.install_compactions_where(|_| true).await
+    }
+
+    /// The next compaction `install_compactions` would install: file here, inputs published.
+    pub fn installable_compaction(&self) -> Option<SegmentId> {
+        let c = self.manifest.compactions.first()?;
+        (self.compaction_files.contains_key(&c.id) && self.input_range(&c.inputs).is_some())
+            .then_some(c.id)
+    }
+
+    /// As [`Store::install_compactions`], stopping at the first compaction for which `ready`
+    /// is false (ADR 0026).
+    pub async fn install_compactions_where(
+        &mut self,
+        ready: impl Fn(SegmentId) -> bool,
+    ) -> Result<usize> {
         let mut n = 0;
         while let Some(c) = self.manifest.compactions.first().cloned() {
+            if !ready(c.id) {
+                break;
+            }
             let (Some(&(file_len, file_hash)), Some(range)) = (
                 self.compaction_files.get(&c.id),
                 self.input_range(&c.inputs),

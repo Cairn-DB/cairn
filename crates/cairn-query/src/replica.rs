@@ -186,6 +186,28 @@ enum Event {
         generation: u64,
         file: Result<(u64, u64)>,
     },
+    /// A segment's indexes were decoded outside the actor, ahead of its publication (ADR 0026).
+    IndexesReady {
+        id: SegmentId,
+        indexes: Result<crate::engine::PreparedIndexes>,
+    },
+}
+
+impl Event {
+    fn kind(&self) -> &'static str {
+        match self {
+            Event::Tick => "tick",
+            Event::Net(..) => "net",
+            Event::Propose(..) => "propose",
+            Event::Query(..) => "query",
+            Event::QueryLegs(..) => "query_legs",
+            Event::Get(..) => "get",
+            Event::Status(..) => "status",
+            Event::FlushWritten { .. } => "flush_written",
+            Event::CompactWritten { .. } => "compact_written",
+            Event::IndexesReady { .. } => "indexes_ready",
+        }
+    }
 }
 
 /// Handle to a running replica (cheap to clone).
@@ -216,7 +238,8 @@ impl Drop for AliveGuard {
                 | Event::Tick
                 | Event::Net(..)
                 | Event::FlushWritten { .. }
-                | Event::CompactWritten { .. } => {}
+                | Event::CompactWritten { .. }
+                | Event::IndexesReady { .. } => {}
             }
         }
     }
@@ -447,6 +470,9 @@ const RETIRED_GRACE_ELECTIONS: u64 = 60;
 /// A segment fetch that gets no chunk for this many election timeouts is abandoned for a
 /// local build.
 const FETCH_STALL_ELECTIONS: u64 = 4;
+/// A replica step at least this long is logged with its parts ("slow replica step").
+const SLOW_STEP: cairn_core::Duration = cairn_core::Duration::from_millis(500);
+
 /// A follower that waited this many election timeouts for the `FlushCommit` of a freeze, with
 /// no sign of progress from the same leader meanwhile, builds it itself. This is a safety net
 /// for a lost announcement, not a failure detector: a leader that fails is replaced, and the
@@ -519,6 +545,10 @@ struct FlushState {
     fetched: u64,
     /// Flushes never built or fetched here because a merge consumed them (diagnostics).
     skipped: u64,
+    /// Segments whose indexes are being decoded outside the actor (ADR 0026).
+    preparing: std::collections::BTreeSet<SegmentId>,
+    /// Segments whose index preparation failed: published anyway, loading at publication.
+    prepare_failed: std::collections::BTreeSet<SegmentId>,
     /// Leader balancing (ADR 0020): tick since which this replica leads, and the earliest tick
     /// for the next handover attempt.
     lead_since: Option<u64>,
@@ -750,7 +780,8 @@ impl<R: Runtime> Replica<R> {
                         | Event::Tick
                         | Event::Net(..)
                         | Event::FlushWritten { .. }
-                        | Event::CompactWritten { .. } => {}
+                        | Event::CompactWritten { .. }
+                        | Event::IndexesReady { .. } => {}
                     }
                 }
             }
@@ -765,12 +796,34 @@ impl<R: Runtime> Replica<R> {
         self.drain_ready().await?;
         loop {
             let ev = self.inbox.pop().await;
+            let kind = ev.kind();
+            let t0 = self.rt.now();
             let step = async {
                 self.handle_event(ev).await?;
+                let t1 = self.rt.now();
                 self.drain_ready().await?;
-                self.serve_waiting().await
+                let t2 = self.rt.now();
+                self.serve_waiting().await?;
+                Ok::<_, Error>((t1, t2))
             }
             .await;
+            // A step that holds the actor this long delays this shard's heartbeats, writes
+            // and reads: say which part did.
+            if let Ok((t1, t2)) = &step {
+                let t3 = self.rt.now();
+                if t3 - t0 >= SLOW_STEP {
+                    tracing::warn!(
+                        node = %self.cfg.id,
+                        shard = %self.cfg.shard,
+                        event = kind,
+                        handle_ms = (*t1 - t0).as_millis() as u64,
+                        persist_ms = (*t2 - *t1).as_millis() as u64,
+                        serve_ms = (t3 - *t2).as_millis() as u64,
+                        "slow replica step"
+                    );
+                }
+            }
+            let step = step.map(|_| ());
             if let Err(e) = step {
                 tracing::error!(node = %self.cfg.id, shard = %self.cfg.shard, "replica error, reopening from disk: {e}");
                 self.reopen().await?;
@@ -836,6 +889,18 @@ impl<R: Runtime> Replica<R> {
                     }
                 }
                 self.drive_flushes().await?;
+            }
+            Event::IndexesReady { id, indexes } => {
+                self.flush.preparing.remove(&id);
+                match indexes {
+                    Ok(p) => self.engine.adopt_indexes(id, p),
+                    Err(e) => {
+                        tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "preparing indexes failed ({e}): loading them at publication");
+                        self.flush.prepare_failed.insert(id);
+                    }
+                }
+                self.drive_flushes().await?;
+                self.drive_compactions().await?;
             }
             Event::CompactWritten {
                 id,
@@ -1155,12 +1220,22 @@ impl<R: Runtime> Replica<R> {
                     // The on-disk log is ahead of Raft's view; align.
                     log.truncate_suffix(first).await?;
                 }
+                let t = self.rt.now();
                 log.append(&entries).await?;
                 log.sync().await?;
+                let took = self.rt.now() - t;
+                if took >= SLOW_STEP / 2 {
+                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, entries = entries.len(), ms = took.as_millis() as u64, "slow Raft log append and sync");
+                }
             }
             if let Some(hs) = ready.hard_state {
                 self.state.hs = hs;
+                let t = self.rt.now();
                 self.state_store.store(&self.state).await?;
+                let took = self.rt.now() - t;
+                if took >= SLOW_STEP / 2 {
+                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, ms = took.as_millis() as u64, "slow hard-state store");
+                }
             }
             for (to, m) in ready.messages {
                 self.send(to, FrameBody::Raft(m)).await;
@@ -1334,7 +1409,17 @@ impl<R: Runtime> Replica<R> {
                 }
             }
         }
-        if self.engine.store_mut().publish_ready().await? > 0 {
+        // A segment is published only once its indexes were decoded outside the actor, so
+        // publishing loads nothing here (ADR 0026).
+        let publishable = self.engine.store().publishable_flushes();
+        let ready = self.indexes_ready(&publishable).await?;
+        if self
+            .engine
+            .store_mut()
+            .publish_ready_where(|id| ready.contains(&id))
+            .await?
+            > 0
+        {
             self.after_publish().await?;
         }
         // Flushes a pending merge already consumes are not built or fetched: the merge is
@@ -1353,6 +1438,8 @@ impl<R: Runtime> Replica<R> {
                 .map(|(c, _, _)| c.id),
         );
         self.flush.fallback.retain(|id| live.contains(id));
+        self.flush.prepare_failed.retain(|id| live.contains(id));
+        self.engine.retain_prepared(|id| live.contains(&id));
         self.flush.waiting_since.retain(|id, _| live.contains(id));
         // A new leader rebuilds or re-announces what is pending: the wait starts again.
         let leader_now = self.raft.leader();
@@ -1487,6 +1574,42 @@ impl<R: Runtime> Replica<R> {
         }
     }
 
+    /// Of `ids` (segments whose files are in place, about to be published or installed), those
+    /// whose indexes are ready. Starts decoding the others outside the actor (ADR 0026); each
+    /// comes back as `IndexesReady`. A preparation that failed counts as ready: that segment
+    /// loads its indexes at publication, as before.
+    async fn indexes_ready(
+        &mut self,
+        ids: &[SegmentId],
+    ) -> Result<std::collections::BTreeSet<SegmentId>> {
+        let mut ready = std::collections::BTreeSet::new();
+        for &id in ids {
+            if self.engine.indexes_ready(id) || self.flush.prepare_failed.contains(&id) {
+                ready.insert(id);
+                continue;
+            }
+            if self.flush.preparing.contains(&id) {
+                continue;
+            }
+            match self.engine.index_job(id).await {
+                Ok(job) => {
+                    self.flush.preparing.insert(id);
+                    let (inbox, rt) = (self.inbox.clone(), self.rt.clone());
+                    self.rt.spawn(async move {
+                        let indexes = rt.offload(move || job.run()).await;
+                        inbox.push(Event::IndexesReady { id, indexes });
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "preparing indexes failed ({e}): loading them at publication");
+                    self.flush.prepare_failed.insert(id);
+                    ready.insert(id);
+                }
+            }
+        }
+        Ok(ready)
+    }
+
     /// Installs merges that consume the oldest pending flushes as soon as their files are here,
     /// and returns the flushes to leave alone meanwhile: those consumed by a merge still being
     /// fetched. A merge whose fetch failed, or our own whose file was lost, gives way to the
@@ -1507,6 +1630,10 @@ impl<R: Runtime> Replica<R> {
                 .collect();
             if let Some((j, id, consumed)) = candidates.iter().find(|(_, id, _)| files.contains(id))
             {
+                if !self.indexes_ready(&[*id]).await?.contains(id) {
+                    // Installed once its indexes are decoded; its flushes stay untouched.
+                    return Ok(consumed.iter().copied().collect());
+                }
                 tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, flushes = consumed.len(), "merge installed over flushes not built here");
                 self.flush.skipped += consumed.len() as u64;
                 self.engine.store_mut().install_subsumed(*j).await?;
@@ -1961,7 +2088,16 @@ impl<R: Runtime> Replica<R> {
                 continue;
             }
             if has_file && inputs_ready {
-                let n = self.engine.store_mut().install_compactions().await?;
+                let ready = self.indexes_ready(&[c.id]).await?;
+                if !ready.contains(&c.id) {
+                    // Installed when its indexes are decoded (`IndexesReady`).
+                    return Ok(());
+                }
+                let n = self
+                    .engine
+                    .store_mut()
+                    .install_compactions_where(|id| ready.contains(&id))
+                    .await?;
                 if n > 0 {
                     self.after_compaction_install().await?;
                     continue;

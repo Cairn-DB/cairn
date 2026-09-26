@@ -330,6 +330,15 @@ impl<R: Runtime> SegmentReader<R> {
         Ok(data)
     }
 
+    /// The whole file mapped, with its section table: readable from any thread (ADR 0026).
+    pub async fn mapped(&self) -> Result<MappedSegment> {
+        let data = self.rt.disk().map(&self.file).await?;
+        Ok(MappedSegment {
+            data,
+            sections: std::sync::Arc::new(self.sections.clone()),
+        })
+    }
+
     /// Reads `len` bytes at `offset` within a section, without verification.
     pub async fn read_range(&self, name: &str, offset: u64, len: usize) -> Result<Bytes> {
         let meta = self
@@ -511,5 +520,42 @@ mod tests {
                 }
             }
         });
+    }
+}
+
+/// A segment file mapped with its section table (from [`SegmentReader::mapped`]). It needs no
+/// runtime, so a helper thread can decode the segment's indexes from it (ADR 0026). Every
+/// section read is checked against its hash.
+#[derive(Clone)]
+pub struct MappedSegment {
+    data: Bytes,
+    sections: std::sync::Arc<Vec<SectionMeta>>,
+}
+
+impl MappedSegment {
+    /// Whether the segment has a section named `name`.
+    pub fn has_section(&self, name: &str) -> bool {
+        self.sections.iter().any(|s| s.name == name)
+    }
+
+    /// The named section, after checking its hash.
+    pub fn read_section(&self, name: &str) -> Result<Bytes> {
+        let meta = self
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| Error::corruption(format!("missing section {name:?}")))?;
+        let end = meta
+            .offset
+            .checked_add(meta.len)
+            .filter(|e| *e <= self.data.len() as u64)
+            .ok_or_else(|| Error::corruption(format!("section {name:?} beyond mapped file")))?;
+        let data = self.data.slice(meta.offset as usize..end as usize);
+        if xxh3(&data) != meta.hash {
+            return Err(Error::corruption(format!(
+                "section {name:?} checksum mismatch"
+            )));
+        }
+        Ok(data)
     }
 }

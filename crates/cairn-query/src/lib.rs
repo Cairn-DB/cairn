@@ -11,7 +11,7 @@ pub mod query;
 pub mod replica;
 pub mod wire;
 
-pub use engine::{EngineConfig, LegsJob, ShardEngine};
+pub use engine::{EngineConfig, IndexJob, LegsJob, PreparedIndexes, ShardEngine};
 pub use fusion::{Fusion, LegList, fuse};
 pub use query::{Hit, LegHit, Query, TextLeg, VectorLeg};
 pub use replica::{

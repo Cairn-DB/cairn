@@ -11,7 +11,7 @@ use cairn_index::{
     Bitmap, Bm25Params, DefaultIndexer, StructuredIndex, TextIndex, VectorIndex, VectorIndexParams,
     VectorQuery,
 };
-use cairn_storage::{Command, Store, StoreConfig};
+use cairn_storage::{Command, MappedSegment, SegmentReader, Store, StoreConfig};
 
 /// Engine configuration.
 #[derive(Debug, Clone, Default)]
@@ -45,6 +45,8 @@ pub struct ShardEngine<R: Runtime> {
     indexes: HashMap<SegmentId, std::sync::Arc<SegmentIndexes>>,
     segments_version: Option<u64>,
     memtable: Option<std::sync::Arc<MemtableIndexes>>,
+    /// Indexes decoded off the actor for segments not published yet (ADR 0026).
+    prepared: HashMap<SegmentId, PreparedIndexes>,
 }
 
 /// Runs every leg of `q` over one segment's (or the memtable's) indexes, restricted to
@@ -93,6 +95,57 @@ fn run_legs(
         );
     }
     Ok(())
+}
+
+/// One segment's indexes decoded off the actor (ADR 0026), waiting for its publication.
+pub struct PreparedIndexes {
+    structured: StructuredIndex,
+    texts: HashMap<usize, TextIndex>,
+    vectors: HashMap<usize, VectorIndex>,
+}
+
+/// Decodes one segment's indexes from its mapped file, on any thread (ADR 0026).
+pub struct IndexJob {
+    mapped: MappedSegment,
+    schema: Schema,
+    vector: VectorIndexParams,
+    prefetch: Option<fn(&[u8])>,
+}
+
+impl IndexJob {
+    /// Checks every section it reads against its hash and decodes the indexes.
+    pub fn run(self) -> Result<PreparedIndexes> {
+        let m = &self.mapped;
+        let structured = StructuredIndex::decode(m, &self.schema)?;
+        let mut texts = HashMap::default();
+        let mut vectors = HashMap::default();
+        for (i, f) in self.schema.fields.iter().enumerate() {
+            match f.kind {
+                FieldKind::Text if m.has_section(&format!("text.{i}")) => {
+                    texts.insert(i, TextIndex::decode(m, i)?);
+                }
+                FieldKind::Vector { dims, metric } => {
+                    vectors.insert(
+                        i,
+                        VectorIndex::decode(
+                            m,
+                            i,
+                            metric,
+                            dims as usize,
+                            self.vector,
+                            self.prefetch,
+                        )?,
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(PreparedIndexes {
+            structured,
+            texts,
+            vectors,
+        })
+    }
 }
 
 /// A query's search over a snapshot of one shard (ADR 0025), from
@@ -185,6 +238,7 @@ impl<R: Runtime> ShardEngine<R> {
             indexes: HashMap::default(),
             segments_version: None,
             memtable: None,
+            prepared: HashMap::default(),
         };
         engine.refresh().await?;
         Ok(engine)
@@ -239,30 +293,25 @@ impl<R: Runtime> ShardEngine<R> {
                 .store
                 .segment(id)
                 .ok_or_else(|| Error::Internal("segment vanished".into()))?;
-            let structured = StructuredIndex::load(view.reader, &schema).await?;
-            let mut texts = HashMap::default();
-            let mut vectors = HashMap::default();
-            for (i, f) in schema.fields.iter().enumerate() {
-                match f.kind {
-                    FieldKind::Text if view.reader.has_section(&format!("text.{i}")) => {
-                        texts.insert(i, TextIndex::load(view.reader, i).await?);
-                    }
-                    FieldKind::Vector { dims, metric } => {
-                        vectors.insert(
-                            i,
-                            VectorIndex::load(
-                                view.reader,
-                                i,
-                                metric,
-                                dims as usize,
-                                self.cfg.vector,
-                            )
-                            .await?,
-                        );
-                    }
-                    _ => {}
+            let prepared = match self.prepared.remove(&id) {
+                Some(p) => p,
+                None => {
+                    // Not prepared (startup, snapshot install, single-node use): decode now,
+                    // off the core, while the actor waits.
+                    let job = IndexJob {
+                        mapped: view.reader.mapped().await?,
+                        schema: schema.clone(),
+                        vector: self.cfg.vector,
+                        prefetch: view.reader.prefetcher(),
+                    };
+                    view.reader.runtime().offload(move || job.run()).await?
                 }
-            }
+            };
+            let PreparedIndexes {
+                structured,
+                texts,
+                vectors,
+            } = prepared;
             let doc_ids = view.docs.docids().to_vec();
             self.indexes.insert(
                 id,
@@ -276,6 +325,36 @@ impl<R: Runtime> ShardEngine<R> {
         }
         self.segments_version = Some(self.store.segments_version());
         Ok(())
+    }
+
+    /// Prepares the indexes of segment `id`, whose file is in place but not published yet
+    /// (ADR 0026): cheap here, and the returned job decodes them on any thread. The replica
+    /// runs it off its actor and hands the result to [`ShardEngine::adopt_indexes`], so
+    /// publishing the segment later loads nothing on the actor.
+    pub async fn index_job(&self, id: SegmentId) -> Result<IndexJob> {
+        let reader =
+            SegmentReader::open(self.store.runtime().clone(), &self.store.segment_path(id)).await?;
+        Ok(IndexJob {
+            mapped: reader.mapped().await?,
+            schema: self.store.schema().clone(),
+            vector: self.cfg.vector,
+            prefetch: reader.prefetcher(),
+        })
+    }
+
+    /// Keeps prepared indexes for segment `id` until it is published.
+    pub fn adopt_indexes(&mut self, id: SegmentId, indexes: PreparedIndexes) {
+        self.prepared.insert(id, indexes);
+    }
+
+    /// Whether segment `id` has its indexes: prepared, or already loaded.
+    pub fn indexes_ready(&self, id: SegmentId) -> bool {
+        self.prepared.contains_key(&id) || self.indexes.contains_key(&id)
+    }
+
+    /// Drops prepared indexes whose segment will not be published (merged away, replaced).
+    pub fn retain_prepared(&mut self, keep: impl Fn(SegmentId) -> bool) {
+        self.prepared.retain(|id, _| keep(*id));
     }
 
     fn memtable_indexes(&mut self) -> std::sync::Arc<MemtableIndexes> {
@@ -548,9 +627,11 @@ impl<R: Runtime> ShardEngine<R> {
     }
 }
 
-/// A job crosses to a helper thread (ADR 0025).
+/// Jobs cross to helper threads (ADR 0025, ADR 0026).
 #[allow(dead_code)]
-fn _legs_job_is_send() {
+fn _jobs_are_send() {
     fn check<T: Send + 'static>() {}
     check::<LegsJob>();
+    check::<IndexJob>();
+    check::<PreparedIndexes>();
 }

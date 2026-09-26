@@ -331,6 +331,17 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     bounds search threads. It did NOT recover the single-client overhead (3.7-4.0 vs
     3.2 ms). The cause is not identified (suspects: the completion hop, cache locality).
   - NOT measured on GCP yet.
+- Index loading off the actor (2026-09-26, owner: "vas-y pour le chargement des index hors de
+  l'acteur"): ADR 0026. Done (prepared before publication, gated publish and install), but
+  it did NOT fix the ingest stalls (A/B identical).
+  - New per-step instrumentation found the real blocker: synchronous disk syncs on the actor
+    (Raft log 0.3-1.7 s per single-entry sync, hard state, manifest at publication) behind
+    build writes.
+  - Chunked segment writes with periodic syncs did not help (reverted).
+  - Next lever: asynchronous Raft persistence (needs an ADR).
+  - Mistake: `git checkout -- segment.rs` to revert the chunked writes also reverted the
+    uncommitted MappedSegment code; it was reapplied from the session. Revert edits
+    precisely, not whole files, while work is uncommitted.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

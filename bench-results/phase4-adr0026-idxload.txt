@@ -1,0 +1,5 @@
+old-r1: probes 1135, p50 171 ms, p99 2500 ms, max 5104 ms, >500ms 18, >2s 13 | ingested rows 0..12500000 in 733s (17044 docs/s)
+new-r1: probes 1148, p50 163 ms, p99 1933 ms, max 5104 ms, >500ms 19, >2s 11 | ingested rows 0..12500000 in 723s (17283 docs/s)
+old-r2: probes 1144, p50 174 ms, p99 1664 ms, max 5104 ms, >500ms 18, >2s 11 | ingested rows 0..12500000 in 733s (17061 docs/s)
+new-r2: probes 1154, p50 173 ms, p99 1091 ms, max 5104 ms, >500ms 25, >2s 11 | ingested rows 0..12500000 in 734s (17019 docs/s)
+ALL_DONE

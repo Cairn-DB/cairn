@@ -19,7 +19,7 @@ pub use deletion::DeletionSet;
 pub use log::{Log, LogConfig, LogEntry};
 pub use manifest::{Manifest, ManifestStore};
 pub use memtable::Memtable;
-pub use segment::{SectionMeta, SegmentReader, SegmentWriter};
+pub use segment::{MappedSegment, SectionMeta, SegmentReader, SegmentWriter};
 pub use store::{
     CompactJob, FlushJob, NoIndexer, SegmentIndexer, SegmentMeta, SegmentView, ShardManifest,
     Store, StoreConfig,
