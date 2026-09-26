@@ -57,3 +57,26 @@ pub(crate) fn will_need(data: &[u8]) {
         libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_WILLNEED);
     }
 }
+
+/// Raises the soft limit on open files to the hard limit and returns the new soft limit.
+/// Distributions default the soft limit to 1024, which a node with many shards reaches under
+/// load: log files, segments, peer connections, and file I/O in flight.
+pub fn raise_open_files_limit() -> std::io::Result<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if lim.rlim_cur < lim.rlim_max {
+        lim.rlim_cur = lim.rlim_max;
+        // SAFETY: `lim` is a valid rlimit; raising the soft limit up to the hard one is allowed
+        // without privileges.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(lim.rlim_cur)
+}

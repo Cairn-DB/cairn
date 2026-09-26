@@ -107,6 +107,9 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let cli = Cli::parse();
+    if let Err(e) = cairn_runtime::raise_open_files_limit() {
+        tracing::warn!("could not raise the open files limit: {e}");
+    }
     let mut peers = HashMap::default();
     for p in &cli.peers {
         let (id, addr) = p.split_once('=').context("peer must be id=addr")?;

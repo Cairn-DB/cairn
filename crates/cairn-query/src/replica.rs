@@ -195,6 +195,12 @@ enum Event {
         expected: (u64, u64),
         ok: Result<bool>,
     },
+    /// A chunk of the fetch `req` of segment `id` was written outside the actor (ADR 0027).
+    ChunkWritten {
+        id: SegmentId,
+        req: u64,
+        ok: Result<()>,
+    },
     /// A segment's indexes were decoded outside the actor, ahead of its publication (ADR 0026).
     IndexesReady {
         id: SegmentId,
@@ -219,6 +225,7 @@ impl Event {
             Event::IndexesReady { .. } => "indexes_ready",
             Event::Persisted(_) => "persisted",
             Event::FetchVerified { .. } => "fetch_verified",
+            Event::ChunkWritten { .. } => "chunk_written",
         }
     }
 }
@@ -254,6 +261,7 @@ impl Drop for AliveGuard {
                 | Event::CompactWritten { .. }
                 | Event::Persisted(_)
                 | Event::FetchVerified { .. }
+                | Event::ChunkWritten { .. }
                 | Event::IndexesReady { .. } => {}
             }
         }
@@ -470,8 +478,10 @@ struct SegFetch {
     progress_tick: u64,
     /// Tick of the last re-request of the chunks in flight.
     retry_tick: u64,
-    /// Chunk writes running outside the actor; the check at the end waits for them.
-    writes: Vec<cairn_core::sync::Receiver<Result<()>>>,
+    /// Chunks received and still being written outside the actor. They count towards
+    /// `FETCH_WINDOW`: a disk stalled behind builds must slow the fetch down, not pile up
+    /// writes (each holds a file descriptor and a chunk; GCP run 7 ran out of descriptors).
+    writing: usize,
 }
 
 /// Segment files fetched at once (flushed or merged, ADR 0021): a replica that comes back
@@ -839,6 +849,7 @@ impl<R: Runtime> Replica<R> {
                         | Event::CompactWritten { .. }
                         | Event::Persisted(_)
                         | Event::FetchVerified { .. }
+                        | Event::ChunkWritten { .. }
                         | Event::IndexesReady { .. } => {}
                     }
                 }
@@ -996,6 +1007,18 @@ impl<R: Runtime> Replica<R> {
                 }
                 self.drive_flushes().await?;
                 self.drive_compactions().await?;
+            }
+            Event::ChunkWritten { id, req, ok } => {
+                let Some(f) = self.flush.fetches.get_mut(&id).filter(|f| f.req == req) else {
+                    return Ok(());
+                };
+                f.writing -= 1;
+                f.progress_tick = self.ticks;
+                if let Err(e) = ok {
+                    self.fetch_failed(id, &format!("writing a chunk: {e}"));
+                    return self.drive_flushes().await;
+                }
+                self.advance_seg_fetch(id).await?;
             }
             Event::IndexesReady {
                 id,
@@ -2003,7 +2026,7 @@ impl<R: Runtime> Replica<R> {
                 got: 0,
                 progress_tick: self.ticks,
                 retry_tick: self.ticks,
-                writes: Vec::new(),
+                writing: 0,
             },
         );
         self.send(
@@ -2235,7 +2258,7 @@ impl<R: Runtime> Replica<R> {
             .flush
             .fetches
             .iter()
-            .filter(|(_, f)| ticks - f.progress_tick >= stall)
+            .filter(|(_, f)| f.writing == 0 && ticks - f.progress_tick >= stall)
             .map(|(id, _)| *id)
             .collect();
         for id in stalled {
@@ -2643,35 +2666,47 @@ impl<R: Runtime> Replica<R> {
         }
         let n = data.len() as u64;
         // Written by a task of its own, like serving (a write can stall behind builds).
-        let (tx, rx) = oneshot();
-        let (rt, staged) = (self.rt.clone(), self.engine.store().staged_fetch_path(id));
+        let (rt, inbox) = (self.rt.clone(), self.inbox.clone());
+        let staged = self.engine.store().staged_fetch_path(id);
         self.rt.spawn(async move {
-            tx.send(cairn_storage::store::write_staged_chunk(rt, staged, offset, data).await);
+            let ok = cairn_storage::store::write_staged_chunk(rt, staged, offset, data).await;
+            inbox.push(Event::ChunkWritten { id, req, ok });
         });
         let ticks = self.ticks;
+        if let Some(f) = self.flush.fetches.get_mut(&id) {
+            f.inflight.remove(&offset);
+            f.got += n;
+            f.writing += 1;
+            f.total = Some(total);
+            f.progress_tick = ticks;
+        }
+        self.advance_seg_fetch(id).await
+    }
+
+    /// Keeps up to `FETCH_WINDOW` chunks of fetch `id` requested or being written, and once
+    /// every chunk is written, checks the file outside the actor.
+    async fn advance_seg_fetch(&mut self, id: SegmentId) -> Result<()> {
         let mut requests = Vec::new();
-        let done = {
+        let (from, req, compaction, done) = {
             let Some(f) = self.flush.fetches.get_mut(&id) else {
                 return Ok(());
             };
-            f.inflight.remove(&offset);
-            f.got += n;
-            f.writes.push(rx);
-            f.total = Some(total);
-            f.progress_tick = ticks;
-            while f.inflight.len() < FETCH_WINDOW && f.next < total {
+            let total = f.total.unwrap_or(0);
+            while f.inflight.len() + f.writing < FETCH_WINDOW && f.next < total {
                 requests.push(f.next);
                 f.inflight.insert(f.next);
                 f.next += CHUNK as u64;
             }
-            f.got >= total && f.inflight.is_empty()
+            let done =
+                f.total.is_some() && f.got >= total && f.inflight.is_empty() && f.writing == 0;
+            (f.from, f.req, f.compaction, done)
         };
         for offset in requests {
             self.send(
                 from,
                 FrameBody::FetchFile {
                     req,
-                    path: path.clone(),
+                    path: seg_rel(id),
                     offset,
                 },
             )
@@ -2680,12 +2715,7 @@ impl<R: Runtime> Replica<R> {
         if !done {
             return Ok(());
         }
-        let writes = self
-            .flush
-            .fetches
-            .remove(&id)
-            .map(|f| f.writes)
-            .unwrap_or_default();
+        self.flush.fetches.remove(&id);
         let Some(expected) = self.engine.store().fetched_expected(id, compaction) else {
             // Published or merged away meanwhile.
             return self.drive_flushes().await;
@@ -2696,18 +2726,7 @@ impl<R: Runtime> Replica<R> {
         let (rt, inbox) = (self.rt.clone(), self.inbox.clone());
         let path = self.engine.store().staged_fetch_path(id);
         self.rt.spawn(async move {
-            let mut written = Ok(());
-            for w in writes {
-                match w.await {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => written = Err(e),
-                    None => written = Err(Error::Internal("chunk write dropped".into())),
-                }
-            }
-            let ok = match written {
-                Ok(()) => cairn_storage::store::verify_staged_file(rt, path, expected).await,
-                Err(e) => Err(e),
-            };
+            let ok = cairn_storage::store::verify_staged_file(rt, path, expected).await;
             inbox.push(Event::FetchVerified {
                 id,
                 compaction,
