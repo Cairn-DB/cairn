@@ -349,6 +349,15 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     (instrumented locally).
   - Cost 27.46 USD, of which about 21 USD was a deploy blocked for 10.7 h on stale SSH host
     keys (scripts fixed in 4833326). Fleet deleted and checked.
+- Asynchronous Raft persistence (2026-09-26, owner: plan approved, "go"): ADR 0027.
+  - Raft: `handed` mark, split messages; bug found and fixed (commit index at restart).
+  - Replica: one background persistence task, messages held until durable.
+  - Simulator: slow syncs.
+  - Pre-existing snapshot-install bug fixed (intent log).
+  - Campaign 0..60000 zero violations with slow syncs.
+  - Local A/B: Raft syncs blocking the actor 94-157 -> 0, ingest +12..55%.
+  - Open: publication syncs on the actor (next lever); about 0.1% of the 150 ms-sync seeds
+    make no progress under faults (1% before). GCP measurement pending (owner's go).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

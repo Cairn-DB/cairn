@@ -116,4 +116,18 @@ time the shard's actor serves nothing: no writes, no reads, no heartbeats (elect
   million fetched. Two thirds of the seeds ran with slow syncs. The 150 ms seeds require no
   minimum activity (see above); every other seed requires at least 5 acknowledged writes
   and 5 checked reads.
+- **Local A/B** (`bench-results/phase4-adr0027-async-persistence.md`): 3 nodes on one host,
+  6M rows, alternating, 2 runs each:
+
+  | | synchronous | asynchronous |
+  |---|---|---|
+  | ingest | 4,951 / 4,535 docs/s | 5,560 / 7,020 docs/s |
+  | Raft syncs on the actor over 250 ms | 94 / 157 | 0 / 0 |
+  | actor steps over 500 ms | 165 / 219 | 121 / 98 |
+
+  Raft syncs no longer block the actor. The remaining slow steps are mostly publication
+  (`indexes_ready`, about 80 per run: doc store opening, manifest and deletion syncs) and
+  adopting a built file (`flush_written`). As foreseen under Risks, these are the next
+  lever. The two async runs differ by 26%: the effect on ingest is real but noisy on a
+  shared host.
 
