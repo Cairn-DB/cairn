@@ -226,6 +226,24 @@ impl Vectors {
     ) -> Result<Self> {
         let mut v = Vectors::from_rows(metric, dims, rows, false);
         if let Some(bytes) = sq8 {
+            v.set_sq8(bytes)?;
+        }
+        Ok(v)
+    }
+
+    /// `n` rows from their SQ8 section only, without f32 rows: the state `drop_f32` leaves.
+    /// Loading a segment with `keep_f32` off no longer reads, hashes and converts the whole
+    /// f32 column only to drop it (1.5 GB for a 3M-row, 128-d merged segment).
+    pub fn from_sq8_only(metric: Metric, dims: usize, n: u32, sq8: &[u8]) -> Result<Self> {
+        let mut v = Vectors::header_only(metric, dims, n);
+        v.set_sq8(sq8)?;
+        Ok(v)
+    }
+
+    fn set_sq8(&mut self, bytes: &[u8]) -> Result<()> {
+        let v = self;
+        let dims = v.dims;
+        {
             let mut r = Reader::new(bytes);
             let params = Sq8Params::decode(&mut r)?;
             if params.min.len() != dims {
@@ -239,6 +257,30 @@ impl Vectors {
             r.finish()?;
             v.sq8 = Some((q8, params));
         }
-        Ok(v)
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loading SQ8 codes alone equals loading everything and dropping the f32 rows.
+    #[test]
+    fn sq8_only_load_matches_drop_f32() {
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let dims = 16;
+            let rows: Vec<f32> = (0..200 * dims)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+                .collect();
+            let built = Vectors::from_rows(metric, dims, rows.clone(), true);
+            let sq8 = built.encode_sq8().expect("sq8");
+            let mut full = Vectors::from_rows_and_sq8(metric, dims, rows, Some(&sq8)).unwrap();
+            assert!(full.drop_f32());
+            let only = Vectors::from_sq8_only(metric, dims, 200, &sq8).unwrap();
+            assert_eq!(only, full);
+            assert!(only.has_sq8() && !only.has_f32());
+            assert!(Vectors::from_sq8_only(metric, dims, 199, &sq8).is_err());
+        }
     }
 }

@@ -272,6 +272,39 @@ impl VectorIndex {
                 disk_scratch: Mutex::new(Vec::new()),
             });
         }
+        let sq8_name = format!("sq8.{field}");
+        let hnsw_name = format!("hnsw.{field}");
+        if !params.keep_f32 && reader.has_section(&sq8_name) {
+            // SQ8 residency (ADR 0013): the f32 column would be dropped right away, so it is
+            // not read at all. This load runs on the replica actor.
+            let mut present = Bitmap::empty(n);
+            for (i, &p) in nulls.iter().enumerate() {
+                if p != 0 {
+                    present.set(i as u32);
+                }
+            }
+            let vectors =
+                Vectors::from_sq8_only(metric, dims, n, &reader.read_section(&sq8_name).await?)?;
+            let hnsw = if reader.has_section(&hnsw_name) {
+                let h = Hnsw::decode(&reader.read_section(&hnsw_name).await?)?;
+                if h.len() != n {
+                    return Err(cairn_core::Error::corruption("hnsw row count mismatch"));
+                }
+                Some(h)
+            } else {
+                None
+            };
+            return Ok(VectorIndex {
+                field,
+                vectors,
+                present,
+                hnsw,
+                disk: None,
+                params,
+                scratch: Mutex::new(Vec::new()),
+                disk_scratch: Mutex::new(Vec::new()),
+            });
+        }
         let col = reader.read_section(&format!("col.{field}")).await?;
         if col.len() != n as usize * dims * 4 {
             return Err(cairn_core::Error::corruption(format!(
@@ -288,7 +321,6 @@ impl VectorIndex {
                 present.set(i as u32);
             }
         }
-        let sq8_name = format!("sq8.{field}");
         let sq8 = if reader.has_section(&sq8_name) {
             Some(reader.read_section(&sq8_name).await?)
         } else {
@@ -298,7 +330,6 @@ impl VectorIndex {
         if !params.keep_f32 {
             vectors.drop_f32();
         }
-        let hnsw_name = format!("hnsw.{field}");
         let hnsw = if reader.has_section(&hnsw_name) {
             let h = Hnsw::decode(&reader.read_section(&hnsw_name).await?)?;
             if h.len() != n {
