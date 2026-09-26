@@ -188,6 +188,13 @@ enum Event {
     },
     /// The persistence task with this sequence number finished (ADR 0027).
     Persisted(u64),
+    /// A fetched segment file was synced and checked outside the actor (ADR 0027).
+    FetchVerified {
+        id: SegmentId,
+        compaction: bool,
+        expected: (u64, u64),
+        ok: Result<bool>,
+    },
     /// A segment's indexes were decoded outside the actor, ahead of its publication (ADR 0026).
     IndexesReady {
         id: SegmentId,
@@ -211,6 +218,7 @@ impl Event {
             Event::CompactWritten { .. } => "compact_written",
             Event::IndexesReady { .. } => "indexes_ready",
             Event::Persisted(_) => "persisted",
+            Event::FetchVerified { .. } => "fetch_verified",
         }
     }
 }
@@ -245,6 +253,7 @@ impl Drop for AliveGuard {
                 | Event::FlushWritten { .. }
                 | Event::CompactWritten { .. }
                 | Event::Persisted(_)
+                | Event::FetchVerified { .. }
                 | Event::IndexesReady { .. } => {}
             }
         }
@@ -461,6 +470,8 @@ struct SegFetch {
     progress_tick: u64,
     /// Tick of the last re-request of the chunks in flight.
     retry_tick: u64,
+    /// Chunk writes running outside the actor; the check at the end waits for them.
+    writes: Vec<cairn_core::sync::Receiver<Result<()>>>,
 }
 
 /// Segment files fetched at once (flushed or merged, ADR 0021): a replica that comes back
@@ -577,6 +588,9 @@ struct FlushState {
     skipped: u64,
     /// Segments whose indexes are being decoded outside the actor (ADR 0026).
     preparing: std::collections::BTreeSet<SegmentId>,
+    /// Fetched segments being synced and checked outside the actor (ADR 0027): not fetched
+    /// again meanwhile.
+    verifying: std::collections::BTreeSet<SegmentId>,
     /// Segments whose index preparation failed: published anyway, loading at publication.
     prepare_failed: std::collections::BTreeSet<SegmentId>,
     /// Leader balancing (ADR 0020): tick since which this replica leads, and the earliest tick
@@ -824,6 +838,7 @@ impl<R: Runtime> Replica<R> {
                         | Event::FlushWritten { .. }
                         | Event::CompactWritten { .. }
                         | Event::Persisted(_)
+                        | Event::FetchVerified { .. }
                         | Event::IndexesReady { .. } => {}
                     }
                 }
@@ -944,6 +959,43 @@ impl<R: Runtime> Replica<R> {
                     ));
                     self.finish_persistence(seq, up_to, r).await?;
                 }
+            }
+            Event::FetchVerified {
+                id,
+                compaction,
+                expected,
+                ok,
+            } => {
+                self.flush.verifying.remove(&id);
+                let installed = match ok {
+                    Ok(true) => match self
+                        .engine
+                        .store_mut()
+                        .install_verified(id, compaction, expected)
+                        .await
+                    {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "installing a fetched segment failed: {e}");
+                            false
+                        }
+                    },
+                    _ => false,
+                };
+                if installed {
+                    self.flush.fetched += 1;
+                    tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "segment fetched");
+                } else if self
+                    .engine
+                    .store()
+                    .fetched_expected(id, compaction)
+                    .is_some()
+                {
+                    tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "fetched segment does not match its commit: building it here");
+                    self.flush.fallback.insert(id);
+                }
+                self.drive_flushes().await?;
+                self.drive_compactions().await?;
             }
             Event::IndexesReady {
                 id,
@@ -1162,40 +1214,49 @@ impl<R: Runtime> Replica<R> {
                 if !path.starts_with("segs/") || path.contains("..") {
                     return Ok(());
                 }
-                // One chunk read per request: never the whole (possibly very large) file.
-                let data = self
-                    .engine
-                    .store()
-                    .read_file_range(&path, offset, CHUNK)
-                    .await?;
-                let missing = if path.ends_with(".del")
-                    && data.is_none()
-                    && self
-                        .engine
-                        .store()
-                        .read_file_range(&path.replace(".del", ".seg"), 0, 0)
-                        .await?
-                        .is_some()
-                {
-                    // No deletion checkpoint, but the segment is here: nothing to mask.
-                    NO_CHECKPOINT
-                } else {
-                    u64::MAX
-                };
-                let (total, chunk) = data.unwrap_or((missing, Bytes::new()));
+                // Served by a task of its own: a disk read can stall for seconds while builds
+                // write, and the actor must not wait on it (ADR 0027). One chunk read per
+                // request: never the whole (possibly very large) file.
+                let (rt, dir, shard) = (
+                    self.rt.clone(),
+                    self.engine.store().shard_dir().to_owned(),
+                    self.cfg.shard,
+                );
                 let applied = self.engine.store().applied_index().get();
-                self.send(
-                    from,
-                    FrameBody::FileChunk {
-                        req,
-                        path,
-                        offset,
-                        total,
-                        applied,
-                        data: chunk,
-                    },
-                )
-                .await;
+                self.rt.spawn(async move {
+                    let read = |rel: String, len| {
+                        let (rt, dir) = (rt.clone(), dir.clone());
+                        async move {
+                            cairn_storage::store::read_shard_file(rt, &dir, &rel, offset, len)
+                                .await
+                                .ok()
+                                .flatten()
+                        }
+                    };
+                    let data = read(path.clone(), CHUNK).await;
+                    let missing = if path.ends_with(".del")
+                        && data.is_none()
+                        && read(path.replace(".del", ".seg"), 0).await.is_some()
+                    {
+                        // No deletion checkpoint, but the segment is here: nothing to mask.
+                        NO_CHECKPOINT
+                    } else {
+                        u64::MAX
+                    };
+                    let (total, chunk) = data.unwrap_or((missing, Bytes::new()));
+                    let f = Frame {
+                        shard,
+                        body: FrameBody::FileChunk {
+                            req,
+                            path,
+                            offset,
+                            total,
+                            applied,
+                            data: chunk,
+                        },
+                    };
+                    let _ = rt.network().send(from, f.to_bytes()).await;
+                });
             }
             FrameBody::FileChunk {
                 req,
@@ -1684,7 +1745,8 @@ impl<R: Runtime> Replica<R> {
             if p.has_file || p.empty || skip.contains(&p.id) {
                 continue;
             }
-            let fetching = self.flush.fetches.contains_key(&p.id);
+            let fetching =
+                self.flush.fetches.contains_key(&p.id) || self.flush.verifying.contains(&p.id);
             // A committed file is fetched from the node that built it, whoever leads now (a
             // new leader included: rebuilding it was wasted work, and its followers then
             // asked it for a file it did not have yet). Built here: no commit yet and this
@@ -1941,6 +2003,7 @@ impl<R: Runtime> Replica<R> {
                 got: 0,
                 progress_tick: self.ticks,
                 retry_tick: self.ticks,
+                writes: Vec::new(),
             },
         );
         self.send(
@@ -2357,7 +2420,11 @@ impl<R: Runtime> Replica<R> {
                 let local = !self.cfg.ship_segments
                     || self.flush.fallback.contains(&p.id)
                     || p.from == self.cfg.id;
-                if !p_has_file && !local && !self.flush.fetches.contains_key(&p.id) {
+                if !p_has_file
+                    && !local
+                    && !self.flush.fetches.contains_key(&p.id)
+                    && !self.flush.verifying.contains(&p.id)
+                {
                     self.start_seg_fetch(p.id, true, p.from).await?;
                 }
             }
@@ -2365,7 +2432,8 @@ impl<R: Runtime> Replica<R> {
                 // Earlier flushes still to publish here.
                 return Ok(());
             }
-            let fetching = self.flush.fetches.contains_key(&c.id);
+            let fetching =
+                self.flush.fetches.contains_key(&c.id) || self.flush.verifying.contains(&c.id);
             // From the node that built it, whoever leads now; here if it is ours (a restart
             // lost the file), without shipping, or after a failed fetch.
             let local = !self.cfg.ship_segments
@@ -2574,11 +2642,12 @@ impl<R: Runtime> Replica<R> {
             return self.drive_flushes().await;
         }
         let n = data.len() as u64;
-        let staging = Store::<R>::ship_staging(id);
-        self.engine
-            .store()
-            .write_fetch_chunk_at(&staging, offset, data)
-            .await?;
+        // Written by a task of its own, like serving (a write can stall behind builds).
+        let (tx, rx) = oneshot();
+        let (rt, staged) = (self.rt.clone(), self.engine.store().staged_fetch_path(id));
+        self.rt.spawn(async move {
+            tx.send(cairn_storage::store::write_staged_chunk(rt, staged, offset, data).await);
+        });
         let ticks = self.ticks;
         let mut requests = Vec::new();
         let done = {
@@ -2587,6 +2656,7 @@ impl<R: Runtime> Replica<R> {
             };
             f.inflight.remove(&offset);
             f.got += n;
+            f.writes.push(rx);
             f.total = Some(total);
             f.progress_tick = ticks;
             while f.inflight.len() < FETCH_WINDOW && f.next < total {
@@ -2610,24 +2680,42 @@ impl<R: Runtime> Replica<R> {
         if !done {
             return Ok(());
         }
-        self.flush.fetches.remove(&id);
-        self.engine.store().sync_fetched(&staging).await?;
-        let installed = if compaction {
-            self.engine
-                .store_mut()
-                .install_fetched_compaction(id)
-                .await?
-        } else {
-            self.engine.store_mut().install_fetched_flush(id).await?
+        let writes = self
+            .flush
+            .fetches
+            .remove(&id)
+            .map(|f| f.writes)
+            .unwrap_or_default();
+        let Some(expected) = self.engine.store().fetched_expected(id, compaction) else {
+            // Published or merged away meanwhile.
+            return self.drive_flushes().await;
         };
-        if installed {
-            self.flush.fetched += 1;
-            tracing::debug!(node = %self.cfg.id, shard = %self.cfg.shard, %id, bytes = total, "segment fetched");
-        } else {
-            tracing::warn!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "fetched segment does not match its commit: building it here");
-            self.flush.fallback.insert(id);
-        }
-        self.drive_flushes().await
+        // Syncing the file and checking its hash read hundreds of megabytes: outside the
+        // actor, which only renames the file into place once `FetchVerified` says it matches.
+        self.flush.verifying.insert(id);
+        let (rt, inbox) = (self.rt.clone(), self.inbox.clone());
+        let path = self.engine.store().staged_fetch_path(id);
+        self.rt.spawn(async move {
+            let mut written = Ok(());
+            for w in writes {
+                match w.await {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => written = Err(e),
+                    None => written = Err(Error::Internal("chunk write dropped".into())),
+                }
+            }
+            let ok = match written {
+                Ok(()) => cairn_storage::store::verify_staged_file(rt, path, expected).await,
+                Err(e) => Err(e),
+            };
+            inbox.push(Event::FetchVerified {
+                id,
+                compaction,
+                expected,
+                ok,
+            });
+        });
+        Ok(())
     }
 
     /// Drops the accepted snapshot and the log after it, and reopens from disk so the leader

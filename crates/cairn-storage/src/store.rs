@@ -412,6 +412,59 @@ fn intent_path(dir: &str) -> String {
     format!("{dir}/INSTALL")
 }
 
+/// Reads up to `len` bytes at `offset` of the shard file `rel` in `dir`; `None` if it does not
+/// exist. Returns the file length too. Needs only the runtime, so a task outside the replica
+/// actor serves chunks with it (ADR 0027).
+pub async fn read_shard_file<R: Runtime>(
+    rt: R,
+    dir: &str,
+    rel: &str,
+    offset: u64,
+    len: usize,
+) -> Result<Option<(u64, bytes::Bytes)>> {
+    let disk = rt.disk();
+    let path = format!("{dir}/{rel}");
+    if !disk.exists(&path).await? {
+        return Ok(None);
+    }
+    let f = disk.open(&path, cairn_core::OpenMode::Read).await?;
+    let total = disk.len(&f).await?;
+    let start = offset.min(total);
+    let n = (total - start).min(len as u64) as usize;
+    Ok(Some((total, disk.read_at(&f, start, n).await?)))
+}
+
+/// Writes one fetched chunk at `offset` of the staging file `path` (outside the actor).
+pub async fn write_staged_chunk<R: Runtime>(
+    rt: R,
+    path: String,
+    offset: u64,
+    data: bytes::Bytes,
+) -> Result<()> {
+    let disk = rt.disk();
+    let f = disk.open(&path, cairn_core::OpenMode::CreateOrOpen).await?;
+    disk.write_at(&f, offset, data).await
+}
+
+/// Syncs a fetched file staged at `path` and checks it against the committed `(length, hash)`,
+/// hashing on a helper thread. Runs outside the replica actor (ADR 0027); the actor then only
+/// renames it into place ([`Store::install_verified`]).
+pub async fn verify_staged_file<R: Runtime>(
+    rt: R,
+    path: String,
+    expected: (u64, u64),
+) -> Result<bool> {
+    let disk = rt.disk();
+    let f = disk.open(&path, cairn_core::OpenMode::ReadWrite).await?;
+    disk.sync(&f).await?;
+    Ok(match SegmentReader::open(rt, &path).await {
+        Ok(r) => {
+            r.len() == expected.0 && r.file_hash() == expected.1 && r.verify_file_hash_off().await?
+        }
+        Err(_) => false,
+    })
+}
+
 fn seg_path(dir: &str, id: SegmentId) -> String {
     format!("{dir}/segs/{:016x}.seg", id.get())
 }
@@ -994,6 +1047,54 @@ impl<R: Runtime> Store<R> {
     /// time.
     pub fn ship_staging(id: SegmentId) -> String {
         format!("segs/{:016x}.seg.ship", id.get())
+    }
+
+    /// The committed length and hash a fetched file for `id` must have: of a pending freeze, or
+    /// of a committed merge. `None` when neither waits for a file any more.
+    pub fn fetched_expected(&self, id: SegmentId, compaction: bool) -> Option<(u64, u64)> {
+        if compaction {
+            self.manifest
+                .compactions
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.len, c.hash))
+        } else {
+            self.pending
+                .iter()
+                .find(|p| p.id == id && p.file.is_none())
+                .and_then(|p| p.commit)
+        }
+    }
+
+    /// Path of the staged file of a fetch of `id`.
+    pub fn staged_fetch_path(&self, id: SegmentId) -> String {
+        format!("{}/{}.fetch", self.dir, Self::ship_staging(id))
+    }
+
+    /// Installs a fetched file already checked by [`verify_staged_file`] against `expected`,
+    /// if a freeze (or a merge) still waits for it with that length and hash: renames it into
+    /// place and records it.
+    pub async fn install_verified(
+        &mut self,
+        id: SegmentId,
+        compaction: bool,
+        expected: (u64, u64),
+    ) -> Result<bool> {
+        if self.fetched_expected(id, compaction) != Some(expected) {
+            return Ok(false);
+        }
+        let path = seg_path(&self.dir, id);
+        self.rt
+            .disk()
+            .rename_nosync(&self.staged_fetch_path(id), &path)
+            .await?;
+        self.unsynced_renames.insert(id);
+        if compaction {
+            self.compaction_files.insert(id, expected);
+        } else if let Some(p) = self.pending.iter_mut().find(|p| p.id == id) {
+            p.file = Some(expected);
+        }
+        Ok(true)
     }
 
     /// Installs a segment file fetched from the leader (streamed to
@@ -2069,16 +2170,12 @@ impl<R: Runtime> Store<R> {
         offset: u64,
         len: usize,
     ) -> Result<Option<(u64, bytes::Bytes)>> {
-        let disk = self.rt.disk();
-        let path = format!("{}/{rel}", self.dir);
-        if !disk.exists(&path).await? {
-            return Ok(None);
-        }
-        let f = disk.open(&path, cairn_core::OpenMode::Read).await?;
-        let total = disk.len(&f).await?;
-        let start = offset.min(total);
-        let n = (total - start).min(len as u64) as usize;
-        Ok(Some((total, disk.read_at(&f, start, n).await?)))
+        read_shard_file(self.rt.clone(), &self.dir, rel, offset, len).await
+    }
+
+    /// The shard directory (for work done outside the store, such as serving file chunks).
+    pub fn shard_dir(&self) -> &str {
+        &self.dir
     }
 
     /// Writes one fetched chunk of `rel` into its staging file (`<rel>.fetch`); the first
@@ -2118,10 +2215,13 @@ impl<R: Runtime> Store<R> {
         offset: u64,
         data: bytes::Bytes,
     ) -> Result<()> {
-        let disk = self.rt.disk();
-        let path = format!("{}/{rel}.fetch", self.dir);
-        let f = disk.open(&path, cairn_core::OpenMode::CreateOrOpen).await?;
-        disk.write_at(&f, offset, data).await
+        write_staged_chunk(
+            self.rt.clone(),
+            format!("{}/{rel}.fetch", self.dir),
+            offset,
+            data,
+        )
+        .await
     }
 
     /// Makes a completely fetched staging file durable.

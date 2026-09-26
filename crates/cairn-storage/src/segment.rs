@@ -355,6 +355,30 @@ impl<R: Runtime> SegmentReader<R> {
             .await
     }
 
+    /// As [`SegmentReader::verify_file_hash`], hashing a mapping of the file on a helper
+    /// thread: nothing runs on the calling core but the mapping (ADR 0027).
+    pub async fn verify_file_hash_off(&self) -> Result<bool> {
+        let body_len = self
+            .sections
+            .iter()
+            .map(|s| s.offset + pad_to(s.len))
+            .max()
+            .unwrap_or(PAGE) as usize;
+        let data = self.rt.disk().map(&self.file).await?;
+        if data.len() < body_len {
+            return Ok(false);
+        }
+        let expected = self.file_hash;
+        Ok(self
+            .rt
+            .offload(move || {
+                let mut h = Xxh3::new();
+                h.update(&data[..body_len]);
+                h.digest() == expected
+            })
+            .await)
+    }
+
     /// Recomputes the body hash from disk and compares it with the footer (shipping check).
     pub async fn verify_file_hash(&self) -> Result<bool> {
         let body_len = self

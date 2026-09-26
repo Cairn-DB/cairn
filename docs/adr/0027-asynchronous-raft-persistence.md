@@ -160,3 +160,23 @@ time the shard's actor serves nothing: no writes, no reads, no heartbeats (elect
   That is the next lever.
 - 122 tests; campaign 3,000 seeds zero violations.
 
+## Segment fetches (2026-09-26, follow-up)
+
+- **End of a fetch**: syncing the fetched file and checking its hash (which re-read the whole
+  file and hashed it on the core's thread) run in a task. The hash is computed on a helper
+  thread from a mapping of the file. The actor only renames the file into place on
+  `FetchVerified`, after checking that it is still wanted. A segment being checked is not
+  fetched again. Measured alone, this did not remove the slow `net` steps.
+- **What did**: instrumenting by frame type showed that the slow `net` steps were disk reads
+  of chunks served to peers (mean 1.4 ms, up to 4.2 s under build writes) and writes of
+  received chunks (up to 5.1 s). Sends never took more than 1 ms. Serving a chunk and
+  writing a received chunk now run in tasks, and the check at the end waits for the writes.
+- A/B, comparable pair (`bench-results/phase4-adr0027-fetch.md`): steps over 500 ms 66 -> 26,
+  blocked time 53.0 -> 20.0 s, longest 3.49 -> 2.03 s, ingest 9.4k -> 11.2k docs/s. The
+  other pair ran under an unrelated CPU-heavy process and is not comparable.
+- Frame handling no longer blocks (`handle_ms` 0 in every remaining slow `net` step). What
+  remains is in the step that follows. The likely cause is the Raft log append, a page-cache
+  write that the kernel can throttle under dirty-page pressure. This was not measured
+  separately. Moving appends off the actor is option 1 above (a writer owning the log).
+- 122 tests; campaign 3,000 seeds zero violations.
+
