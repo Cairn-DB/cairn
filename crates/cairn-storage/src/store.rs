@@ -319,6 +319,9 @@ pub struct Store<R: Runtime> {
     /// Segments replaced by an installed compaction whose files are kept for a while, so
     /// followers and snapshot installs that still need them can fetch them (ADR 0021).
     retired: Vec<SegmentId>,
+    /// Segment files renamed into place without a directory sync (ADR 0027): made durable by
+    /// a later `Disk::sync_dir`, at the latest before a manifest refers to them.
+    unsynced_renames: std::collections::BTreeSet<SegmentId>,
     /// The segment list as the log defines it: published segments, plus freezes with rows (in
     /// `FlushBegin` order), with every accepted compaction applied. The same on every replica
     /// at the same applied index, whatever each has installed yet: a `CompactCommit` is
@@ -556,6 +559,7 @@ impl<R: Runtime> Store<R> {
             pending: std::collections::VecDeque::new(),
             compaction_files: cairn_core::HashMap::default(),
             retired: Vec::new(),
+            unsynced_renames: std::collections::BTreeSet::new(),
             logical: Vec::new(),
             masked_during_build: cairn_core::HashSet::default(),
             job_active: false,
@@ -1007,11 +1011,12 @@ impl<R: Runtime> Store<R> {
         };
         let path = seg_path(&self.dir, id);
         let disk = self.rt.disk();
-        disk.rename(
+        disk.rename_nosync(
             &format!("{}/{}.fetch", self.dir, Self::ship_staging(id)),
             &path,
         )
         .await?;
+        self.unsynced_renames.insert(id);
         let ok = match SegmentReader::open(self.rt.clone(), &path).await {
             Ok(r) => r.len() == len && r.file_hash() == hash && r.verify_file_hash().await?,
             Err(_) => false,
@@ -1097,6 +1102,9 @@ impl<R: Runtime> Store<R> {
                     deletions,
                     deletions_dirty: false,
                 });
+            }
+            if new_segment.is_some() {
+                self.ensure_renames_synced(&[p.id]).await?;
             }
             if p.last > new_manifest.applied_index {
                 new_manifest.applied_index = p.last;
@@ -1319,9 +1327,42 @@ impl<R: Runtime> Store<R> {
     /// Moves a segment written by a build outside the actor into place. A late build must
     /// never replace a file installed meanwhile (a snapshot, a fetch): the caller adopts only
     /// results still wanted, and [`Store::discard_built_file`] drops the others.
-    pub async fn adopt_built_file(&self, id: SegmentId) -> Result<()> {
+    pub async fn adopt_built_file(&mut self, id: SegmentId) -> Result<()> {
         let path = seg_path(&self.dir, id);
-        self.rt.disk().rename(&format!("{path}.built"), &path).await
+        self.rt
+            .disk()
+            .rename_nosync(&format!("{path}.built"), &path)
+            .await?;
+        self.unsynced_renames.insert(id);
+        Ok(())
+    }
+
+    /// The segment directory, whose sync makes renames into it durable.
+    pub fn segs_dir(&self) -> String {
+        format!("{}/segs", self.dir)
+    }
+
+    /// Segment files renamed into place since the last directory sync.
+    pub fn unsynced_renames(&self) -> Vec<SegmentId> {
+        self.unsynced_renames.iter().copied().collect()
+    }
+
+    /// Records that a directory sync covered these renames (it started after them).
+    pub fn renames_synced(&mut self, ids: &[SegmentId]) {
+        for id in ids {
+            self.unsynced_renames.remove(id);
+        }
+    }
+
+    /// Makes the renames of these files durable before a manifest refers to them: syncs the
+    /// segment directory unless a sync already covered them (usually the index preparation
+    /// off the actor, ADR 0026).
+    async fn ensure_renames_synced(&mut self, ids: &[SegmentId]) -> Result<()> {
+        if ids.iter().any(|id| self.unsynced_renames.contains(id)) {
+            self.rt.disk().sync_dir(&self.segs_dir()).await?;
+            self.unsynced_renames.clear();
+        }
+        Ok(())
     }
 
     /// Removes an unwanted build result.
@@ -1482,11 +1523,12 @@ impl<R: Runtime> Store<R> {
         };
         let path = seg_path(&self.dir, id);
         let disk = self.rt.disk();
-        disk.rename(
+        disk.rename_nosync(
             &format!("{}/{}.fetch", self.dir, Self::ship_staging(id)),
             &path,
         )
         .await?;
+        self.unsynced_renames.insert(id);
         let ok = match SegmentReader::open(self.rt.clone(), &path).await {
             Ok(r) => r.len() == c.len && r.file_hash() == c.hash && r.verify_file_hash().await?,
             Err(_) => false,
@@ -1651,6 +1693,7 @@ impl<R: Runtime> Store<R> {
         new_manifest.compactions.drain(..=j);
         new_manifest.applied_index = last.max(new_manifest.applied_index);
         new_manifest.applied_term = self.log.read(last).await?.term;
+        self.ensure_renames_synced(&[target.id]).await?;
         self.manifest_store.store(&new_manifest).await?;
         self.manifest = new_manifest;
         for id in &dropped {
@@ -1755,6 +1798,7 @@ impl<R: Runtime> Store<R> {
             let mut new_manifest = self.manifest.clone();
             new_manifest.segments.splice(range.clone(), [meta.clone()]);
             new_manifest.compactions.remove(0);
+            self.ensure_renames_synced(&[c.id]).await?;
             self.manifest_store.store(&new_manifest).await?;
             self.manifest = new_manifest;
             self.compaction_files.remove(&c.id);

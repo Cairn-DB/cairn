@@ -523,6 +523,12 @@ impl Disk for SimDisk {
         self.deferred(None, "disk.rename.done", |_, _| Ok(())).await
     }
 
+    async fn sync_dir(&self, _dir: &str) -> Result<()> {
+        // Directory operations are durable when issued here: nothing to do but take the time
+        // of an operation.
+        self.deferred(None, "disk.sync_dir", |_, _| Ok(())).await
+    }
+
     async fn remove(&self, path: &str) -> Result<()> {
         let path = normalize(path)?;
         self.with_state(|d| d.remove(&path))?;

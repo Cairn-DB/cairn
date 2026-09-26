@@ -192,6 +192,8 @@ enum Event {
     IndexesReady {
         id: SegmentId,
         indexes: Result<crate::engine::PreparedIndexes>,
+        /// Renames made durable by the directory sync this preparation ran first.
+        synced: Vec<SegmentId>,
     },
 }
 
@@ -910,7 +912,7 @@ impl<R: Runtime> Replica<R> {
                     Ok(file) => {
                         let wanted = self.engine.store().flush_wanted(id, generation);
                         if wanted {
-                            self.engine.store().adopt_built_file(id).await?;
+                            self.engine.store_mut().adopt_built_file(id).await?;
                         } else {
                             self.engine.store().discard_built_file(id).await?;
                         }
@@ -943,8 +945,13 @@ impl<R: Runtime> Replica<R> {
                     self.finish_persistence(seq, up_to, r).await?;
                 }
             }
-            Event::IndexesReady { id, indexes } => {
+            Event::IndexesReady {
+                id,
+                indexes,
+                synced,
+            } => {
                 self.flush.preparing.remove(&id);
+                self.engine.store_mut().renames_synced(&synced);
                 match indexes {
                     Ok(p) => self.engine.adopt_indexes(id, p),
                     Err(e) => {
@@ -991,7 +998,7 @@ impl<R: Runtime> Replica<R> {
                     self.engine.store().discard_built_file(id).await?;
                     return Ok(());
                 }
-                self.engine.store().adopt_built_file(id).await?;
+                self.engine.store_mut().adopt_built_file(id).await?;
                 self.flush.built += 1;
                 if pending {
                     self.engine.store_mut().set_compaction_file(id, file);
@@ -1814,9 +1821,21 @@ impl<R: Runtime> Replica<R> {
                 Ok(job) => {
                     self.flush.preparing.insert(id);
                     let (inbox, rt) = (self.inbox.clone(), self.rt.clone());
+                    // The segment directory is synced here too, off the actor: the file was
+                    // renamed into place without it, and publication waits for this task.
+                    let dir = self.engine.store().segs_dir();
+                    let covered = self.engine.store().unsynced_renames();
                     self.rt.spawn(async move {
+                        let synced = match rt.disk().sync_dir(&dir).await {
+                            Ok(()) => covered,
+                            Err(_) => Vec::new(),
+                        };
                         let indexes = rt.offload(move || job.run()).await;
-                        inbox.push(Event::IndexesReady { id, indexes });
+                        inbox.push(Event::IndexesReady {
+                            id,
+                            indexes,
+                            synced,
+                        });
                     });
                 }
                 Err(e) => {
@@ -2078,8 +2097,14 @@ impl<R: Runtime> Replica<R> {
                 data: self.engine.store().manifest_bytes(),
             };
             self.compact_raft_log(snap);
+            // Stored by the next persistence task, not here: a restart takes the term from the
+            // manifest just stored (`applied_term`, written with its index since ADR 0020),
+            // and this copy only serves manifests older than that. Storing it on the actor
+            // waited for the log sync after every publication (332 ms on average, ADR 0027).
             self.state.snapshot_term = term;
-            self.store_state_now().await?;
+            self.persist.state_dirty = true;
+            self.persist.work = true;
+            self.start_persistence();
         }
         // A full memtable flushes before any compaction: compactions are long, and writes are
         // held back while the memtable is over its limit.

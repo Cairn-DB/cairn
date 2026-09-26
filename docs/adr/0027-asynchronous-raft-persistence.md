@@ -131,3 +131,32 @@ time the shard's actor serves nothing: no writes, no reads, no heartbeats (elect
   lever. The two async runs differ by 26%: the effect on ingest is real but noisy on a
   shared host.
 
+## Publication syncs (2026-09-26, follow-up)
+
+- Timing the publication path, one node, 4M rows: `publish_ready` itself took 22 ms on
+  average. What blocked was around it:
+  - the Raft-state store that followed each publication, 332 ms on average and up to
+    581 ms, because it waits for the log sync;
+  - the rename that adopts a built file, 175 ms on average, because it syncs the directory.
+- **State after publication**: now stored by the next persistence task. A restart takes the
+  snapshot term from the manifest's `applied_term`, which every publication writes with its
+  index (ADR 0020); the state's copy only serves older manifests.
+- **Renames**: `Disk::rename_nosync` and `Disk::sync_dir`. Adopting a built file and
+  installing a fetched flush or merge rename without syncing the directory. The index
+  preparation (ADR 0026) syncs it off the actor, before publication. Publication, merge
+  installation and subsumption sync it themselves only if a file they reference is not
+  covered yet.
+- A/B, 3 nodes, 6M rows, 2 runs each (`bench-results/phase4-adr0027-publication.md`):
+
+  | | before | after |
+  |---|---|---|
+  | actor time in steps over 500 ms | 63.4 / 46.5 s | 36.9 / 34.0 s |
+  | longest step | 5.13 / 2.06 s | 2.41 / 1.76 s |
+  | slow publication steps | 44 / 45 | 14 / 15 |
+  | ingest | 12.3k / 10.8k docs/s | 12.0k / 12.6k docs/s |
+
+  Ingest shows no measurable change on this host. What remains is mostly the end of a
+  segment fetch (`net` events): the actor syncs the fetched file and verifies its hash.
+  That is the next lever.
+- 122 tests; campaign 3,000 seeds zero violations.
+

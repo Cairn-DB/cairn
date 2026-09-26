@@ -359,6 +359,22 @@ impl Disk for PoolDisk {
         })
     }
 
+    fn rename_nosync(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> {
+        let (f, t) = (self.resolve(from), self.resolve(to));
+        offload(&self.completer, move || {
+            std::fs::rename(f?, t?).map_err(map_io)
+        })
+    }
+
+    fn sync_dir(&self, dir: &str) -> impl Future<Output = Result<()>> {
+        let d = self.resolve(dir);
+        offload(&self.completer, move || {
+            std::fs::File::open(d?)
+                .and_then(|d| d.sync_all())
+                .map_err(map_io)
+        })
+    }
+
     fn remove(&self, path: &str) -> impl Future<Output = Result<()>> {
         let p = self.resolve(path);
         offload(&self.completer, move || {

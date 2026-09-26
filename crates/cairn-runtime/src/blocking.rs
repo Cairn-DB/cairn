@@ -175,6 +175,12 @@ impl Disk for BlockingDisk {
         Ok(())
     }
 
+    async fn sync_dir(&self, dir: &str) -> Result<()> {
+        fs::File::open(self.resolve(dir)?)
+            .and_then(|d| d.sync_all())
+            .map_err(map_io)
+    }
+
     async fn remove(&self, path: &str) -> Result<()> {
         fs::remove_file(self.resolve(path)?).map_err(map_io)
     }

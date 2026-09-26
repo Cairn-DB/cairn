@@ -73,8 +73,17 @@ pub trait Disk {
     /// Truncates or extends the file to `len` bytes (extension is zero-filled).
     fn set_len(&self, file: &Self::File, len: u64) -> impl Future<Output = Result<()>>;
 
-    /// Atomically replaces `to` with `from`.
+    /// Atomically replaces `to` with `from`, durably (the directory is synced).
     fn rename(&self, from: &str, to: &str) -> impl Future<Output = Result<()>>;
+
+    /// As [`Disk::rename`], without syncing the directory: the rename is durable only after a
+    /// later [`Disk::sync_dir`] of `to`'s directory (or a durable rename there).
+    fn rename_nosync(&self, from: &str, to: &str) -> impl Future<Output = Result<()>> {
+        self.rename(from, to)
+    }
+
+    /// Makes earlier renames into directory `dir` durable.
+    fn sync_dir(&self, dir: &str) -> impl Future<Output = Result<()>>;
 
     /// Removes a file.
     fn remove(&self, path: &str) -> impl Future<Output = Result<()>>;
