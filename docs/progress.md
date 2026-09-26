@@ -358,6 +358,12 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Local A/B: Raft syncs blocking the actor 94-157 -> 0, ingest +12..55%.
   - Open: publication syncs on the actor (next lever); about 0.1% of the 150 ms-sync seeds
     make no progress under faults (1% before). GCP measurement pending (owner's go).
+  - Follow-ups (9164580, 3f4e21d): publication state and directory syncs, then fetch
+    verification, chunk serving and chunk writes, all moved off the actor. Local A/B: blocked
+    time 53 -> 20 s, slow steps 66 -> 26 (one comparable pair; host shared with an unrelated
+    llama-server at ~330% CPU). Remaining slow `net` steps have handle_ms 0 and persist_ms
+    0.6-1 s: most likely the Raft log append (page-cache write throttled under dirty
+    pressure), not measured separately. Next: time the append, or the GCP run (owner's go).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
