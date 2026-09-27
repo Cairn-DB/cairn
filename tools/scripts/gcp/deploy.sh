@@ -18,6 +18,16 @@ wait_ssh() {
   exit 1
 }
 for n in $(seq 1 "$NODES"); do wait_ssh "$(node_name "$n")"; done; wait_ssh "$BENCH_NAME"
+# Node data on the local NVMe SSD when there is one: formatted, mounted at /mnt/cairn, and
+# linked as ~/cairn/data/run (where run-cluster.sh writes).
+for n in $(seq 1 "$NODES"); do
+  ssh_to "$(node_name "$n")" 'dev=/dev/disk/by-id/google-local-nvme-ssd-0
+    if [ -e $dev ] && ! mountpoint -q /mnt/cairn; then
+      sudo mkfs.ext4 -q -F $dev && sudo mkdir -p /mnt/cairn && sudo mount -o discard,noatime $dev /mnt/cairn && sudo chown cairn:cairn /mnt/cairn
+    fi
+    mkdir -p cairn/data && { mountpoint -q /mnt/cairn && mkdir -p /mnt/cairn/run && ln -sfn /mnt/cairn/run cairn/data/run || true; }
+    df -h /mnt/cairn 2>/dev/null | tail -1'
+done
 B="$(node_name 1)"; BIP="$(public_ip "$B")"
 ssh_to "$B" 'sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential rsync curl >/dev/null
   [ -x ~/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null'

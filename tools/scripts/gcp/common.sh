@@ -6,11 +6,13 @@ ZONE="${CAIRN_GCP_ZONE:-europe-west1-b}"
 NODE_TYPE="${CAIRN_GCP_NODE_TYPE:-n2-highmem-8}"   # 8 vCPU, 64 GB
 BENCH_TYPE="${CAIRN_GCP_BENCH_TYPE:-e2-standard-4}" # 4 vCPU, 16 GB: client + ground truth
 NODES="${CAIRN_GCP_NODES:-3}"
-# Disk throughput scales with size: 80 GB pd-ssd (0.48 MB/s per GB) gave about 38 MB/s, a
-# likely bottleneck in run 7. The project's regional SSD quota is 500 GB, so nodes use
-# pd-balanced (0.28 MB/s per GB, 4096 GB quota): 500 GB gives about 140 MB/s.
-NODE_DISK_GB="${CAIRN_GCP_NODE_DISK_GB:-500}"
+# Node data goes on a local NVMe SSD (375 GB, mounted at /mnt/cairn by deploy.sh). An 80 GB
+# pd-ssd (0.48 MB/s per GB) gave about 38 MB/s, a likely bottleneck in run 7, and the
+# project's regional SSD quota (500 GB, pd-ssd and pd-balanced alike) rules out larger ones.
+# Local SSD data is lost when the VM stops, which is fine for benchmarks.
+NODE_DISK_GB="${CAIRN_GCP_NODE_DISK_GB:-30}"
 NODE_DISK_TYPE="${CAIRN_GCP_NODE_DISK_TYPE:-pd-balanced}"
+NODE_LOCAL_SSD="${CAIRN_GCP_NODE_LOCAL_SSD:-1}"
 NET="cairn-net"; SUBNET="cairn-subnet"; RANGE="10.77.0.0/24"
 KEY_FILE="$HOME/.ssh/cairn_hcloud"
 SSH_USER="cairn"
