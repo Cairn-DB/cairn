@@ -89,6 +89,15 @@ impl JobSlots {
     }
 }
 
+/// Returns the node build slot recorded in `held`, if any.
+fn release_slot(held: &mut bool, cfg: &ReplicaConfig) {
+    if std::mem::take(held)
+        && let Some(slots) = &cfg.compaction_slots
+    {
+        slots.release();
+    }
+}
+
 /// Replica settings.
 #[derive(Debug, Clone)]
 pub struct ReplicaConfig {
@@ -530,7 +539,10 @@ pub struct Replica<R: Runtime> {
     fetch: Option<SnapshotFetch>,
     ticks: u64,
     last_apply_tick: u64,
-    holds_slot: bool,
+    /// Node build slots held by this replica's flush build and merge build. A flush may run
+    /// while this replica's merge runs, each in a slot of its own.
+    flush_slot: bool,
+    merge_slot: bool,
     /// Proposals held back while the memtable is over its hard limit (write backpressure).
     deferred: std::collections::VecDeque<(Command, Sender<Result<Token>>)>,
     /// Flush state (ADR 0016), reset when the replica reopens.
@@ -799,7 +811,8 @@ impl<R: Runtime> Replica<R> {
             fetch: None,
             ticks: 0,
             last_apply_tick: 0,
-            holds_slot: false,
+            flush_slot: false,
+            merge_slot: false,
             deferred: std::collections::VecDeque::new(),
             flush: FlushState::default(),
             persist: Persistence::default(),
@@ -928,7 +941,7 @@ impl<R: Runtime> Replica<R> {
                 generation,
                 file,
             } => {
-                self.release_slot();
+                release_slot(&mut self.flush_slot, &self.cfg);
                 self.flush.building = None;
                 match file {
                     Err(e) => {
@@ -1043,7 +1056,7 @@ impl<R: Runtime> Replica<R> {
                 generation,
                 file,
             } => {
-                self.release_slot();
+                release_slot(&mut self.merge_slot, &self.cfg);
                 self.flush.compacting = None;
                 let file = match file {
                     Ok(f) => f,
@@ -1799,8 +1812,11 @@ impl<R: Runtime> Replica<R> {
                 }
             }
         }
+        // Not held back by a merge of this replica: a merge of 3M rows takes minutes, and
+        // meanwhile the memtable reaches its write limit and the whole ingest waits for this
+        // shard (every client batch spans all shards).
         if let Some(id) = to_build
-            && !self.busy()
+            && self.flush.building.is_none()
         {
             self.start_flush_build(id)?;
         }
@@ -2050,10 +2066,10 @@ impl<R: Runtime> Replica<R> {
             if !slots.try_acquire() {
                 return Ok(());
             }
-            self.holds_slot = true;
+            self.flush_slot = true;
         }
         let Some(job) = self.engine.store().flush_job(id) else {
-            self.release_slot();
+            release_slot(&mut self.flush_slot, &self.cfg);
             return Ok(());
         };
         self.flush.building = Some(id);
@@ -2294,15 +2310,6 @@ impl<R: Runtime> Replica<R> {
         Ok(())
     }
 
-    fn release_slot(&mut self) {
-        if self.holds_slot {
-            self.holds_slot = false;
-            if let Some(slots) = &self.cfg.compaction_slots {
-                slots.release();
-            }
-        }
-    }
-
     /// Leader only (ADR 0021): picks a compaction per policy and builds it; the result is
     /// proposed as a `CompactCommit` and installed everywhere when applied. One compaction at
     /// a time: none while another is committed but not installed, or proposed but not
@@ -2349,7 +2356,7 @@ impl<R: Runtime> Replica<R> {
             if !slots.try_acquire_merge() {
                 return Ok(());
             }
-            self.holds_slot = true;
+            self.merge_slot = true;
         }
         tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, ?inputs, "compaction build started");
         self.flush.compacting = Some(id);
