@@ -1,0 +1,21 @@
+name: Feature or design proposal
+description: Propose a feature, or challenge a design decision.
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today? A real use case helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would change. For formats, the wire protocol or Raft, this will become an ADR.
+  - type: textarea
+    id: guarantees
+    attributes:
+      label: Effect on the guarantees
+      description: Does it touch deletions, durability, or consistency levels? How would we test it?

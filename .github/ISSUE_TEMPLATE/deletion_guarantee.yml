@@ -1,0 +1,54 @@
+name: Deletion guarantee not honoured
+description: A document that was taken down could still be read, or came back. Test data only.
+title: "[deletion] "
+labels: ["deletion-guarantee", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the property Cairn cares about most: once a takedown is acknowledged, the document
+        is gone from every replica, and a client that passes the takedown's consistency token never
+        reads it again, through any node.
+
+        **If this exposed real data in a deployment, do not file it here**: use
+        [private vulnerability reporting](https://github.com/cairn-db/cairn/security/advisories/new)
+        instead (see SECURITY.md). This form is for reproductions on test data.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: e.g. 04c6c1c, or the image tag
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did the document reappear?
+      options:
+        - A read (get or search) with the takedown's token (read_your_writes)
+        - A linearizable read after the takedown was acknowledged
+        - A stale read, long after the takedown
+        - After a restart, a snapshot install or a merge
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: |
+        The writes, the takedown with its returned token, and the read that returned the document,
+        with the node each request went to. A simulator seed (`CAIRN_SEED=...`) is the best
+        possible reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Cluster setup
+      description: Number of nodes, shards, replication, flags, and any fault (node killed, network cut, disk full).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

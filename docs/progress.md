@@ -433,6 +433,14 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     captured no query; a wait loop without timeout idled 2.5 h (10K-query file, 20K asked).
   - To confirm at 50M on the next GCP run. Docker image builds and serves (podman smoke test).
 
+- Publication prep, local only (2026-09-28, owner: "vas-y pour la partie 1 en local"):
+  README rewritten (deletion guarantee first, 50M results, known limits), ROADMAP.md, issue
+  templates (bug, proposal, deletion guarantee routed to private reporting for real data), PR
+  template, docs/community/ (labels, 9 first issues, org profile, publication checklist with
+  audit: no secrets, names or public IPs in tree or history; licenses permissive). Nothing
+  pushed; the org cairn-db is still empty. Owner decides on internal files (CLAUDE.md,
+  prompts/, progress.md) and visibility.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/cairn-db/cairn/security/advisories/new
+    about: Security issues, including a deleted document exposed in a real deployment. Please do not open a public issue.
+  - name: Questions and ideas
+    url: https://github.com/cairn-db/cairn/discussions
+    about: Usage questions, design discussions, and "would Cairn fit my use case?"
