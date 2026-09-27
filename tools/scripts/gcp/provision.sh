@@ -14,15 +14,15 @@ $G compute firewall-rules describe cairn-ssh >/dev/null 2>&1 || \
 $G compute firewall-rules describe cairn-internal >/dev/null 2>&1 || \
   $G compute firewall-rules create cairn-internal --network "$NET" --allow tcp,udp,icmp --source-ranges "$RANGE"
 META="ssh-keys=$SSH_USER:$(cat "$KEY_FILE.pub"),enable-oslogin=FALSE"
-create() { # name type ip disk_gb
+create() { # name type ip disk_gb disk_type
   $G compute instances describe "$1" --zone "$ZONE" >/dev/null 2>&1 && { echo "$1 exists"; return; }
   $G compute instances create "$1" --zone "$ZONE" --machine-type "$2" \
     --network-interface "subnet=$SUBNET,private-network-ip=$3" \
     --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud \
-    --boot-disk-size "${4}GB" --boot-disk-type pd-ssd --labels project=cairn --metadata "$META"
+    --boot-disk-size "${4}GB" --boot-disk-type "$5" --labels project=cairn --metadata "$META"
 }
-for i in $(seq 1 "$NODES"); do create "$(node_name "$i")" "$NODE_TYPE" "$(node_ip "$i")" "$NODE_DISK_GB"; done
-create "$BENCH_NAME" "$BENCH_TYPE" "$BENCH_IP" 60
+for i in $(seq 1 "$NODES"); do create "$(node_name "$i")" "$NODE_TYPE" "$(node_ip "$i")" "$NODE_DISK_GB" "$NODE_DISK_TYPE"; done
+create "$BENCH_NAME" "$BENCH_TYPE" "$BENCH_IP" 60 pd-ssd
 # New VMs have new host keys, and GCP may hand out public IPs used by earlier fleets: forget
 # the keys recorded for these IPs.
 for vm in $(for i in $(seq 1 "$NODES"); do node_name "$i"; done) "$BENCH_NAME"; do
