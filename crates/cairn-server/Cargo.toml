@@ -36,6 +36,7 @@ cairn-client = { path = "../cairn-client" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 base64 = "0.22"
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 rcgen = "0.13"

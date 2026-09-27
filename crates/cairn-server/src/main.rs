@@ -2,6 +2,11 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use anyhow::Context;
+
+/// mimalloc instead of glibc malloc (ADR 0029): glibc's heap, fragmented by index builds, made
+/// per-query allocations slow after a long ingest and kept freed memory.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use cairn_core::{HashMap, NodeId, Schema};
 use cairn_server::{Node, NodeConfig};
 use clap::Parser;

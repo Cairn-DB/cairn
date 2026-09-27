@@ -419,6 +419,20 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Lesson: run-cluster.sh overwrites node logs on restart; keep a copy before restarting.
   - Cost about 7 USD. Fleet deleted 16:40 UTC and checked.
 
+- Post-ingest slowdown, reproduced and fixed locally (2026-09-28, owner: "vas-y pour la
+  reproduction locale de la fuite mémoire"): ADR 0029.
+  - Repro data/run-memrepro.sh (3 nodes, 6M rows, merges, then paused): after ingest 4.1-5.1 GB
+    per node vs 1.8 GB restarted, 4-client throughput -35%. `malloc_trim` via gdb frees ~2.5 GB
+    but does not change latency. Per-shard timing (cairn_query::stats) puts the slowdown in
+    the search jobs. gdb stack samples under load: glibc `_int_malloc` 14% vs 1%, mostly a
+    bitmap clone per segment and query.
+  - 2c12511 removes that clone (gap halves). mimalloc as the server allocator (ADR 0029)
+    closes it: after ingest vs restarted 2.1 vs 1.9 GB, -6% throughput. On identical data,
+    fresh: +21-27% unfiltered and +36% filtered throughput over glibc, +10% memory.
+  - Method mistakes: gdb pauses held the bench's settle step, so the first two sampling runs
+    captured no query; a wait loop without timeout idled 2.5 h (10K-query file, 20K asked).
+  - To confirm at 50M on the next GCP run. Docker image builds and serves (podman smoke test).
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
