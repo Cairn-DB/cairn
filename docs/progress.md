@@ -405,6 +405,20 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - `live_docs` is approximate by design (memtable + segments minus deletions), which
     explains counts slightly above the row count seen in the A/B.
 
+- GCP 50M run 8 (2026-09-27, owner: "go pour le run gcp"): bench-results/phase4-gcp-bigann50m-run8.md.
+  - Node data on local NVMe SSD (392 MB/s; the regional SSD quota of 500 GB also counts
+    pd-balanced). Teardown watchdog from the start.
+  - Ingest **8,343 docs/s** (run 6: 6,493; run 7: 5,542). Longest stall 12 min (was 27).
+    Remaining: duplicate builds (leader moves, 2 s fetch stall fallbacks), actor persist
+    steps up to 8 s on a fast disk (not diagnosed; ingest node logs lost to restarts).
+  - Queries after ingest MISSED targets (p99 117-151 ms, 80 QPS). Bisection on the same data
+    after restarts: no code regression; restarted 57b71af gives **p99 42/44 ms unfiltered,
+    42/42 ms filtered, 244/226 QPS** (targets met, 118 segs/node). The ingesting process held
+    33.8 GB anon vs 17 GB after restart: something from ingest stays in memory and is likely
+    searched. OPEN, reproduce locally next.
+  - Lesson: run-cluster.sh overwrites node logs on restart; keep a copy before restarting.
+  - Cost about 7 USD. Fleet deleted 16:40 UTC and checked.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
