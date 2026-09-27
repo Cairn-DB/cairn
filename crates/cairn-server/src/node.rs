@@ -123,15 +123,20 @@ pub struct Node {
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
-/// Compaction slots shared by every core of this process (one node per process).
-/// Threads per build when not set: all concurrent builds together use at most half the
-/// hardware threads, leaving the rest to the executors (Raft, replication, queries). With every
-/// hardware thread per build, 4 slots ran 32 build threads on an 8-vCPU VM, starved the Raft
-/// actors, and leadership churned (GCP 50M run, 2026-09-25).
+/// Threads per build when not set: all concurrent builds together can use the whole machine.
+/// They run at a low priority ([`BUILD_NICE`]), so serving takes the CPU it needs first. At
+/// normal priority, 4 slots of 8 threads on an 8-vCPU VM starved the Raft actors (GCP 50M run,
+/// 2026-09-25); the half-machine cap that followed left builds, the ingest bottleneck, on half
+/// the CPU (GCP run 7, 2026-09-26).
 pub fn auto_build_threads(hardware_threads: usize, slots: usize) -> usize {
-    (hardware_threads / (2 * slots.max(1))).max(1)
+    (hardware_threads / slots.max(1)).max(1)
 }
 
+/// Nice value of build threads: under contention a normal-priority thread gets about ten
+/// times their CPU share, and they still progress when serving is busy.
+pub const BUILD_NICE: i32 = 10;
+
+/// Compaction slots shared by every core of this process (one node per process).
 fn job_slots(max: usize) -> std::sync::Arc<cairn_query::JobSlots> {
     static SLOTS: std::sync::OnceLock<std::sync::Arc<cairn_query::JobSlots>> =
         std::sync::OnceLock::new();
@@ -302,16 +307,19 @@ impl Node {
                     .leader_balancing
                     .then(|| placement(&cfg, shard).first().copied())
                     .flatten(),
-                build_parallel: Some(std::sync::Arc::new(cairn_runtime::ThreadParallel::new(
-                    if cfg.build_threads == 0 {
-                        auto_build_threads(
-                            std::thread::available_parallelism().map_or(1, |n| n.get()),
-                            cfg.compaction_slots,
-                        )
-                    } else {
-                        cfg.build_threads
-                    },
-                ))),
+                build_parallel: Some(std::sync::Arc::new(
+                    cairn_runtime::ThreadParallel::background(
+                        if cfg.build_threads == 0 {
+                            auto_build_threads(
+                                std::thread::available_parallelism().map_or(1, |n| n.get()),
+                                cfg.compaction_slots,
+                            )
+                        } else {
+                            cfg.build_threads
+                        },
+                        BUILD_NICE,
+                    ),
+                )),
             };
             match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
                 Ok(h) => {
@@ -911,11 +919,11 @@ mod tests {
     use super::auto_build_threads;
 
     #[test]
-    fn builds_leave_half_the_machine_to_the_executors() {
-        assert_eq!(auto_build_threads(8, 4), 1);
-        assert_eq!(auto_build_threads(8, 2), 2);
-        assert_eq!(auto_build_threads(16, 2), 4);
-        assert_eq!(auto_build_threads(2, 2), 1);
-        assert_eq!(auto_build_threads(64, 0), 32);
+    fn concurrent_builds_share_the_machine() {
+        assert_eq!(auto_build_threads(8, 4), 2);
+        assert_eq!(auto_build_threads(8, 2), 4);
+        assert_eq!(auto_build_threads(16, 2), 8);
+        assert_eq!(auto_build_threads(2, 4), 1);
+        assert_eq!(auto_build_threads(64, 0), 64);
     }
 }
