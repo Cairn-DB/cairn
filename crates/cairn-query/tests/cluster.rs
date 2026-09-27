@@ -877,7 +877,11 @@ fn merges_pause_and_resume() {
         for s in &st {
             assert!(s.merges_paused);
             assert_eq!(s.merges, [0, 0], "node {}", s.id);
-            assert!(!merged(&s.segments), "merged while paused: {:?}", s.segments);
+            assert!(
+                !merged(&s.segments),
+                "merged while paused: {:?}",
+                s.segments
+            );
         }
         for s in &slots {
             s.set_merges_paused(false);
@@ -899,7 +903,10 @@ fn merges_pause_and_resume() {
             rt.sleep(Duration::from_millis(10)).await;
         }
         assert!(merged(&st[0].segments), "no merge after resume: {st:#?}");
-        assert!(st.iter().all(|s| !s.merges_paused && s.segments.len() <= 3), "{st:#?}");
+        assert!(
+            st.iter().all(|s| !s.merges_paused && s.segments.len() <= 3),
+            "{st:#?}"
+        );
         check_all_docs(&hs, 150, &[]).await;
     });
 }

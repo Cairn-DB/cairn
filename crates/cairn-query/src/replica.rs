@@ -561,6 +561,10 @@ pub struct Replica<R: Runtime> {
     fetch: Option<SnapshotFetch>,
     ticks: u64,
     last_apply_tick: u64,
+    /// Query timing since the last report (`cairn_query::stats` at info, every 200 ticks):
+    /// searches, microseconds preparing on the actor, microseconds from submission to result
+    /// on the search pool (queue wait included).
+    search_stats: std::rc::Rc<std::cell::Cell<(u64, u64, u64)>>,
     /// Node build slots held by this replica's flush build and merge build. A flush may run
     /// while this replica's merge runs, each in a slot of its own.
     flush_slot: bool,
@@ -833,6 +837,7 @@ impl<R: Runtime> Replica<R> {
             fetch: None,
             ticks: 0,
             last_apply_tick: 0,
+            search_stats: Default::default(),
             flush_slot: false,
             merge_slot: false,
             deferred: std::collections::VecDeque::new(),
@@ -1234,11 +1239,17 @@ impl<R: Runtime> Replica<R> {
                 // The snapshot is taken here, when the read is released (after ReadIndex or
                 // the token's index), and the search runs on a helper thread (ADR 0025):
                 // searches of one shard overlap, and never hold up its Raft work.
+                let t0 = self.rt.now();
                 match self.engine.prepare_legs(&q).await {
                     Ok(job) => {
                         let rt = self.rt.clone();
+                        let stats = self.search_stats.clone();
+                        let prepare = (self.rt.now() - t0).as_micros() as u64;
                         self.rt.spawn(async move {
+                            let t1 = rt.now();
                             let r = rt.offload_search(move || job.run()).await;
+                            let (n, p, w) = stats.get();
+                            stats.set((n + 1, p + prepare, w + (rt.now() - t1).as_micros() as u64));
                             done.send(r);
                         });
                     }
@@ -2258,6 +2269,13 @@ impl<R: Runtime> Replica<R> {
     /// Background upkeep on ticks: flush an idle memtable, and retry a compaction that was
     /// waiting for a free slot.
     async fn on_idle_tick(&mut self) -> Result<()> {
+        // Every 200 ticks: 10 s at the server's 50 ms tick.
+        if self.ticks % 200 == 0 {
+            let (n, p, w) = self.search_stats.take();
+            if n > 0 {
+                tracing::info!(target: "cairn_query::stats", node = %self.cfg.id, shard = %self.cfg.shard, searches = n, prepare_us = p / n, search_us = w / n, segments = self.engine.store().segments().count(), "search timing");
+            }
+        }
         // Write only a segment format every peer reads (ADR 0018): peers announce theirs when
         // they connect, and a rolling upgrade switches formats once the last one did.
         let v = cairn_storage::segment::negotiated_segment_version(

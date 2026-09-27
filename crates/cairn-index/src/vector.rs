@@ -105,6 +105,8 @@ pub struct VectorIndex {
     /// (ADR 0025): at most `SCRATCH_KEEP` are kept, and extra concurrent searches allocate
     /// their own.
     scratch: Mutex<Vec<SearchScratch>>,
+    /// Whether every row has a vector (then a search filter needs no masking), computed once.
+    all_present: std::sync::OnceLock<bool>,
     disk_scratch: Mutex<Vec<DiskScratch>>,
 }
 
@@ -161,6 +163,7 @@ impl VectorIndex {
                 disk: Some(disk),
                 params,
                 scratch: Mutex::new(Vec::new()),
+                all_present: std::sync::OnceLock::new(),
                 disk_scratch: Mutex::new(Vec::new()),
             };
         }
@@ -183,6 +186,7 @@ impl VectorIndex {
             disk: None,
             params,
             scratch: Mutex::new(Vec::new()),
+            all_present: std::sync::OnceLock::new(),
             disk_scratch: Mutex::new(Vec::new()),
         }
     }
@@ -206,6 +210,7 @@ impl VectorIndex {
             disk: None,
             params,
             scratch: Mutex::new(Vec::new()),
+            all_present: std::sync::OnceLock::new(),
             disk_scratch: Mutex::new(Vec::new()),
         }
     }
@@ -283,6 +288,7 @@ impl VectorIndex {
                 disk: Some(disk),
                 params,
                 scratch: Mutex::new(Vec::new()),
+                all_present: std::sync::OnceLock::new(),
                 disk_scratch: Mutex::new(Vec::new()),
             });
         }
@@ -331,6 +337,7 @@ impl VectorIndex {
             disk: None,
             params,
             scratch: Mutex::new(Vec::new()),
+            all_present: std::sync::OnceLock::new(),
             disk_scratch: Mutex::new(Vec::new()),
         })
     }
@@ -390,16 +397,23 @@ impl VectorIndex {
         q: VectorQuery,
     ) -> Result<(Vec<(f32, u32)>, Strategy)> {
         let qv = self.vectors.prepare_query(query)?;
-        // Effective filter: requested rows AND present rows.
+        // Effective filter: requested rows AND present rows. When every row has a vector (the
+        // usual case) the filter is used as is: cloning it cost an allocation per segment and
+        // query, which a heap fragmented by index builds made slow (14% of search time after a
+        // long ingest, GCP run 8).
+        let all_present = *self
+            .all_present
+            .get_or_init(|| self.present.count() == self.vectors.len());
         let owned;
         let eff: Option<&Bitmap> = match filter {
+            Some(f) if all_present => Some(f),
             Some(f) => {
                 let mut b = f.clone();
                 b.and_with(&self.present);
                 owned = b;
                 Some(&owned)
             }
-            None if self.present.count() == self.vectors.len() => None,
+            None if all_present => None,
             None => Some(&self.present),
         };
         let count = eff.map_or(self.vectors.len(), Bitmap::count);
