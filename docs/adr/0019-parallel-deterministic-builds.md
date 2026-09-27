@@ -83,3 +83,16 @@ Option 3, for both HNSW and Vamana.
 - On this 16-thread development machine with 2 slots, a build now gets 4 threads instead
   of 16, so a single large build takes longer. Pass `--build-threads` explicitly when
   builds do not compete with serving.
+
+## Low priority instead of a cap (2026-09-27)
+
+- GCP run 7 (`bench-results/phase4-gcp-bigann50m-run7-ingest.md`) waited on builds while nodes
+  used 1.5 to 3.8 of 8 vCPUs: the half-machine cap above protected the actors but starved the
+  builds.
+- Build workers now run at nice 10 (Linux: per thread). Under contention, a normal-priority
+  thread gets about ten times their share, so serving comes first and builds still progress.
+  The default gives all concurrent builds the whole machine: hardware threads / slots.
+- Alone, this made ingest worse locally (median 510 s against 386 s for 6M rows). Faster
+  flushes brought merges earlier, and a replica ran one build at a time, so a shard's
+  flush waited for its own merge. Since 7b781a0 flush and merge hold separate slots.
+  Together: median 289 s, 20.8k docs/s (`bench-results/phase4-build-priority-and-slots.md`).

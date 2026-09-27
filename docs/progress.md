@@ -377,6 +377,21 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     leader balancing, the `flush_written` handle time (1 to 3 s), and merges that ignore
     `--max-segments` after a restart.
 
+- Build throughput (2026-09-27, owner: "vas-y pour les threads de construction"):
+  - 662a8eb: build workers at nice 10, default threads = hardware / slots (was / (2 x slots)).
+  - 7b781a0: a shard's flush no longer waits for its own merge (separate node slots). Found
+    while measuring: a merge blocked its shard's flushes, the memtable hit the write limit,
+    and the whole ingest stopped (every batch spans all shards).
+  - Local A/B, 6M rows, nodes pinned to 5 threads (bench-results/phase4-build-priority-and-slots.md):
+    median 386 s baseline, 510 s nice only, 431 s slots only, **289 s both (20.8k docs/s)**,
+    no stall over 110 s. Only 3 runs of the winner; not yet on GCP.
+  - 123 tests; campaign 3,000 seeds zero violations.
+  - Open: query latency while builds run (8 end-of-run queries vary 20 ms to 6 s p50 in every
+    variant); `live docs` above the row count in two runs; merges that ignore `--max-segments`
+    after a restart (needed to query an idle cluster on GCP).
+  - Next: the merge pause flag, then a GCP 50M run with a larger pd-ssd (throughput scales
+    with size) and a teardown watchdog from the start (owner's go needed).
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
