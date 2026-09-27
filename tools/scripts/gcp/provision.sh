@@ -21,7 +21,7 @@ create() { # name type ip disk_gb
     --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud \
     --boot-disk-size "${4}GB" --boot-disk-type pd-ssd --labels project=cairn --metadata "$META"
 }
-for i in $(seq 1 "$NODES"); do create "$(node_name "$i")" "$NODE_TYPE" "$(node_ip "$i")" 80; done
+for i in $(seq 1 "$NODES"); do create "$(node_name "$i")" "$NODE_TYPE" "$(node_ip "$i")" "$NODE_DISK_GB"; done
 create "$BENCH_NAME" "$BENCH_TYPE" "$BENCH_IP" 60
 # New VMs have new host keys, and GCP may hand out public IPs used by earlier fleets: forget
 # the keys recorded for these IPs.
