@@ -288,7 +288,8 @@ fn node_memory(pids: &Path) -> Vec<(String, String)> {
 }
 
 /// Waits until every node reports, for every shard, the same applied index and a segment list
-/// that has not changed for `stable` (background builds finished).
+/// that has not changed for `stable`, with no flush or merge building or pending. Without the
+/// last condition a merge longer than `stable` passed for settled (GCP run 5).
 fn settle(addrs: &HashMap<NodeId, SocketAddr>, nodes: &[(u32, SocketAddr)], stable: Duration) {
     let mut clients: Vec<Client> = nodes
         .iter()
@@ -305,6 +306,9 @@ fn settle(addrs: &HashMap<NodeId, SocketAddr>, nodes: &[(u32, SocketAddr)], stab
             match c.status() {
                 Ok(st) => {
                     for s in st {
+                        if s.flushes[2] > 0 || s.merges != [0, 0] {
+                            ok = false;
+                        }
                         snap.push((u64::from(s.id.get()), s.applied.0, s.segments.clone()));
                     }
                 }

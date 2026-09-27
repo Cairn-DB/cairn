@@ -392,6 +392,19 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Next: the merge pause flag, then a GCP 50M run with a larger pd-ssd (throughput scales
     with size) and a teardown watchdog from the start (owner's go needed).
 
+- Merge pause (2026-09-27, owner: "vas-y pour la pause des fusions"): ADR 0028.
+  - `--max-segments` never disabled merges (the tiered policy runs regardless): that is why
+    run 7 could not reach an idle cluster.
+  - Per-node pause at runtime: `--merges-paused`, `SetMergesPaused` request, `cairn-bench merges
+    pause|resume`, HTTP `/v1/admin/merges`. Running and committed merges complete. Status shows
+    merges running/pending and the flag. Protocol 5 (full restart to upgrade).
+  - The bench settle test now waits until no flush or merge is building or pending.
+  - Simulation test with a positive control; 124 tests; campaign 3,000 seeds zero violations.
+    Local end-to-end (data/run-pause-e2e.sh): paused during ingest, idle (0/0, CPU < 1%)
+    right after ingest, segments unchanged, merges back within 30 s after resume.
+  - `live_docs` is approximate by design (memtable + segments minus deletions), which
+    explains counts slightly above the row count seen in the A/B.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

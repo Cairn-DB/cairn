@@ -72,6 +72,13 @@ Consistency levels (`consistency`, on reads and searches):
 | `DELETE /v1/documents/{id}` | `?after=` | `{"count":1, "consistency_token"}` |
 | `POST /v1/documents/delete` | `{"ids":[...], "after"?}` | `{"count", "consistency_token"}` |
 | `POST /v1/search` | see below | `{"hits":[...]}` |
+| `GET /v1/admin/merges` | | `{"paused"}` for the node answering |
+| `POST /v1/admin/merges` | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |
+
+Merge pause (ADR 0028): a paused node starts no new merge. Merges already running, and merges
+committed in a shard's log, still complete; `merges_running` and `merges_pending` in
+`/v1/status` show when none is left. The call applies to one node: call it on every node to
+pause the cluster. It is an administrative endpoint with no authentication (see Security).
 
 ## Search
 

@@ -220,6 +220,15 @@ impl Client {
         }
     }
 
+    /// Pauses or resumes merges on the node this client talks to (not the whole cluster).
+    pub fn set_merges_paused(&mut self, paused: bool) -> Result<()> {
+        match self.call(&Request::SetMergesPaused(paused))? {
+            Response::Ack(_) => Ok(()),
+            Response::Error { message, .. } => Err(Error::Internal(message)),
+            other => Err(Error::Internal(format!("unexpected response {other:?}"))),
+        }
+    }
+
     /// Sentinel meaning "read-your-writes with every token this client has seen"; expanded by
     /// `get` and `query` into the per-shard token list.
     pub fn read_your_writes(&self) -> Consistency {

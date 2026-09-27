@@ -37,10 +37,11 @@ const MAX_FRAME: usize = 64 << 20;
 /// the log, file shipping. Bump on any incompatible change (ADR 0018). Version 1 was the
 /// unversioned protocol (4-byte hello) before ADR 0018; version 3 added the Raft `TimeoutNow`
 /// message (ADR 0020); version 4 adds the `CompactCommit` command and the builder in
-/// `FlushCommit` (ADR 0021), which older nodes cannot decode.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// `FlushCommit` (ADR 0021), which older nodes cannot decode; version 5 adds merge counts and
+/// the pause flag to replica status and the `SetMergesPaused` request.
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Oldest protocol version this build still accepts from peers and clients.
-pub const PROTOCOL_MIN: u32 = 4;
+pub const PROTOCOL_MIN: u32 = 5;
 
 /// Writes one frame (one write call: one TLS record for small frames).
 pub fn write_frame(w: &mut impl Write, kind: u8, req: u64, payload: &[u8]) -> std::io::Result<()> {

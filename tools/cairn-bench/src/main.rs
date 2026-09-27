@@ -175,6 +175,15 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         every: u64,
     },
+    /// Pauses or resumes merges on every given node (`pause` or `resume`), then prints each
+    /// node's merges running, pending and paused.
+    Merges {
+        /// `pause` or `resume`.
+        action: String,
+        /// Nodes as `id=addr` (repeatable).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+    },
     /// Waits until every node holds the same state per shard (applied index, segment list,
     /// nothing pending) and prints how long it took (catch-up measurements).
     Converge {
@@ -718,6 +727,31 @@ fn main() -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
+        Cmd::Merges { action, nodes } => {
+            let paused = match action.as_str() {
+                "pause" => true,
+                "resume" => false,
+                other => anyhow::bail!("merges: expected pause or resume, got {other}"),
+            };
+            for s in &nodes {
+                let (i, a) = s.split_once('=').expect("node must be id=addr");
+                let id = cairn_core::NodeId(i.parse().expect("node id"));
+                let mut c = cairn_client::Client::new(
+                    [(id, a.parse().expect("addr"))].into_iter().collect(),
+                );
+                c.max_attempts = 1;
+                c.set_merges_paused(paused)?;
+                let st = c.status()?;
+                let (run, pend) = st
+                    .iter()
+                    .fold((0, 0), |a, s| (a.0 + s.merges[0], a.1 + s.merges[1]));
+                println!(
+                    "node {i}: merges paused {} running {run} pending {pend}",
+                    st.iter().all(|s| s.merges_paused)
+                );
+            }
+            Ok(())
+        }
         Cmd::Status { nodes, every } => {
             let nodes: Vec<(u32, std::net::SocketAddr)> = nodes
                 .iter()
@@ -755,8 +789,12 @@ fn main() -> anyhow::Result<()> {
                                     a[2] + s.flushes[2],
                                 ]
                             });
+                            let mg = st
+                                .iter()
+                                .fold((0, 0), |a, s| (a.0 + s.merges[0], a.1 + s.merges[1]));
+                            let paused = st.iter().any(|s| s.merges_paused);
                             println!(
-                                "{} node {i}: leads {lead}/{} memtables {:.0} MB raftlog {:.0} MB net-out {:.0} MB net-in {} segs {} flushes built/fetched/pending {}/{}/{} deferred/commit/inbox {}",
+                                "{} node {i}: leads {lead}/{} memtables {:.0} MB raftlog {:.0} MB net-out {:.0} MB net-in {} segs {} flushes built/fetched/pending {}/{}/{} merges running/pending {}/{}{} deferred/commit/inbox {}",
                                 chrono_free_date(),
                                 st.len(),
                                 mb(mem),
@@ -767,6 +805,9 @@ fn main() -> anyhow::Result<()> {
                                 fl[0],
                                 fl[1],
                                 fl[2],
+                                mg.0,
+                                mg.1,
+                                if paused { " (paused)" } else { "" },
                                 q.join(" ")
                             );
                         }

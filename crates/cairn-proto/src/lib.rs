@@ -50,6 +50,9 @@ pub enum Request {
     },
     /// Internal: a request forwarded by another node; the receiver never forwards it again.
     Forwarded(Box<Request>),
+    /// Pause (`true`) or resume merges on the node that receives it (not forwarded): answered
+    /// with an empty `Ack`. Merges already running or committed still complete.
+    SetMergesPaused(bool),
 }
 
 /// A response.
@@ -286,6 +289,9 @@ fn enc_status(w: &mut Writer, s: &ReplicaStatus) {
     for x in s.flushes {
         w.u64(x);
     }
+    w.u64(s.merges[0])
+        .u64(s.merges[1])
+        .u8(u8::from(s.merges_paused));
 }
 
 fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
@@ -314,6 +320,8 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
         segments.push(r.u64()?);
     }
     let flushes = [r.u64()?, r.u64()?, r.u64()?];
+    let merges = [r.u64()?, r.u64()?];
+    let merges_paused = r.u8()? != 0;
     Ok(ReplicaStatus {
         id,
         role,
@@ -328,6 +336,8 @@ fn dec_status(r: &mut Reader<'_>) -> Result<ReplicaStatus> {
         net,
         segments,
         flushes,
+        merges,
+        merges_paused,
     })
 }
 
@@ -387,6 +397,9 @@ impl Request {
             }
             Request::Forwarded(inner) => {
                 w.u8(7).bytes(&inner.to_bytes());
+            }
+            Request::SetMergesPaused(paused) => {
+                w.u8(8).u8(u8::from(*paused));
             }
         }
         w.into_bytes()
@@ -453,6 +466,7 @@ impl Request {
                 consistency: dec_consistency(&mut r)?,
             },
             7 => Request::Forwarded(Box::new(Request::from_bytes(r.bytes()?)?)),
+            8 => Request::SetMergesPaused(r.u8()? != 0),
             t => return Err(Error::corruption(format!("request tag {t}"))),
         };
         r.finish()?;
@@ -652,6 +666,8 @@ mod tests {
                 consistency: Consistency::Stale,
             },
             Request::Forwarded(Box::new(Request::Delete(vec![DocId(3)]))),
+            Request::SetMergesPaused(true),
+            Request::SetMergesPaused(false),
         ];
         for r in reqs {
             assert_eq!(Request::from_bytes(&r.to_bytes()).unwrap(), r);
@@ -682,6 +698,8 @@ mod tests {
             net: (100, 4),
             segments: vec![1, 2],
             flushes: [5, 6, 1],
+            merges: [1, 2],
+            merges_paused: true,
         };
         let resps = vec![
             Response::Ack(vec![token]),

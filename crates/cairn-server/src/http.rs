@@ -37,6 +37,8 @@ pub struct HttpConfig {
     pub tls: Option<ClientTls>,
     /// Largest request body accepted.
     pub max_body_bytes: usize,
+    /// This node's build slots, which carry its merge pause flag (`/v1/admin/merges`).
+    pub job_slots: Arc<cairn_query::JobSlots>,
 }
 
 struct Shared {
@@ -134,6 +136,7 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/documents/delete", post(delete_many))
         .route("/v1/documents/{id}", get(get_doc).delete(delete_one))
         .route("/v1/search", post(search))
+        .route("/v1/admin/merges", get(merges).post(set_merges))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(shared)
 }
@@ -184,7 +187,27 @@ fn status_json(s: &ReplicaStatus) -> Json_ {
         "segments_built": s.flushes[0],
         "segments_fetched": s.flushes[1],
         "pending": s.flushes[2],
+        "merges_running": s.merges[0],
+        "merges_pending": s.merges[1],
+        "merges_paused": s.merges_paused,
     })
+}
+
+#[derive(Deserialize)]
+struct MergesBody {
+    paused: bool,
+}
+
+/// Merge pause state of this node (the one serving the HTTP request).
+async fn merges(State(s): State<Arc<Shared>>) -> Json<Json_> {
+    Json(json!({ "paused": s.cfg.job_slots.merges_paused() }))
+}
+
+/// Pauses or resumes merges on this node only: call it on every node to pause the cluster.
+/// Merges already running or committed complete; `/v1/status` shows when none is left.
+async fn set_merges(State(s): State<Arc<Shared>>, Json(body): Json<MergesBody>) -> Json<Json_> {
+    s.cfg.job_slots.set_merges_paused(body.paused);
+    Json(json!({ "paused": body.paused }))
 }
 
 // ---------------------------------------------------------------- consistency tokens

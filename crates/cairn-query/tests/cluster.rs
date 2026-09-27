@@ -835,3 +835,71 @@ fn followers_install_leader_built_compactions() {
         check_all_docs(&hs, 150, &deleted).await;
     });
 }
+
+/// Merges can be paused per node: none starts while paused (status says so, and nothing is
+/// left running or pending), and they resume afterwards.
+#[test]
+fn merges_pause_and_resume() {
+    use cairn_query::JobSlots;
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(43, SimConfig::default());
+    let slots: Vec<std::sync::Arc<JobSlots>> = (0..3)
+        .map(|_| {
+            let s = std::sync::Arc::new(JobSlots::new(2));
+            s.set_merges_paused(true);
+            s
+        })
+        .collect();
+    let handles: Vec<ReplicaHandle> = (1..=3u32)
+        .map(|n| {
+            let mut cfg = config(NodeId(n), 3000);
+            cfg.engine.store.max_segments = 3;
+            cfg.compaction_slots = Some(slots[(n - 1) as usize].clone());
+            let (sim, hh) = (sim.clone(), ex.handle());
+            ex.block_on(async move {
+                Replica::spawn(sim.runtime(NodeId(n), &hh), cfg, schema())
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    let merged = |segs: &[u64]| segs.iter().any(|id| id & (1 << 62) != 0);
+    ex.block_on(async move {
+        wait_leader(&rt, &hs).await;
+        for i in 1..=150u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+        }
+        wait_converged(&rt, &hs, 150).await;
+        let st = wait_flushed(&rt, &hs).await;
+        assert!(st[0].segments.len() > 3, "{:?}", st[0].segments);
+        for s in &st {
+            assert!(s.merges_paused);
+            assert_eq!(s.merges, [0, 0], "node {}", s.id);
+            assert!(!merged(&s.segments), "merged while paused: {:?}", s.segments);
+        }
+        for s in &slots {
+            s.set_merges_paused(false);
+        }
+        let mut st = Vec::new();
+        for _ in 0..3000 {
+            st.clear();
+            for h in &hs {
+                st.push(h.status().await.unwrap());
+            }
+            if st.iter().all(|s| {
+                s.flushes[2] == 0
+                    && s.merges == [0, 0]
+                    && s.segments == st[0].segments
+                    && s.segments.len() <= 3
+            }) {
+                break;
+            }
+            rt.sleep(Duration::from_millis(10)).await;
+        }
+        assert!(merged(&st[0].segments), "no merge after resume: {st:#?}");
+        assert!(st.iter().all(|s| !s.merges_paused && s.segments.len() <= 3), "{st:#?}");
+        check_all_docs(&hs, 150, &[]).await;
+    });
+}

@@ -48,6 +48,8 @@ pub struct Token {
 pub struct JobSlots {
     used: std::sync::atomic::AtomicUsize,
     max: usize,
+    /// No new merge starts while set (merges already committed still complete).
+    merges_paused: std::sync::atomic::AtomicBool,
 }
 
 impl JobSlots {
@@ -56,7 +58,23 @@ impl JobSlots {
         JobSlots {
             used: std::sync::atomic::AtomicUsize::new(0),
             max: max.max(1),
+            merges_paused: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Pauses or resumes merges on the replicas sharing these slots (one node). A paused node
+    /// starts no new merge; merges it already runs, and merges committed in a shard's log,
+    /// still complete, so a shard never waits on a decided merge. Queries can then be
+    /// measured on an idle node, and an operator can hold merges off during peak hours.
+    pub fn set_merges_paused(&self, paused: bool) {
+        self.merges_paused
+            .store(paused, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether merges are paused.
+    pub fn merges_paused(&self) -> bool {
+        self.merges_paused
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Takes a slot if one is free.
@@ -168,6 +186,10 @@ pub struct ReplicaStatus {
     pub segments: Vec<u64>,
     /// Flushes built here, flushes fetched from the leader, frozen memtables not yet published.
     pub flushes: [u64; 3],
+    /// Merges building here (0 or 1), merges committed and not yet installed here.
+    pub merges: [u64; 2],
+    /// Whether this node starts no new merge ([`JobSlots::set_merges_paused`]).
+    pub merges_paused: bool,
 }
 
 enum Event {
@@ -1123,6 +1145,17 @@ impl<R: Runtime> Replica<R> {
                         self.flush.fetched,
                         (st.pending_flushes().len() + st.pending_compactions().len()) as u64,
                     ],
+                    merges: [
+                        u64::from(
+                            self.flush.compacting.is_some() || self.flush.own_compaction.is_some(),
+                        ),
+                        st.pending_compactions().len() as u64,
+                    ],
+                    merges_paused: self
+                        .cfg
+                        .compaction_slots
+                        .as_ref()
+                        .is_some_and(|s| s.merges_paused()),
                 });
             }
         }
@@ -2315,6 +2348,14 @@ impl<R: Runtime> Replica<R> {
     /// a time: none while another is committed but not installed, or proposed but not
     /// committed.
     async fn maybe_compact_job(&mut self) -> Result<()> {
+        if self
+            .cfg
+            .compaction_slots
+            .as_ref()
+            .is_some_and(|s| s.merges_paused())
+        {
+            return Ok(());
+        }
         if self.raft.role() != Role::Leader
             || self.busy()
             || self.fetch.is_some()

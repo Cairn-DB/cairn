@@ -81,6 +81,10 @@ struct Cli {
     /// the same segments whatever the count (ADR 0019).
     #[arg(long, default_value_t = 0)]
     build_threads: usize,
+    /// Start with merges paused: no new merge starts until resumed (`POST /v1/admin/merges`
+    /// or `cairn-bench merges resume`). Merges already committed still complete.
+    #[arg(long)]
+    merges_paused: bool,
     /// Do not move shard leaderships to their preferred replicas (ADR 0020).
     #[arg(long)]
     no_leader_balancing: bool,
@@ -174,6 +178,7 @@ fn main() -> anyhow::Result<()> {
         leader_balancing: !cli.no_leader_balancing,
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
+        merges_paused: cli.merges_paused,
     })?;
     eprintln!(
         "cairn-server node {} listening on {} ({} cores)",
@@ -188,6 +193,7 @@ fn main() -> anyhow::Result<()> {
             schema: http_schema,
             tls: http_tls,
             max_body_bytes: cli.http_max_body,
+            job_slots: node.job_slots(),
         })?;
         eprintln!("cairn-server node {} serving HTTP on {addr}", node.id());
     }

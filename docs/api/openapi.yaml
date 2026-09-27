@@ -32,6 +32,18 @@ paths:
                 properties:
                   replicas: { type: array, items: { $ref: "#/components/schemas/ReplicaStatus" } }
         "503": { $ref: "#/components/responses/Error" }
+  /v1/admin/merges:
+    get:
+      summary: Merge pause state of the node answering
+      responses:
+        "200": { description: State, content: { application/json: { schema: { $ref: "#/components/schemas/Merges" } } } }
+    post:
+      summary: Pause or resume merges on the node answering (running and committed merges complete)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Merges" } } }
+      responses:
+        "200": { description: New state, content: { application/json: { schema: { $ref: "#/components/schemas/Merges" } } } }
   /v1/documents:
     post:
       summary: Insert or replace documents
@@ -202,3 +214,11 @@ components:
         segments_built: { type: integer }
         segments_fetched: { type: integer }
         pending: { type: integer }
+        merges_running: { type: integer }
+        merges_pending: { type: integer }
+        merges_paused: { type: boolean }
+    Merges:
+      type: object
+      required: [paused]
+      properties:
+        paused: { type: boolean }

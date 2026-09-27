@@ -66,6 +66,8 @@ pub struct NodeConfig {
     pub tick_ms: u64,
     /// Message drop probability (tests).
     pub drop_prob: f64,
+    /// Start with merges paused ([`Node::set_merges_paused`]).
+    pub merges_paused: bool,
 }
 
 enum CoreRequest {
@@ -176,6 +178,7 @@ impl Node {
     pub fn start(cfg: NodeConfig) -> Result<Node> {
         std::fs::create_dir_all(&cfg.data_dir)
             .map_err(|e| Error::io(cairn_core::error::IoErrorKind::Other, e))?;
+        job_slots(cfg.compaction_slots).set_merges_paused(cfg.merges_paused);
         let cores_n = cfg.cores.max(1);
         let queues: Queues = Arc::new((0..cores_n).map(|_| CrossQueue::new()).collect());
         let (net_tx, net_rx) = std::sync::mpsc::channel::<Result<TcpNetwork>>();
@@ -642,6 +645,11 @@ impl Node {
             Request::Forwarded(inner) => {
                 Box::pin(Self::handle(rt, queues, cfg, *inner, false)).await
             }
+            Request::SetMergesPaused(paused) => {
+                job_slots(cfg.compaction_slots).set_merges_paused(paused);
+                tracing::info!(node = %cfg.id, paused, "merges paused set");
+                Response::Ack(Vec::new())
+            }
             Request::ShardLegs {
                 shard,
                 query,
@@ -894,6 +902,17 @@ impl Node {
     /// Node id.
     pub fn id(&self) -> NodeId {
         self.cfg.id
+    }
+
+    /// Pauses or resumes merges on this node (see [`cairn_query::JobSlots::set_merges_paused`]).
+    /// The build slots, and so this flag, are shared by every node of one process.
+    pub fn set_merges_paused(&self, paused: bool) {
+        job_slots(self.cfg.compaction_slots).set_merges_paused(paused);
+    }
+
+    /// The build slots shared by this node's replicas (merge pause flag included).
+    pub fn job_slots(&self) -> std::sync::Arc<cairn_query::JobSlots> {
+        job_slots(self.cfg.compaction_slots)
     }
 
     /// Listen address.
