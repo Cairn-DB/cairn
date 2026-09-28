@@ -73,3 +73,16 @@ Recall is unchanged: allocation does not affect results.
 - Memory at rest is about 10% higher (mimalloc uses larger pages and segments) but stays flat
   over time.
 - A C toolchain is needed to build the server, which the build images already have.
+
+## Confirmed at 50M (GCP run 9, 2026-09-28)
+
+Queries ran on the nodes that had just ingested 50M rows, with no restart
+(`bench-results/phase4-gcp-bigann50m-run9.md`):
+
+- p99 of 35/36 ms unfiltered and 31/30 ms filtered, at 435/318 QPS;
+- 16.5-17.2 GB of anonymous memory per node, against 33.8 GB in run 8;
+- a restart now gains 8-9% in throughput, against a factor of 3 to 4 before.
+
+Ingest went from 8,343 to 20,667 docs/s over the same run, a gain not seen locally. It is to be
+confirmed.
+

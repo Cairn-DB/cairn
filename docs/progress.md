@@ -441,6 +441,14 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   pushed; the org cairn-db is still empty. Owner decides on internal files (CLAUDE.md,
   prompts/, progress.md) and visibility.
 
+- GCP 50M run 9 (2026-09-28, owner: "go pour le run gcp"): bench-results/phase4-gcp-bigann50m-run9.md.
+  - mimalloc confirmed at 50M: queries on the ingesting processes, no restart: p99 35/36 ms
+    unfiltered, 31/30 ms filtered, 435/318 QPS, takedown p99 102 ms. Anon 16.5-17.2 GB per node
+    (run 8: 33.8 GB). A restart now gains 8-9% (was 3-4x).
+  - Ingest 20,667 docs/s (run 8: 8,343), no long stall; not seen locally, one run: to confirm.
+  - About 3 USD, fleet deleted 11:09 UTC and checked. Repository published privately at
+    github.com/Cairn-DB/cairn (owner's go, 2026-09-28); CI and image workflows green.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

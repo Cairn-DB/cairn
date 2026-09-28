@@ -59,26 +59,24 @@ The HTTP/JSON API is documented in [docs/api/http.md](docs/api/http.md), with an
 ## Measured results
 
 50M BigANN vectors (128 dimensions) on 3 × GCP n2-highmem-8 (8 vCPU, 64 GB), every node holding
-every shard, 1,000 queries per kind from 8 client threads, k = 10
-([bench-results/phase4-gcp-bigann50m-run8.md](bench-results/phase4-gcp-bigann50m-run8.md)):
+every shard. Queries ran on the same processes that had just ingested the data, with no
+restart: 1,000 per kind from 8 client threads, k = 10
+([bench-results/phase4-gcp-bigann50m-run9.md](bench-results/phase4-gcp-bigann50m-run9.md)).
 
 | metric | result | target |
 |---|---|---|
-| unfiltered p99, stale / linearizable | 42 / 44 ms | < 100 ms |
-| 1%-selective filter p99, stale / linearizable | 42 / 42 ms | < 100 ms |
-| throughput, unfiltered | 244 QPS | |
-| recall@10, unfiltered / filtered | 0.985 / 0.989 | |
+| unfiltered p99, stale / linearizable | 35 / 36 ms | < 100 ms |
+| 1%-selective filter p99, stale / linearizable | 31 / 30 ms | < 100 ms |
+| throughput, unfiltered, stale / linearizable | 435 / 318 QPS | |
+| recall@10, unfiltered / filtered | 0.985 / 0.990 | |
 | takedown visible on all 3 machines, p99 | 102 ms | < 1 s |
-| ingest, 50M rows through Raft | 8,343 docs/s | |
-
-These queries were measured after a restart. On the node that had just ingested, glibc's
-fragmented heap made queries 3 to 4 times slower. The server now uses mimalloc
-([ADR 0029](docs/adr/0029-mimalloc.md)), which removes that gap in local tests. The fix is
-still to be confirmed at 50M.
+| ingest, 50M rows through Raft | 20,667 docs/s (2,419 s) | |
 
 Other evidence: [Big-ANN filtered track at 10M](bench-results/phase2-yfcc10m.md) (recall@10
 0.9994, p99 ≤ 16.5 ms, one node); [simulation campaigns](bench-results/phase3-campaign.md). Every
-report lists the commands, the hardware and the misses.
+report lists the commands, the hardware and the misses: for instance, run 8 missed the latency
+targets on freshly ingested nodes until the allocator was changed
+([ADR 0029](docs/adr/0029-mimalloc.md)).
 
 ## Known limits
 
@@ -90,7 +88,8 @@ report lists the commands, the hardware and the misses.
   Node-to-node traffic uses mutual TLS ([ADR 0018](docs/adr/0018-versioned-contract-and-mtls.md)).
 - **Protocol versions** are checked on every connection, but upgrading across a protocol
   change needs a full-cluster restart.
-- Ingest still stalls for minutes at a time under sustained load, while index builds catch up.
+- Ingest throughput depends on how fast index builds keep up. At 50M on 3 nodes, the last run
+  showed no long stall, but it is a single run.
 
 ## Build and test
 
