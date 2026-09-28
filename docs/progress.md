@@ -469,6 +469,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   4. Pending: the owner's decisions on internal files (CLAUDE.md, prompts/, progress.md) and
      visibility.
 
+- Release 0.1.0, developer preview (2026-09-28, owner: "go avec la v0.1"): history rewritten
+  by the owner (data/rewrite-consultant.sh, filter-repo) to remove personal details; old -> new
+  commit ids in docs/history-rewrite-map.txt. Tag v0.1.0 at f0da9f9: release pipeline green
+  (verify, signed amd64+arm64 images ghcr.io/cairn-db/cairn:0.1.0 and :0.1, GitHub
+  pre-release). Everything is still private. Pending: contact@cairn-db.com reception (an OVH
+  alias to create), DKIM/DMARC, then going public with the owner's go.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset
