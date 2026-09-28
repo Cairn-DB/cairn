@@ -34,23 +34,16 @@ cargo bench -p cairn-index                     # criterion benchmarks
 - Docs updated (public items, ADR if a decision was made).
 - Benchmarks re-run if the change touches a hot path.
 
-## Autonomous delivery mode (in force since 2026-09-22)
+## How this project is built
 
-The owner delegated all decisions and will not intervene until a fully functional prototype is
-delivered. These rules amend the ones above for that period:
+Cairn is developed with an AI coding agent working under these rules. For the context behind
+the documents:
 
-- Read, in order: `SPEC.md`, this file, `docs/progress.md` (the journal: state, next step, open
-  problems). The journal is the hand-off between context windows; update it at every milestone and
-  whenever a non-obvious problem is solved. Never rely on conversation memory for state.
-- Decisions the owner would have taken are taken by the agent and recorded: ADR status
-  `accepted (delegated YYYY-MM-DD)`. Rule 8 (ask before heavy deps / format changes / phase exit)
-  becomes: decide, justify in an ADR or in `docs/progress.md`, proceed.
-- Phase gates are self-approved only with evidence: a report in `docs/reports/phase-N.md` with the
-  exact commands run, their results, and benchmark files under `bench-results/`.
-- Commit per milestone or smaller, on `main`, message says why, with the Co-Authored-By trailer.
-- Long jobs (> 2 min) run in the background with output to a file; poll, do not block.
-- Absolute paths in every shell command (parallel calls share one cwd).
-- No `sudo`, no system packages. Tooling is `rustup`/`cargo install` only.
-- Datasets live in `data/` (gitignored), fetched by `tools/fetch-datasets.sh` with checksums.
-- Hardware target for all benchmarks: this machine (see `docs/progress.md` "Environment").
-- Honesty rule unchanged: a missed target is reported as missed, in the report and the journal.
+- `docs/progress.md` is the journal: state, next step, open problems. It is the hand-off between
+  sessions and is updated at every milestone. State is never kept in conversation memory.
+- A decision the agent took on the owner's behalf is recorded as an ADR with the status
+  `accepted (delegated YYYY-MM-DD)`, with its justification.
+- A phase or milestone is closed only with evidence: the exact commands, their results, and
+  the benchmark files under `bench-results/`. A missed target is reported as missed.
+- Commits are small, on `main`, and say why. Commits written with the agent carry a
+  `Co-Authored-By` trailer.

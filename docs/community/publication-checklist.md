@@ -25,8 +25,8 @@ owner's explicit go.
    - `prompts/`: the kickoff prompt;
    - `docs/progress.md`: the full journal, with cloud costs.
 
-   Recommendation: keep all three. They show how the evidence was produced, and that can
-   attract contributors.
+   Decided (2026-09-28): keep all three, with CLAUDE.md reduced to what explains the context,
+   and personal details removed.
 2. **Visibility.** Publish the repository as private first, to review it on GitHub, then
    switch it to public.
 3. **Repository name.** `cairn-db/cairn`. The issue templates and the organization README link

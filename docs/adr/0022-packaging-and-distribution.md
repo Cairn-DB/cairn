@@ -6,8 +6,7 @@
 
 ## Context
 
-The owner will take Cairn to production and publish it as open source.
-The goal is contributors from RAG governance, AI engineering and
+The owner will take Cairn to production and publish it as open source. The goal is contributors from RAG governance, AI engineering and
 application development, gathered around one property: a takedown is visible everywhere
 within about 100 ms, and a client that asked for it never reads the document again. The
 priorities, in order:

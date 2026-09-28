@@ -7,7 +7,9 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
-First developer preview, planned as 0.1.0. Everything below is new.
+## [0.1.0] - 2026-09-28
+
+First developer preview. Everything below is new.
 
 ### Engine
 - Hybrid queries in one plan: vector legs (HNSW, or a DiskANN-style disk-resident index), a
