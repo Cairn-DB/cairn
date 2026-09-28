@@ -87,6 +87,8 @@ targets on freshly ingested nodes until the allocator was changed
 
 - **Static membership.** The number of nodes is fixed at startup. Adding a node or rebalancing
   shards needs a reload; dynamic membership is on the roadmap.
+- **A node that loses its disk cannot rejoin yet**: an empty node has forgotten its Raft votes.
+  The cluster keeps serving on the other replicas. See the [deployment guide](docs/deployment.md).
 - **One region.** Nodes should sit within a few milliseconds of each other (zones of one
   cloud region, or nearby datacenters).
 - **API keys are static files per node.** No key rotation service or external identity
