@@ -1,8 +1,9 @@
+# The development image: ghcr.io/<owner>/cairn:edge on every push to main (linux/amd64).
+# Versioned, signed, multi-arch images come from release.yml on a version tag.
 name: image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
 permissions:
   contents: read
   packages: write
@@ -24,8 +25,6 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/cairn
           tags: |
             type=edge,branch=main
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
       - uses: docker/build-push-action@v6
         with:
           context: .
