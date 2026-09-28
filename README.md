@@ -96,8 +96,8 @@ targets on freshly ingested nodes until the allocator was changed
   ([ADR 0018](docs/adr/0018-versioned-contract-and-mtls.md)).
 - **Protocol versions** are checked on every connection, but upgrading across a protocol
   change needs a full-cluster restart.
-- Ingest throughput depends on how fast index builds keep up. At 50M on 3 nodes, the last run
-  showed no long stall, but it is a single run.
+- Ingest throughput depends on how fast index builds keep up: about 20k docs/s at 50M on 3
+  nodes, measured on two runs.
 
 ## Build and test
 

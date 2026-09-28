@@ -6,9 +6,8 @@ missing. Nothing here has a date. An item moves only when its evidence is in
 
 ## Next
 
-- **Confirm the ingest rate.** The last 50M run ingested at 20.7k docs/s with no long stall,
-  2.5× the run before, after the allocator change (ADR 0029). One run is not enough. What
-  remains to look at:
+- **Ingest efficiency.** Two 50M runs ingested at about 20k docs/s with no long stall (ADR
+  0029). What remains to look at:
   - builds done twice when leadership moves during ingest;
   - fetches that give up too early and rebuild locally.
 - **Leader balancing under continuous ingest.** Leadership should spread evenly even while

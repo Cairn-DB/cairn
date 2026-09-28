@@ -457,6 +457,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   new dependency). Takedown audit log (key id, ids, token), on by default. 129 tests (process
   tests over HTTPS); image smoke-tested (401/200, audit line, digests only on disk).
 
+- Toward a developer preview (2026-09-28, owner: "go dans l'ordre"):
+  1. GCP run 10 reproduced run 9: ingest 19,660 docs/s; no-restart p99 31/31 ms unfiltered,
+     31/33 ms filtered, 374/352 QPS, takedown p99 102 ms. About 3 USD, fleet deleted and checked.
+  2. docs/deployment.md (3 zones, sizing, security, operations). Review caught and fixed two
+     unsafe claims: rejoining with an empty disk, restoring one node from an old copy
+     (forgotten Raft votes).
+  3. CHANGELOG.md, docs/releasing.md, release.yml: tag-gated signed multi-arch images (cross-
+     compiled arm64, SBOM, provenance, cosign keyless) and a GitHub release. The rehearsal
+     run is green on GitHub, and the arm64 image builds. It was not run on arm64 hardware.
+  4. Pending: the owner's decisions on internal files (CLAUDE.md, prompts/, progress.md) and
+     visibility.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

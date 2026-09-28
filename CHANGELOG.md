@@ -41,7 +41,8 @@ First developer preview, planned as 0.1.0. Everything below is new.
   - p99 of 35 ms unfiltered and 31 ms with a 1% filter;
   - 435 QPS;
   - takedowns visible everywhere within 102 ms at p99;
-  - ingest at 20.7k docs/s (`bench-results/phase4-gcp-bigann50m-run9.md`).
+  - ingest at 19.7k-20.7k docs/s (`bench-results/phase4-gcp-bigann50m-run9.md` and
+    `run10.md`).
 - 60,000 seeds of deterministic fault-injection simulation with zero safety violations.
 
 ### Known limits

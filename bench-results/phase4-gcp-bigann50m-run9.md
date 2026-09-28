@@ -21,8 +21,8 @@
 Ingest ran at 27k docs/s on average up to 26M rows, with no long stall. This run does not
 separate the causes. Index builds allocate heavily and ran on glibc's fragmented heap until
 now. Locally, at 6M rows, mimalloc showed no ingest gain: 9,543 docs/s against 10,000-13,000
-with glibc, in noisy runs. The 2.5× is therefore observed at 50M only, and is to be confirmed
-by another run before it is claimed.
+with glibc, in noisy runs. The 2.5× is therefore observed at 50M only. Run 10 reproduced it:
+19,660 docs/s (`phase4-gcp-bigann50m-run10.md`).
 
 ## Queries: targets met on the nodes that ingested
 
