@@ -99,10 +99,27 @@ struct Cli {
     /// Serve the HTTP/JSON API on this address (ADR 0023). Off by default.
     #[arg(long)]
     http_listen: Option<SocketAddr>,
-    /// Allow the HTTP API on a node that uses mutual TLS. The HTTP port has no TLS and no
-    /// authentication: bind it to a trusted interface or put an authenticating proxy in front.
+    /// Allow plain HTTP (no --http-tls-cert) on a node that uses mutual TLS between nodes.
     #[arg(long)]
     http_allow_plaintext: bool,
+    /// API keys file (ADR 0030): `{"keys":[{"id","sha256","roles"}]}`, digests only. Create
+    /// entries with `cairn-server keygen <id> <roles>`. The environment variable
+    /// CAIRN_HTTP_ADMIN_KEY adds an admin key given in clear (same on every node).
+    #[arg(long)]
+    http_keys: Option<PathBuf>,
+    /// If the --http-keys file does not exist, create it with a new admin key and print that key
+    /// once on stderr (first start of a development node).
+    #[arg(long)]
+    http_generate_admin_key: bool,
+    /// Serve the HTTP API without authentication (development only; refused otherwise).
+    #[arg(long)]
+    http_insecure_dev: bool,
+    /// TLS certificate chain (PEM) for the HTTP port.
+    #[arg(long)]
+    http_tls_cert: Option<PathBuf>,
+    /// TLS private key (PEM) for the HTTP port.
+    #[arg(long)]
+    http_tls_key: Option<PathBuf>,
     /// Largest HTTP request body, in bytes.
     #[arg(long, default_value_t = 64 << 20)]
     http_max_body: usize,
@@ -111,10 +128,68 @@ struct Cli {
     drop_prob: f64,
 }
 
+/// `cairn-server keygen <id> <roles>`: prints a new API key and its keys-file entry.
+fn keygen(args: &[String]) -> anyhow::Result<()> {
+    let [id, roles] = args else {
+        anyhow::bail!(
+            "usage: cairn-server keygen <id> <roles, comma-separated: read,write,takedown,admin>"
+        );
+    };
+    let roles: Vec<cairn_server::auth::Role> = roles
+        .split(',')
+        .map(cairn_server::auth::Role::parse)
+        .collect::<anyhow::Result<_>>()?;
+    let (secret, key) = cairn_server::auth::generate(id, &roles)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "key": secret, "entry": key.entry() }))?
+    );
+    eprintln!(
+        "Store the key now: it is not saved anywhere. Add the entry to the --http-keys file."
+    );
+    Ok(())
+}
+
+/// The keys the HTTP API accepts, from --http-keys and CAIRN_HTTP_ADMIN_KEY.
+fn http_keys(cli: &Cli) -> anyhow::Result<cairn_server::auth::ApiKeys> {
+    use cairn_server::auth::{ApiKeys, Role, generate};
+    let mut keys = match &cli.http_keys {
+        Some(path) if path.exists() => ApiKeys::load(path)?,
+        Some(path) if cli.http_generate_admin_key => {
+            let (secret, key) = generate("admin", &[Role::Admin])?;
+            let json = serde_json::to_string_pretty(&serde_json::json!({ "keys": [key.entry()] }))?;
+            std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+            eprintln!(
+                "Generated an admin API key (shown once, only its digest is kept in {}):\n  {secret}",
+                path.display()
+            );
+            ApiKeys::load(path)?
+        }
+        Some(path) => anyhow::bail!("--http-keys {} does not exist", path.display()),
+        None if cli.http_generate_admin_key => {
+            anyhow::bail!("--http-generate-admin-key needs --http-keys <file>")
+        }
+        None => ApiKeys::default(),
+    };
+    if let Ok(secret) = std::env::var("CAIRN_HTTP_ADMIN_KEY")
+        && !secret.is_empty()
+    {
+        keys.add_plain("admin-env", &secret, &[Role::Admin])?;
+    }
+    Ok(keys)
+}
+
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // The takedown audit trail is on unless RUST_LOG says otherwise about it.
+    let mut filter = tracing_subscriber::EnvFilter::from_default_env();
+    if !std::env::var("RUST_LOG").is_ok_and(|v| v.contains("audit")) {
+        filter = filter.add_directive("cairn_server::audit=info".parse()?);
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("keygen") {
+        return keygen(&args[2..]);
+    }
     let cli = Cli::parse();
     if let Err(e) = cairn_runtime::raise_open_files_limit() {
         tracing::warn!("could not raise the open files limit: {e}");
@@ -134,17 +209,47 @@ fn main() -> anyhow::Result<()> {
         ),
         (None, None, None) => {
             eprintln!(
-                "WARNING: no --tls-ca/--tls-cert/--tls-key: node traffic and client traffic are \
-                 plaintext and unauthenticated (development only)"
+                "WARNING: no --tls-ca/--tls-cert/--tls-key: node traffic and binary-protocol \
+                 clients are plaintext and unauthenticated (development only)"
             );
             None
         }
         _ => anyhow::bail!("--tls-ca, --tls-cert and --tls-key go together"),
     };
+    let https = match (&cli.http_tls_cert, &cli.http_tls_key) {
+        (Some(c), Some(k)) => Some(
+            cairn_runtime::tls::https_server_config(c, k)
+                .context("loading the HTTP TLS certificate")?,
+        ),
+        (None, None) => None,
+        _ => anyhow::bail!("--http-tls-cert and --http-tls-key go together"),
+    };
+    let auth = http_keys(&cli)?;
+    if cli.http_listen.is_some() {
+        if auth.is_empty() && !cli.http_insecure_dev {
+            anyhow::bail!(
+                "the HTTP API needs API keys (ADR 0030): --http-keys <file> (see `cairn-server \
+                 keygen`), --http-keys <file> --http-generate-admin-key on a first start, or \
+                 CAIRN_HTTP_ADMIN_KEY; --http-insecure-dev serves it without authentication"
+            );
+        }
+        if cli.http_insecure_dev {
+            eprintln!(
+                "WARNING: --http-insecure-dev: the HTTP API accepts every request without a key \
+                 (development only)"
+            );
+        } else if https.is_none() {
+            eprintln!(
+                "WARNING: the HTTP API is plain HTTP: API keys travel in clear; add \
+                 --http-tls-cert/--http-tls-key or put a TLS proxy in front"
+            );
+        }
+    }
     let http_tls = match (&cli.http_listen, &tls) {
-        (Some(_), Some(_)) if !cli.http_allow_plaintext => anyhow::bail!(
-            "--http-listen serves plaintext without authentication, which would bypass mutual \
-             TLS: add --http-allow-plaintext to confirm (bind it to a trusted interface)"
+        (Some(_), Some(_)) if https.is_none() && !cli.http_allow_plaintext => anyhow::bail!(
+            "--http-listen serves plain HTTP next to mutual TLS between nodes: add \
+             --http-tls-cert/--http-tls-key, or --http-allow-plaintext to confirm (bind it to a \
+             trusted interface)"
         ),
         (Some(_), Some(_)) => Some(
             cairn_runtime::tls::ClientTls::from_pem_files(
@@ -199,6 +304,8 @@ fn main() -> anyhow::Result<()> {
             tls: http_tls,
             max_body_bytes: cli.http_max_body,
             job_slots: node.job_slots(),
+            auth: (!cli.http_insecure_dev).then(|| std::sync::Arc::new(auth)),
+            https,
         })?;
         eprintln!("cairn-server node {} serving HTTP on {addr}", node.id());
     }

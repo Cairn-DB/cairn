@@ -63,6 +63,20 @@ fn load_identity(
     Ok((chain, key))
 }
 
+/// Server TLS for the HTTP API (ADR 0030): the certificate chain and key in PEM files, no
+/// client certificate (clients authenticate with API keys), HTTP/1.1 announced over ALPN.
+pub fn https_server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> {
+    let (chain, key) = load_identity(cert, key)?;
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(tls_err)?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(tls_err)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// TLS settings of a client (a node dialing peers, or an application).
 #[derive(Clone, Debug)]
 pub struct ClientTls {

@@ -449,6 +449,14 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - About 3 USD, fleet deleted 11:09 UTC and checked. Repository published privately at
     github.com/Cairn-DB/cairn (owner's go, 2026-09-28); CI and image workflows green.
 
+- HTTP authentication (2026-09-28, owner: auth before the developer preview, "go"): ADR 0030.
+  API keys (SHA-256 digests in a keys file, `cairn-server keygen`, CAIRN_HTTP_ADMIN_KEY), roles
+  read/write/takedown/admin (takedown apart from write), 401/403, unknown routes need admin.
+  Secure by default: no keys, no API, unless --http-insecure-dev; the Docker image generates
+  an admin key on first start and prints it once. HTTPS with rustls (tokio-rustls, the only
+  new dependency). Takedown audit log (key id, ids, token), on by default. 129 tests (process
+  tests over HTTPS); image smoke-tested (401/200, audit line, digests only on disk).
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

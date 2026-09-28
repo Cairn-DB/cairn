@@ -1,4 +1,5 @@
 # One development node: podman compose -f docker/compose.yaml up (or docker compose).
+# The first start prints an admin API key in the logs (ADR 0030); set CAIRN_HTTP_ADMIN_KEY to choose it.
 services:
   cairn:
     build: { context: .., dockerfile: docker/Dockerfile }

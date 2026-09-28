@@ -6,6 +6,8 @@ accepts any request and forwards it to the shard leaders. Machine-readable descr
 
 ```bash
 docker run -p 7200:7200 cairn:dev        # one node, default schema (docker/schema.json)
+docker logs <container> | grep cairn_    # the admin API key generated on the first start
+export KEY=cairn_...                     # used as "Authorization: Bearer $KEY" below
 ```
 
 With rootless podman, use `127.0.0.1` rather than `localhost`: `localhost` may resolve to
@@ -29,7 +31,7 @@ schema. JSON types by field kind:
 A missing field or `null` means no value. An upsert replaces the whole document.
 
 ```bash
-curl -s localhost:7200/v1/documents -H 'content-type: application/json' -d '{
+curl -s localhost:7200/v1/documents -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{
   "documents": [
     { "id": 1, "text": "nuclear energy debate", "source": "tv", "tags": ["politics"],
       "created": 19000, "embedding": [0.1, 0.2, ...] }
@@ -46,9 +48,9 @@ token as `after` on the next write, and the new token covers both.
 This is what makes a takedown final for the client that asked for it:
 
 ```bash
-T=$(curl -s -X DELETE localhost:7200/v1/documents/1 | jq -r .consistency_token)
-curl -s "localhost:7200/v1/documents/1?after=$T"        # 404, through any node
-curl -s localhost:7200/v1/search -H content-type:application/json -d "{\"text\":{\"field\":\"text\",\"query\":\"nuclear\"},\"after\":\"$T\"}"
+T=$(curl -s -H "Authorization: Bearer $KEY" -X DELETE localhost:7200/v1/documents/1 | jq -r .consistency_token)
+curl -s -H "Authorization: Bearer $KEY" "localhost:7200/v1/documents/1?after=$T"   # 404, through any node
+curl -s localhost:7200/v1/search -H "Authorization: Bearer $KEY" -H content-type:application/json -d "{\"text\":{\"field\":\"text\",\"query\":\"nuclear\"},\"after\":\"$T\"}"
                                                          # document 1 is not in the hits
 ```
 
@@ -62,18 +64,18 @@ Consistency levels (`consistency`, on reads and searches):
 
 ## Endpoints
 
-| method and path | body or parameters | answer |
-|---|---|---|
-| `GET /health` | | `{"status":"ok"}` |
-| `GET /v1/schema` | | the schema |
-| `GET /v1/status` | | the replicas hosted by the node answering: role, term, commit and applied indexes, segments |
-| `POST /v1/documents` | `{"documents":[...], "after"?}` | `{"count", "consistency_token"}` |
-| `GET /v1/documents/{id}` | `?consistency=&after=` | the document, or 404 |
-| `DELETE /v1/documents/{id}` | `?after=` | `{"count":1, "consistency_token"}` |
-| `POST /v1/documents/delete` | `{"ids":[...], "after"?}` | `{"count", "consistency_token"}` |
-| `POST /v1/search` | see below | `{"hits":[...]}` |
-| `GET /v1/admin/merges` | | `{"paused"}` for the node answering |
-| `POST /v1/admin/merges` | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |
+| method and path | role | body or parameters | answer |
+|---|---|---|---|
+| `GET /health` | none | | `{"status":"ok"}` |
+| `GET /v1/schema` | read | | the schema |
+| `GET /v1/status` | admin | | the replicas hosted by the node answering: role, term, commit and applied indexes, segments |
+| `POST /v1/documents` | write | `{"documents":[...], "after"?}` | `{"count", "consistency_token"}` |
+| `GET /v1/documents/{id}` | read | `?consistency=&after=` | the document, or 404 |
+| `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
+| `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}` | `{"count", "consistency_token"}` |
+| `POST /v1/search` | read | see below | `{"hits":[...]}` |
+| `GET /v1/admin/merges` | admin | | `{"paused"}` for the node answering |
+| `POST /v1/admin/merges` | admin | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |
 
 Merge pause (ADR 0028): a paused node starts no new merge. Merges already running, and merges
 committed in a shard's log, still complete; `merges_running` and `merges_pending` in
@@ -111,12 +113,38 @@ pause the cluster. It is an administrative endpoint with no authentication (see 
 
 Errors come back as `{"error": "message"}`:
 - 400: invalid input (unknown field, wrong type or dimension, bad filter or token);
+- 401: missing or invalid API key;
+- 403: the key lacks the role the endpoint needs;
 - 404: missing document;
 - 503: the cluster is unreachable, or has no leader for a shard after retries;
 - 500: anything else.
 
-## Security
+## Authentication and security
 
-The HTTP port has **no TLS and no authentication** yet. A node running with mutual TLS
-refuses to open it without `--http-allow-plaintext`. Bind it to a trusted interface, or put
-an authenticating TLS proxy in front.
+Every request except `/health` carries an API key (ADR 0030):
+`Authorization: Bearer <key>`.
+
+**Roles.** Each key holds one or more roles:
+- `read`: reads, searches and the schema;
+- `write`: inserts and replacements;
+- `takedown`: deletions, kept apart from `write` so that deletions can be granted to a
+  compliance service alone;
+- `admin`: status and merge pause, and every other role.
+
+**Keys.**
+- `cairn-server keygen <id> <roles>` prints a new key once, with the entry to add to the
+  keys file (`--http-keys`). The file holds only SHA-256 digests.
+- `CAIRN_HTTP_ADMIN_KEY` adds an admin key given in clear, for instance from a secret shared by
+  every node.
+- On a first start, `--http-keys <file> --http-generate-admin-key` creates the file with one
+  admin key and prints that key once. This is what the Docker image does when no key is
+  configured.
+- Without any key the node refuses to serve the API, unless `--http-insecure-dev` says
+  otherwise (development only).
+
+**TLS.** `--http-tls-cert/--http-tls-key` serve the API over HTTPS. Without them, keys travel
+in clear and the node warns at startup: use TLS, or an HTTPS proxy in front. A node that runs
+mutual TLS between nodes refuses plain HTTP unless `--http-allow-plaintext` confirms it.
+
+**Audit.** Every takedown is logged with the key id, the document ids and the consistency
+token (log target `cairn_server::audit`, on by default). Secrets never reach the logs.

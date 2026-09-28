@@ -26,7 +26,8 @@ A small, typed client (`httpx`) covering the endpoints in `docs/api/http.md`:
 - documents, search and takedowns;
 - consistency tokens, kept per session so that read-your-writes and read-your-takedowns are
   the default;
-- merge pause.
+- merge pause;
+- API keys (`Authorization: Bearer`, ADR 0030) and HTTPS.
 
 It should come with an example that runs a RAG retrieval step and proves a takedown is never
 returned again.

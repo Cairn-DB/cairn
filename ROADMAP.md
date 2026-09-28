@@ -20,7 +20,9 @@ missing. Nothing here has a date. An item moves only when its evidence is in
 
 - **Dynamic membership.** Add and remove nodes and replicas without a reload, through Raft
   membership changes, with shards rebalanced.
-- **TLS and authentication on the HTTP API**, with roles (read, write, takedown, admin).
+- **Key management**: rotation without restart, keys shared through the cluster instead of
+  per-node files, and an external identity provider (OIDC). API keys with roles and HTTPS
+  exist (ADR 0030).
 - **Backups and restore**, consistent with the deletion guarantee: a restored backup must not
   bring back a document deleted after the backup was taken, unless the operator explicitly
   asks for it.

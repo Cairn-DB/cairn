@@ -1,11 +1,13 @@
 # Three replicated nodes on one host: podman compose -f docker/compose.cluster.yaml up.
-# HTTP API on 7201-7203, binary protocol on 7101-7103.
+# HTTP API on 7201-7203 (Authorization: Bearer $CAIRN_HTTP_ADMIN_KEY), binary protocol on 7101-7103.
 # Peers are addressed by IP: the server does not resolve host names yet.
 x-node: &node
   build: { context: .., dockerfile: docker/Dockerfile }
   image: cairn:dev
   environment: &env
     CAIRN_PEERS: "1=172.28.0.11:7100 2=172.28.0.12:7100 3=172.28.0.13:7100"
+    # One admin API key for every node (ADR 0030): export it, or put it in a .env file.
+    CAIRN_HTTP_ADMIN_KEY: "${CAIRN_HTTP_ADMIN_KEY:?set CAIRN_HTTP_ADMIN_KEY to a secret of 16+ characters}"
     CAIRN_CORES: "2"
 services:
   node1:

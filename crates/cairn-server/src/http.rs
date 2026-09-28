@@ -39,6 +39,10 @@ pub struct HttpConfig {
     pub max_body_bytes: usize,
     /// This node's build slots, which carry its merge pause flag (`/v1/admin/merges`).
     pub job_slots: Arc<cairn_query::JobSlots>,
+    /// Accepted API keys (ADR 0030); `None` serves without authentication (development only).
+    pub auth: Option<Arc<crate::auth::ApiKeys>>,
+    /// TLS for the HTTP port itself; `None` serves plain HTTP.
+    pub https: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
 }
 
 struct Shared {
@@ -108,17 +112,119 @@ pub fn start(cfg: HttpConfig) -> anyhow::Result<SocketAddr> {
         .build()?;
     let listener = rt.block_on(tokio::net::TcpListener::bind(cfg.listen))?;
     let addr = listener.local_addr()?;
+    let https = cfg.https.clone();
     let app = router(cfg);
     std::thread::Builder::new()
         .name("cairn-http".into())
         .spawn(move || {
             rt.block_on(async move {
-                if let Err(e) = axum::serve(listener, app).await {
-                    tracing::error!("http server stopped: {e}");
+                match https {
+                    None => {
+                        if let Err(e) = axum::serve(listener, app).await {
+                            tracing::error!("http server stopped: {e}");
+                        }
+                    }
+                    Some(tls) => serve_tls(listener, app, tls).await,
                 }
             })
         })?;
     Ok(addr)
+}
+
+/// HTTPS: each connection does its TLS handshake in a task of its own (a slow client never
+/// holds up the accept loop), then is served as HTTP/1.1.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: Arc<tokio_rustls::rustls::ServerConfig>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("https accept: {e}");
+                continue;
+            }
+        };
+        let (acceptor, app) = (acceptor.clone(), app.clone());
+        tokio::spawn(async move {
+            let stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                acceptor.accept(tcp),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, "tls handshake failed: {e}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let service = hyper_util::service::TowerToHyperService::new(app);
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await
+            {
+                tracing::debug!(%peer, "https connection: {e}");
+            }
+        });
+    }
+}
+
+/// The API key that authenticated a request (its id), for the takedown audit trail.
+#[derive(Clone)]
+struct KeyId(String);
+
+/// Checks the `Authorization` header against the node's keys and the role the route needs
+/// (ADR 0030): 401 without a valid key, 403 without the role.
+async fn authorize(
+    State(s): State<Arc<Shared>>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(keys) = &s.cfg.auth else {
+        return next.run(req).await;
+    };
+    let Some(role) = crate::auth::required_role(req.method().as_str(), req.uri().path()) else {
+        return next.run(req).await;
+    };
+    let header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let Some(key) = keys.authenticate(header) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({ "error": "missing or invalid API key" })),
+        )
+            .into_response();
+    };
+    if !key.allows(role) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": format!("key {:?} lacks the {role:?} role", key.id) })),
+        )
+            .into_response();
+    }
+    req.extensions_mut().insert(KeyId(key.id.clone()));
+    next.run(req).await
+}
+
+/// Records a takedown: which key asked, for which documents, and the token that proves it
+/// (target `cairn_server::audit`, on by default).
+fn audit_takedown(key: Option<&KeyId>, ids: &[u64], resp: &Json<Json_>) {
+    let shown: Vec<u64> = ids.iter().copied().take(100).collect();
+    tracing::info!(
+        target: "cairn_server::audit",
+        key = key.map_or("-", |k| k.0.as_str()),
+        count = ids.len(),
+        ids = ?shown,
+        token = resp.0["consistency_token"].as_str().unwrap_or(""),
+        "takedown"
+    );
 }
 
 /// The routes, for tests and embedding.
@@ -137,6 +243,10 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/documents/{id}", get(get_doc).delete(delete_one))
         .route("/v1/search", post(search))
         .route("/v1/admin/merges", get(merges).post(set_merges))
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            authorize,
+        ))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(shared)
 }
@@ -500,6 +610,7 @@ struct DeleteBody {
 
 async fn delete_many(
     State(s): State<Arc<Shared>>,
+    key: Option<axum::Extension<KeyId>>,
     Json(body): Json<DeleteBody>,
 ) -> ApiResult<Json<Json_>> {
     if body.ids.is_empty() {
@@ -508,7 +619,9 @@ async fn delete_many(
     let ids: Vec<DocId> = body.ids.iter().copied().map(DocId).collect();
     let n = ids.len();
     let tokens = with_client(&s, move |c| c.delete(ids)).await?;
-    ack(n, &tokens, body.after.as_deref())
+    let resp = ack(n, &tokens, body.after.as_deref())?;
+    audit_takedown(key.as_deref(), &body.ids, &resp);
+    Ok(resp)
 }
 
 #[derive(Deserialize)]
@@ -519,11 +632,14 @@ struct ReadParams {
 
 async fn delete_one(
     State(s): State<Arc<Shared>>,
+    key: Option<axum::Extension<KeyId>>,
     Path(id): Path<u64>,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Json<Json_>> {
     let tokens = with_client(&s, move |c| c.delete(vec![DocId(id)])).await?;
-    ack(1, &tokens, p.after.as_deref())
+    let resp = ack(1, &tokens, p.after.as_deref())?;
+    audit_takedown(key.as_deref(), &[id], &resp);
+    Ok(resp)
 }
 
 async fn get_doc(

@@ -2,7 +2,8 @@
 #   podman build -f docker/Dockerfile -t cairn:dev .   (or docker build ...)
 # Run one development node:
 #   podman run -p 7200:7200 -p 7100:7100 -v cairn-data:/data cairn:dev
-# HTTP/JSON API on 7200 (ADR 0023), binary protocol on 7100.
+# HTTP/JSON API on 7200 (ADR 0023), binary protocol on 7100. The first start prints an admin
+# API key in the logs (ADR 0030): podman logs <container> | grep cairn_
 FROM docker.io/library/rust:1-bookworm AS build
 WORKDIR /src
 COPY . .

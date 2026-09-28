@@ -34,22 +34,27 @@ has dropped it. Cairn replaces that with:
 ## Quick start (Docker)
 
 ```bash
-docker build -f docker/Dockerfile -t cairn:dev .       # or podman
-docker run -p 7200:7200 -v cairn-data:/data cairn:dev  # one development node, HTTP on 7200
-docker compose -f docker/compose.cluster.yaml up -d    # three replicated nodes (HTTP 7201-7203)
+docker build -f docker/Dockerfile -t cairn:dev .                # or podman
+docker run -d --name cairn -p 7200:7200 -v cairn-data:/data cairn:dev
+export KEY=$(docker logs cairn 2>&1 | grep -o 'cairn_[A-Za-z0-9_-]*' | head -1)   # admin key, printed once
 ```
 
 ```bash
 # Write, then search with the write's token: the result reflects it.
-curl -s 127.0.0.1:7200/v1/documents -H content-type:application/json \
+curl -s 127.0.0.1:7200/v1/documents -H "Authorization: Bearer $KEY" -H content-type:application/json \
   -d '{"documents":[{"id":1,"text":"nuclear energy debate","source":"tv"}]}'
 # {"consistency_token":"2.2","count":1}
-curl -s 127.0.0.1:7200/v1/search -H content-type:application/json \
+curl -s 127.0.0.1:7200/v1/search -H "Authorization: Bearer $KEY" -H content-type:application/json \
   -d '{"text":{"field":"text","query":"nuclear"},"after":"2.2"}'
 
-# Take it down: with the new token, no node returns it again.
-curl -s -X DELETE 127.0.0.1:7200/v1/documents/1
+# Take it down: with the new token, no node returns it again. The takedown is audited.
+curl -s -X DELETE 127.0.0.1:7200/v1/documents/1 -H "Authorization: Bearer $KEY"
 ```
+
+API keys carry roles (`read`, `write`, `takedown`, `admin`); `cairn-server keygen` creates them,
+and HTTPS is one flag away ([ADR 0030](docs/adr/0030-http-authentication.md)). Three replicated
+nodes: `CAIRN_HTTP_ADMIN_KEY=<secret> docker compose -f docker/compose.cluster.yaml up -d`
+(HTTP 7201-7203).
 
 The HTTP/JSON API is documented in [docs/api/http.md](docs/api/http.md), with an
 [OpenAPI description](docs/api/openapi.yaml). Configuration uses environment variables
@@ -84,8 +89,9 @@ targets on freshly ingested nodes until the allocator was changed
   shards needs a reload; dynamic membership is on the roadmap.
 - **One region.** Nodes should sit within a few milliseconds of each other (zones of one
   cloud region, or nearby datacenters).
-- **The HTTP port has no TLS or authentication.** Put an authenticating TLS proxy in front.
-  Node-to-node traffic uses mutual TLS ([ADR 0018](docs/adr/0018-versioned-contract-and-mtls.md)).
+- **API keys are static files per node.** No key rotation service or external identity
+  provider (OIDC) yet. Node-to-node traffic uses mutual TLS
+  ([ADR 0018](docs/adr/0018-versioned-contract-and-mtls.md)).
 - **Protocol versions** are checked on every connection, but upgrading across a protocol
   change needs a full-cluster restart.
 - Ingest throughput depends on how fast index builds keep up. At 50M on 3 nodes, the last run

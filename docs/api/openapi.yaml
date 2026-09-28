@@ -4,14 +4,18 @@ info:
   version: "0.1"
   description: >
     Hybrid search (vectors, BM25, filters) with a deletion guarantee: a takedown is final for
-    any read that passes its consistency token as `after`. See docs/api/http.md and ADR 0023.
+    any read that passes its consistency token as `after`. See docs/api/http.md, ADR 0023 and,
+    for API keys and roles, ADR 0030.
   license: { name: Apache-2.0, identifier: Apache-2.0 }
 servers:
   - url: http://localhost:7200
+security:
+  - apiKey: []
 paths:
   /health:
     get:
       summary: Liveness
+      security: []
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
   /v1/schema:
@@ -114,6 +118,14 @@ paths:
                   hits: { type: array, items: { $ref: "#/components/schemas/Hit" } }
         "400": { $ref: "#/components/responses/Error" }
 components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: >
+        An API key (ADR 0030). Roles: read (reads, search, schema), write (upserts), takedown
+        (deletions), admin (status, merge pause, and everything else). 401 without a valid key,
+        403 without the role.
   parameters:
     Consistency:
       name: consistency

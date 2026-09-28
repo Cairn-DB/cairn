@@ -26,7 +26,10 @@ impl Drop for Proc {
     }
 }
 
-/// One HTTP/1.1 request with `Connection: close`; returns the status and the JSON body.
+/// The admin key every test node accepts (CAIRN_HTTP_ADMIN_KEY, ADR 0030).
+const ADMIN: &str = "test-admin-key-0123456789";
+
+/// One HTTP/1.1 request with `Connection: close`, as admin; returns the status and the JSON body.
 fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -34,6 +37,7 @@ fn http(addr: SocketAddr, method: &str, path: &str, body: Option<&Value>) -> (u1
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\
+         Authorization: Bearer {ADMIN}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
         payload.len()
     )
@@ -100,7 +104,8 @@ fn http_api_end_to_end() {
             .arg("--schema")
             .arg(&schema_path)
             .args(["--shards", "3", "--cores", "2", "--tick-ms", "20"])
-            .args(["--memtable-bytes", "4000"]);
+            .args(["--memtable-bytes", "4000"])
+            .env("CAIRN_HTTP_ADMIN_KEY", ADMIN);
         for (j, a) in raft.iter().enumerate() {
             cmd.arg("--peer").arg(format!("{}={a}", j + 1));
         }
@@ -347,6 +352,7 @@ fn http_next_to_mtls_needs_explicit_consent() {
             .arg("--tls-key")
             .arg(dir.join("node1.key"))
             .args(["--shards", "2", "--cores", "2", "--tick-ms", "20"])
+            .env("CAIRN_HTTP_ADMIN_KEY", ADMIN)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         if allow {
