@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod auth;
+pub mod catalog;
 pub mod http;
 pub mod node;
 

@@ -95,6 +95,46 @@ paths:
                   deleted: { type: integer, description: Documents removed (deletion by filter) }
                   consistency_token: { $ref: "#/components/schemas/Token" }
         "400": { $ref: "#/components/responses/Error" }
+  /v1/collections:
+    get:
+      summary: Live collections, default first
+      responses:
+        "200":
+          description: Collections
+          content:
+            application/json:
+              schema: { type: object, properties: { collections: { type: array, items: { $ref: "#/components/schemas/Collection" } } } }
+    post:
+      summary: Create a collection (admin); answers once every shard has a leader
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, schema]
+              properties:
+                name: { type: string, pattern: "^[a-z0-9_-]{1,64}$" }
+                schema: { type: object, description: "{fields: [{name, kind}]}, as in --schema" }
+                shards: { type: integer, minimum: 1, maximum: 1024 }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Collection" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/collections/{c}:
+    parameters:
+      - { name: c, in: path, required: true, schema: { type: string } }
+    get:
+      summary: A collection's definition
+      responses:
+        "200": { description: Definition, content: { application/json: { schema: { $ref: "#/components/schemas/Collection" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Drop a collection and delete its data on every node (admin)
+      responses:
+        "200": { description: Dropped, content: { application/json: { schema: { type: object, properties: { dropped: { type: string } } } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/tenants/{tenant}:
     delete:
       summary: Erase a tenant (every document it holds; unscoped keys with the takedown role)
@@ -196,6 +236,15 @@ components:
     Consistency:
       type: string
       enum: [linearizable, read_your_writes, stale]
+    Collection:
+      type: object
+      properties:
+        name: { type: string }
+        shards: { type: integer }
+        schema: { type: object }
+      description: >
+        Every document route also exists under /v1/collections/{c}/ (documents, documents/{id},
+        documents/delete, search, schema, tenants/{tenant}), with the same bodies and answers.
     Tenant:
       type: string
       pattern: "^[A-Za-z0-9_.-]{1,128}$"

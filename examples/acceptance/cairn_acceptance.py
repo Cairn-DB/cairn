@@ -10,6 +10,7 @@ of the Docker image: embedding[384], text, source, tags, created, payload), then
 - updates;
 - takedowns, never read again through any node;
 - text ids, deletion by filter and tenants (0.2);
+- collections (0.3);
 - input errors;
 - administration.
 
@@ -503,6 +504,47 @@ def run(api, n, rep):
                                                   "with_documents": False, "after": token}, node=node)
         ok &= st == 200 and res["hits"] == []
     rep.check("tenants: an erased tenant's documents are gone on every node", ok)
+
+    # --- collections (0.3): created through one node, used through every node, dropped.
+    name = "acceptance-notes"
+    api.call("DELETE", f"/v1/collections/{name}")  # a leftover from an interrupted run
+    schema = {"fields": [{"name": "embedding", "kind": {"Vector": {"dims": 8, "metric": "Cosine"}}},
+                         {"name": "body", "kind": "Text"}, {"name": "parent", "kind": "Enum"}]}
+    st, created = api.call("POST", "/v1/collections", {"name": name, "schema": schema, "shards": 2}, node=0)
+    rep.check("collections: create one with its own schema -> 201", st == 201 and created.get("shards") == 2,
+              f"status {st} {str(created)[:80]}")
+    st, _ = api.call("POST", "/v1/collections", {"name": name, "schema": schema})
+    rep.check("collections: the same name again -> 409", st == 409, f"status {st}")
+    notes = [{"id": f"note-{i}", "embedding": [1.0 if j == i % 8 else 0.1 for j in range(8)],
+              "body": f"narwhal note {i}", "parent": f"p{i % 2}"} for i in range(10)]
+    st, ack = api.call("POST", f"/v1/collections/{name}/documents", {"documents": notes},
+                       node=len(api.urls) - 1)
+    ctoken = ack.get("consistency_token", "") if st == 200 else ""
+    ok = st == 200
+    for node in nodes:
+        st, res = api.call("POST", f"/v1/collections/{name}/search",
+                           {"k": 50, "text": {"field": "body", "query": "narwhal"}, "after": ctoken}, node=node)
+        ok &= st == 200 and len(res["hits"]) == 10
+        st, res = api.call("POST", "/v1/search", {"k": 50, "text": {"field": "text", "query": "narwhal"}}, node=node)
+        ok &= st == 200 and res["hits"] == []
+    rep.check("collections: its documents are found through every node, and not in default", ok)
+    st, ack = api.call("POST", f"/v1/collections/{name}/documents/delete",
+                       {"filter": {"field": "parent", "eq": "p0"}, "after": ctoken})
+    rep.check("collections: deletion by parent inside a collection", st == 200 and ack.get("deleted") == 5,
+              f"status {st} {str(ack)[:80]}")
+    st, _ = api.call("DELETE", f"/v1/collections/{name}", node=1 % len(api.urls))
+    ok = st == 200
+    for node in nodes:
+        for _ in range(50):
+            st, res = api.call("GET", "/v1/collections", node=node)
+            if st == 200 and name not in [c["name"] for c in res["collections"]]:
+                break
+            time.sleep(0.1)
+        else:
+            ok = False
+        st, _ = api.call("POST", f"/v1/collections/{name}/search", {"k": 5}, node=node)
+        ok &= st == 404
+    rep.check("collections: dropped, gone from every node", ok)
 
     # --- consistency levels
     st, _ = api.call("POST", "/v1/search", {"k": 3, "text": {"field": "text", "query": "museum"},

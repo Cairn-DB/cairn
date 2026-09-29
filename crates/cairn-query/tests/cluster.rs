@@ -1101,9 +1101,13 @@ fn a_stopped_replica_closes_cleanly_and_reopens() {
     });
     let (sim2, hh) = (sim.clone(), ex.handle());
     let again = ex.block_on(async move {
-        Replica::spawn(sim2.runtime(NodeId(3), &hh), config(NodeId(3), 6000), schema())
-            .await
-            .unwrap()
+        Replica::spawn(
+            sim2.runtime(NodeId(3), &hh),
+            config(NodeId(3), 6000),
+            schema(),
+        )
+        .await
+        .unwrap()
     });
     let rt = sim.runtime(NodeId(9), &ex.handle());
     let hs = vec![handles[0].clone(), handles[1].clone(), again];

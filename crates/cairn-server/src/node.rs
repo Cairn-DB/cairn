@@ -1,8 +1,9 @@
 //! Node assembly: core threads, shard replicas, node dispatcher, client coordinator.
 
+use crate::catalog::{self, CATALOG_SHARD, CollectionDef};
 use bytes::Bytes;
 use cairn_core::{DocId, Document, Error, HashMap, NodeId, Result, Runtime as _, Schema, ShardId};
-use cairn_proto::{Request, Response, shard_of, shard_of_key};
+use cairn_proto::{Request, Response};
 use cairn_query::{
     Applied, Consistency, EngineConfig, Hit, LegList, Query, Replica, ReplicaConfig, ReplicaHandle,
     ReplicaStatus, Token, fuse,
@@ -13,9 +14,34 @@ use cairn_runtime::{
     CrossQueue, CrossReceiver, CrossSender, Executor, TcpNetwork, TcpNetworkConfig, cross_oneshot,
 };
 use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+/// Serializes catalog changes on this node (the catalog leader).
+struct CatalogLock;
+
+static CATALOG_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl CatalogLock {
+    async fn acquire(rt: &Runtime) -> CatalogLock {
+        while CATALOG_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            rt.sleep(cairn_core::Duration::from_millis(10)).await;
+        }
+        CatalogLock
+    }
+}
+
+impl Drop for CatalogLock {
+    fn drop(&mut self) {
+        CATALOG_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The replicas one core runs, by shard; collections add and remove them at run time.
+type Handles = Rc<RefCell<HashMap<ShardId, ReplicaHandle>>>;
 
 /// Node configuration.
 #[derive(Debug, Clone)]
@@ -97,6 +123,22 @@ enum CoreRequest {
         shard: ShardId,
         reply: CrossSender<Option<ReplicaStatus>>,
     },
+    /// Reads every catalog entry from this node's catalog replica.
+    CatalogRead {
+        consistency: Consistency,
+        reply: CrossSender<Result<Vec<Document>>>,
+    },
+    /// Starts this node's replica of a collection shard (idempotent): `true` once running.
+    Start {
+        shard: ShardId,
+        def: Arc<CollectionDef>,
+        reply: CrossSender<bool>,
+    },
+    /// Stops this node's replica of a shard, if it runs one; answers once its files are closed.
+    Stop {
+        shard: ShardId,
+        reply: CrossSender<()>,
+    },
 }
 
 /// What a point read targets: an internal id, or a text id resolved by the shard (ADR 0031).
@@ -109,15 +151,14 @@ enum ReadTarget {
 /// Checks documents before they are proposed (a document the log cannot apply is refused here,
 /// with a message, rather than skipped by every replica). A client may send only the fields of
 /// its own schema: the reserved ones (ADR 0031) are then appended, empty.
-fn prepare_docs(cfg: &NodeConfig, docs: Vec<Document>, keyed: bool) -> Result<Vec<Document>> {
-    let n = cfg.schema.fields.len();
-    let user = cfg
-        .schema
+fn prepare_docs(schema: &Schema, docs: Vec<Document>, keyed: bool) -> Result<Vec<Document>> {
+    let n = schema.fields.len();
+    let user = schema
         .fields
         .iter()
         .filter(|f| !cairn_core::schema::is_reserved(&f.name))
         .count();
-    let key_field = cfg.schema.index_of(cairn_core::schema::KEY_FIELD);
+    let key_field = schema.index_of(cairn_core::schema::KEY_FIELD);
     docs.into_iter()
         .map(|mut d| {
             if d.values.len() == user && user < n {
@@ -137,7 +178,7 @@ fn prepare_docs(cfg: &NodeConfig, docs: Vec<Document>, keyed: bool) -> Result<Ve
                     )));
                 }
             }
-            d.validate(&cfg.schema)
+            d.validate(schema)
                 .map_err(|e| Error::InvalidRequest(e.to_string()))?;
             Ok(d)
         })
@@ -205,12 +246,42 @@ pub fn placement(cfg: &NodeConfig, shard: ShardId) -> Vec<NodeId> {
     } else {
         cfg.replication.min(n)
     };
+    if shard == CATALOG_SHARD {
+        // The catalog lives on every node, so every node can read it locally.
+        return nodes;
+    }
     let start = shard.get() as usize % n;
     (0..rf).map(|j| nodes[(start + j) % n]).collect()
 }
 
+/// The collection given at startup.
+fn default_collection(cfg: &NodeConfig) -> CollectionDef {
+    CollectionDef {
+        name: catalog::DEFAULT.into(),
+        id: 0,
+        base: 0,
+        shards: cfg.shards,
+        schema: cfg.schema.clone(),
+    }
+}
+
 fn hosts(cfg: &NodeConfig, shard: ShardId) -> bool {
     placement(cfg, shard).contains(&cfg.id)
+}
+
+/// Index build threads for one replica (ADR 0019).
+fn build_pool(cfg: &NodeConfig) -> std::sync::Arc<cairn_runtime::ThreadParallel> {
+    std::sync::Arc::new(cairn_runtime::ThreadParallel::background(
+        if cfg.build_threads == 0 {
+            auto_build_threads(
+                std::thread::available_parallelism().map_or(1, |n| n.get()),
+                cfg.compaction_slots,
+            )
+        } else {
+            cfg.build_threads
+        },
+        BUILD_NICE,
+    ))
 }
 
 fn core_of(shard: ShardId, cores: usize) -> usize {
@@ -223,6 +294,13 @@ impl Node {
     pub fn start(cfg: NodeConfig) -> Result<Node> {
         std::fs::create_dir_all(&cfg.data_dir)
             .map_err(|e| Error::io(cairn_core::error::IoErrorKind::Other, e))?;
+        if cfg.shards == 0 || cfg.shards > catalog::MAX_SHARD {
+            return Err(Error::InvalidRequest(format!(
+                "--shards must be between 1 and {}",
+                catalog::MAX_SHARD
+            )));
+        }
+        catalog::install(catalog::from_entries(default_collection(&cfg), &[]));
         job_slots(cfg.compaction_slots).set_merges_paused(cfg.merges_paused);
         let cores_n = cfg.cores.max(1);
         let queues: Queues = Arc::new((0..cores_n).map(|_| CrossQueue::new()).collect());
@@ -293,7 +371,11 @@ impl Node {
         };
         let disk = PoolDisk::new(&cfg.data_dir, ex.reactor().completer()).expect("data dir");
         let rt = PoolRuntime::new(ex.handle(), disk, net);
-        let handles = ex.block_on(Self::spawn_replicas(rt.clone(), cfg.clone(), core));
+        let handles: Handles = Rc::new(RefCell::new(ex.block_on(Self::spawn_replicas(
+            rt.clone(),
+            cfg.clone(),
+            core,
+        ))));
         let queue = queues[core].clone();
         let (rt2, h2, cfg2) = (rt.clone(), handles.clone(), cfg.clone());
         rt.spawn(async move {
@@ -303,74 +385,74 @@ impl Node {
         });
         if core == 0 {
             Self::spawn_dispatcher(&rt, queues.clone(), cfg.cores.max(1));
+            Self::spawn_reconciler(&rt, queues.clone(), cfg.clone());
             Self::spawn_coordinator(&rt, queues, cfg);
         }
         let _ = ex.run();
     }
 
+    /// Replica settings for one shard, stored under `dir`.
+    fn replica_config(cfg: &NodeConfig, shard: ShardId, dir: String) -> ReplicaConfig {
+        ReplicaConfig {
+            shard,
+            id: cfg.id,
+            peers: placement(cfg, shard),
+            tick: cairn_core::Duration::from_millis(cfg.tick_ms),
+            election_ticks: 10,
+            heartbeat_ticks: 2,
+            engine: EngineConfig {
+                store: StoreConfig {
+                    memtable_max_bytes: cfg.memtable_max_bytes,
+                    max_segments: cfg.max_segments,
+                    target_segment_rows: cfg.target_segment_rows,
+                    log: LogConfig::default(),
+                    shard: shard.get(),
+                    ..StoreConfig::default()
+                },
+                vector: cairn_index::VectorIndexParams {
+                    keep_f32: !cfg.sq8_only,
+                    disk: cfg.disk_index,
+                    vamana: cairn_index::diskann::VamanaParams {
+                        passes: cfg.vamana_passes,
+                        ..Default::default()
+                    },
+                    ..cairn_index::VectorIndexParams::default()
+                },
+            },
+            dir,
+            seed: u64::from(cfg.id.get()) * 1000 + u64::from(shard.get()),
+            own_receiver: false,
+            idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
+            compaction_slots: Some(job_slots(cfg.compaction_slots)),
+            ship_segments: cfg.ship_segments,
+            preferred_leader: cfg
+                .leader_balancing
+                .then(|| placement(cfg, shard).first().copied())
+                .flatten(),
+            build_parallel: Some(build_pool(cfg)),
+        }
+    }
+
+    /// The replicas a core starts with: its shards of `default`, and the catalog. Other
+    /// collections are started by the reconciler once the catalog is read.
     async fn spawn_replicas(
         rt: Runtime,
         cfg: NodeConfig,
         core: usize,
     ) -> HashMap<ShardId, ReplicaHandle> {
         let mut handles = HashMap::default();
-        let slots = job_slots(cfg.compaction_slots);
-        for s in 0..cfg.shards {
-            let shard = ShardId(s);
+        let default = default_collection(&cfg);
+        let mut wanted: Vec<(ShardId, String, Schema)> = default
+            .shard_ids()
+            .map(|s| (s, default.shard_dir(s), cfg.schema.clone()))
+            .collect();
+        wanted.push((CATALOG_SHARD, "catalog".into(), catalog::catalog_schema()));
+        for (shard, dir, schema) in wanted {
             if core_of(shard, cfg.cores) != core || !hosts(&cfg, shard) {
                 continue;
             }
-            let rc = ReplicaConfig {
-                shard,
-                id: cfg.id,
-                peers: placement(&cfg, shard),
-                tick: cairn_core::Duration::from_millis(cfg.tick_ms),
-                election_ticks: 10,
-                heartbeat_ticks: 2,
-                engine: EngineConfig {
-                    store: StoreConfig {
-                        memtable_max_bytes: cfg.memtable_max_bytes,
-                        max_segments: cfg.max_segments,
-                        target_segment_rows: cfg.target_segment_rows,
-                        log: LogConfig::default(),
-                        shard: s,
-                        ..StoreConfig::default()
-                    },
-                    vector: cairn_index::VectorIndexParams {
-                        keep_f32: !cfg.sq8_only,
-                        disk: cfg.disk_index,
-                        vamana: cairn_index::diskann::VamanaParams {
-                            passes: cfg.vamana_passes,
-                            ..Default::default()
-                        },
-                        ..cairn_index::VectorIndexParams::default()
-                    },
-                },
-                dir: format!("shard{s}"),
-                seed: u64::from(cfg.id.get()) * 1000 + u64::from(s),
-                own_receiver: false,
-                idle_flush_ticks: (cfg.idle_flush_ms / cfg.tick_ms.max(1)) as u32,
-                compaction_slots: Some(slots.clone()),
-                ship_segments: cfg.ship_segments,
-                preferred_leader: cfg
-                    .leader_balancing
-                    .then(|| placement(&cfg, shard).first().copied())
-                    .flatten(),
-                build_parallel: Some(std::sync::Arc::new(
-                    cairn_runtime::ThreadParallel::background(
-                        if cfg.build_threads == 0 {
-                            auto_build_threads(
-                                std::thread::available_parallelism().map_or(1, |n| n.get()),
-                                cfg.compaction_slots,
-                            )
-                        } else {
-                            cfg.build_threads
-                        },
-                        BUILD_NICE,
-                    ),
-                )),
-            };
-            match Replica::spawn(rt.clone(), rc, cfg.schema.clone()).await {
+            let rc = Self::replica_config(&cfg, shard, dir);
+            match Replica::spawn(rt.clone(), rc, schema).await {
                 Ok(h) => {
                     handles.insert(shard, h);
                 }
@@ -380,20 +462,56 @@ impl Node {
         handles
     }
 
-    fn serve(
-        rt: &Runtime,
-        cfg: &NodeConfig,
-        handles: &HashMap<ShardId, ReplicaHandle>,
-        req: CoreRequest,
-    ) {
+    fn serve(rt: &Runtime, cfg: &NodeConfig, handles: &Handles, req: CoreRequest) {
         let shard = match &req {
             CoreRequest::Net { shard, .. }
             | CoreRequest::Propose { shard, .. }
             | CoreRequest::Get { shard, .. }
             | CoreRequest::QueryLegs { shard, .. }
-            | CoreRequest::Status { shard, .. } => *shard,
+            | CoreRequest::Status { shard, .. }
+            | CoreRequest::Start { shard, .. }
+            | CoreRequest::Stop { shard, .. } => *shard,
+            CoreRequest::CatalogRead { .. } => CATALOG_SHARD,
         };
-        let Some(h) = handles.get(&shard).cloned() else {
+        let req = match req {
+            CoreRequest::Start { shard, def, reply } => {
+                if handles.borrow().contains_key(&shard) {
+                    reply.send(true);
+                    return;
+                }
+                let (rt2, cfg2, handles2) = (rt.clone(), cfg.clone(), handles.clone());
+                rt.spawn(async move {
+                    let rc = Self::replica_config(&cfg2, shard, def.shard_dir(shard));
+                    match Replica::spawn(rt2, rc, def.schema.clone()).await {
+                        Ok(h) => {
+                            let mut m = handles2.borrow_mut();
+                            // A concurrent start of the same shard won: keep it.
+                            m.entry(shard).or_insert(h);
+                            tracing::info!(node = %cfg2.id, %shard, collection = %def.name, "replica started");
+                            reply.send(true);
+                        }
+                        Err(e) => {
+                            tracing::error!(%shard, collection = %def.name, "cannot start replica: {e}");
+                            reply.send(false);
+                        }
+                    }
+                });
+                return;
+            }
+            CoreRequest::Stop { shard, reply } => {
+                let h = handles.borrow_mut().remove(&shard);
+                rt.spawn(async move {
+                    if let Some(h) = h {
+                        h.stop().await;
+                    }
+                    reply.send(());
+                });
+                return;
+            }
+            other => other,
+        };
+        let found = handles.borrow().get(&shard).cloned();
+        let Some(h) = found else {
             // Not hosted here: point the coordinator at a hosting node (rotating, so reads
             // that any replica may serve spread over the shard's replicas).
             static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -413,7 +531,8 @@ impl Node {
                 CoreRequest::Get { reply, .. } => reply.send(Err(e())),
                 CoreRequest::QueryLegs { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Status { reply, .. } => reply.send(None),
-                CoreRequest::Net { .. } => {}
+                CoreRequest::CatalogRead { reply, .. } => reply.send(Err(e())),
+                CoreRequest::Net { .. } | CoreRequest::Start { .. } | CoreRequest::Stop { .. } => {}
             }
             return;
         };
@@ -442,6 +561,23 @@ impl Node {
             CoreRequest::Status { reply, .. } => {
                 rt.spawn(async move { reply.send(h.status().await) })
             }
+            CoreRequest::CatalogRead { consistency, reply } => rt.spawn(async move {
+                let mut q = Query::new(10_000);
+                q.filter = cairn_core::Predicate::In {
+                    field: 0,
+                    values: vec![
+                        cairn_core::Value::Enum("collection".into()),
+                        cairn_core::Value::Enum("dropped".into()),
+                    ],
+                };
+                q.with_documents = true;
+                reply.send(
+                    h.query(q, consistency)
+                        .await
+                        .map(|hits| hits.into_iter().filter_map(|hit| hit.document).collect()),
+                )
+            }),
+            CoreRequest::Start { .. } | CoreRequest::Stop { .. } => unreachable!("handled above"),
         }
     }
 
@@ -556,7 +692,7 @@ impl Node {
         offload(&rt.completer(), move || {
             let conn = {
                 let mut m = peer_conns().lock().expect("peer conns");
-                match m.get(&node) {
+                match m.get(&node).filter(|c| !c.is_closed()) {
                     Some(c) => c.clone(),
                     None => {
                         let c = Arc::new(ClientConn::connect_with(
@@ -595,6 +731,7 @@ impl Node {
         rt: &Runtime,
         queues: &Queues,
         cfg: &NodeConfig,
+        coll: &CollectionDef,
         shard: ShardId,
         cmd: Command,
         may_forward: bool,
@@ -631,7 +768,7 @@ impl Node {
                         return Ok((Vec::new(), 0));
                     }
                 };
-                match Self::forward(rt, cfg, l, shard, req).await {
+                match Self::forward(rt, cfg, l, shard, Self::wrap(coll, req)).await {
                     Response::Ack(tokens) => Ok((tokens, 0)),
                     Response::Deleted { count, tokens } => Ok((tokens, count)),
                     Response::Error {
@@ -648,10 +785,12 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_routed(
         rt: &Runtime,
         queues: &Queues,
         cfg: &NodeConfig,
+        coll: &CollectionDef,
         shard: ShardId,
         target: ReadTarget,
         consistency: Consistency,
@@ -684,13 +823,26 @@ impl Node {
                         tokens: Vec::new(),
                     },
                 };
-                Self::forward(rt, cfg, l, shard, req).await
+                Self::forward(rt, cfg, l, shard, Self::wrap(coll, req)).await
             }
             Some(Err(e)) => Response::from_error(&e),
             None => Response::Error {
                 message: "core stopped".into(),
                 leader_hint: None,
             },
+        }
+    }
+
+    /// A request for a collection other than `default` is sent to another node wrapped with
+    /// the collection's name, which that node resolves again.
+    fn wrap(coll: &CollectionDef, req: Request) -> Request {
+        if coll.id == 0 {
+            req
+        } else {
+            Request::In {
+                collection: coll.name.clone(),
+                req: Box::new(req),
+            }
         }
     }
 
@@ -701,11 +853,57 @@ impl Node {
         req: Request,
         may_forward: bool,
     ) -> Response {
-        let cores = cfg.cores.max(1);
         match req {
             Request::Forwarded(inner) => {
                 Box::pin(Self::handle(rt, queues, cfg, *inner, false)).await
             }
+            Request::In { collection, req } => {
+                match Self::resolve(rt, queues, cfg, &collection).await {
+                    Ok(c) => {
+                        Box::pin(Self::handle_in(rt, queues, cfg, &c, *req, may_forward)).await
+                    }
+                    Err(e) => Response::from_error(&e),
+                }
+            }
+            req @ (Request::CreateCollection { .. }
+            | Request::DropCollection { .. }
+            | Request::ListCollections) => {
+                Box::pin(Self::catalog_request(rt, queues, cfg, req, may_forward)).await
+            }
+            other => {
+                let default = catalog::current()
+                    .get(catalog::DEFAULT)
+                    .expect("the default collection is always known");
+                Self::handle_in(rt, queues, cfg, &default, other, may_forward).await
+            }
+        }
+    }
+
+    async fn handle_in(
+        rt: &Runtime,
+        queues: &Queues,
+        cfg: &NodeConfig,
+        coll: &CollectionDef,
+        req: Request,
+        may_forward: bool,
+    ) -> Response {
+        let cores = cfg.cores.max(1);
+        macro_rules! route {
+            ($e:expr) => {
+                match $e {
+                    Ok(s) => s,
+                    Err(e) => return Response::from_error(&e),
+                }
+            };
+        }
+        match req {
+            Request::Forwarded(_)
+            | Request::In { .. }
+            | Request::CreateCollection { .. }
+            | Request::DropCollection { .. }
+            | Request::ListCollections => Response::from_error(&Error::InvalidRequest(
+                "this request cannot target a collection".into(),
+            )),
             Request::SetMergesPaused(paused) => {
                 job_slots(cfg.compaction_slots).set_merges_paused(paused);
                 tracing::info!(node = %cfg.id, paused, "merges paused set");
@@ -731,16 +929,13 @@ impl Node {
                 },
             },
             Request::Upsert(docs) => {
-                let docs = match prepare_docs(cfg, docs, false) {
+                let docs = match prepare_docs(&coll.schema, docs, false) {
                     Ok(d) => d,
                     Err(e) => return Response::from_error(&e),
                 };
                 let mut groups: HashMap<ShardId, Vec<Document>> = HashMap::default();
                 for d in docs {
-                    groups
-                        .entry(shard_of(d.id, cfg.shards))
-                        .or_default()
-                        .push(d);
+                    groups.entry(route!(coll.route(d.id))).or_default().push(d);
                 }
                 let mut tokens = Vec::new();
                 for (shard, group) in groups {
@@ -748,6 +943,7 @@ impl Node {
                         rt,
                         queues,
                         cfg,
+                        coll,
                         shard,
                         Command::Upsert(group),
                         may_forward,
@@ -764,7 +960,7 @@ impl Node {
             Request::Delete(ids) => {
                 let mut groups: HashMap<ShardId, Vec<DocId>> = HashMap::default();
                 for id in ids {
-                    groups.entry(shard_of(id, cfg.shards)).or_default().push(id);
+                    groups.entry(route!(coll.route(id))).or_default().push(id);
                 }
                 let mut tokens = Vec::new();
                 for (shard, group) in groups {
@@ -772,6 +968,7 @@ impl Node {
                         rt,
                         queues,
                         cfg,
+                        coll,
                         shard,
                         Command::Delete(group),
                         may_forward,
@@ -786,11 +983,11 @@ impl Node {
                 Response::Ack(tokens)
             }
             Request::UpsertKeyed(docs) => {
-                let docs = match prepare_docs(cfg, docs, true) {
+                let docs = match prepare_docs(&coll.schema, docs, true) {
                     Ok(d) => d,
                     Err(e) => return Response::from_error(&e),
                 };
-                let Some(field) = cfg.schema.index_of(cairn_core::schema::KEY_FIELD) else {
+                let Some(field) = coll.schema.index_of(cairn_core::schema::KEY_FIELD) else {
                     return Response::from_error(&Error::InvalidRequest(
                         "this collection has no text ids".into(),
                     ));
@@ -808,10 +1005,7 @@ impl Node {
                             "a text id must be a non-empty UTF-8 string".into(),
                         ));
                     };
-                    groups
-                        .entry(shard_of_key(&key, cfg.shards))
-                        .or_default()
-                        .push(d);
+                    groups.entry(coll.route_key(&key)).or_default().push(d);
                 }
                 let mut tokens = Vec::new();
                 for (shard, group) in groups {
@@ -819,6 +1013,7 @@ impl Node {
                         rt,
                         queues,
                         cfg,
+                        coll,
                         shard,
                         Command::UpsertKeyed(group),
                         may_forward,
@@ -835,10 +1030,7 @@ impl Node {
             Request::DeleteKeys(keys) => {
                 let mut groups: HashMap<ShardId, Vec<String>> = HashMap::default();
                 for k in keys {
-                    groups
-                        .entry(shard_of_key(&k, cfg.shards))
-                        .or_default()
-                        .push(k);
+                    groups.entry(coll.route_key(&k)).or_default().push(k);
                 }
                 let mut tokens = Vec::new();
                 for (shard, group) in groups {
@@ -846,6 +1038,7 @@ impl Node {
                         rt,
                         queues,
                         cfg,
+                        coll,
                         shard,
                         Command::DeleteKeys(group),
                         may_forward,
@@ -864,24 +1057,24 @@ impl Node {
                 scope,
                 filter,
             } => {
-                if let Err(e) = filter.validate(&cfg.schema) {
+                if let Err(e) = filter.validate(&coll.schema) {
                     return Response::from_error(&Error::InvalidRequest(e.to_string()));
                 }
                 // One command per shard the scope reaches, each resolved by that shard's log.
                 let parts: Vec<(ShardId, DeleteScope)> = match (shard, scope) {
-                    (Some(s), _) if s.get() >= cfg.shards => {
+                    (Some(s), _) if !coll.owns(s) => {
                         return Response::from_error(&Error::InvalidRequest(format!(
                             "no shard {s}"
                         )));
                     }
                     (Some(s), scope) => vec![(s, scope)],
-                    (None, DeleteScope::All) => (0..cfg.shards)
-                        .map(|s| (ShardId(s), DeleteScope::All))
-                        .collect(),
+                    (None, DeleteScope::All) => {
+                        coll.shard_ids().map(|s| (s, DeleteScope::All)).collect()
+                    }
                     (None, DeleteScope::Ids(ids)) => {
                         let mut groups: HashMap<ShardId, Vec<DocId>> = HashMap::default();
                         for id in ids {
-                            groups.entry(shard_of(id, cfg.shards)).or_default().push(id);
+                            groups.entry(route!(coll.route(id))).or_default().push(id);
                         }
                         groups
                             .into_iter()
@@ -891,10 +1084,7 @@ impl Node {
                     (None, DeleteScope::Keys(keys)) => {
                         let mut groups: HashMap<ShardId, Vec<String>> = HashMap::default();
                         for k in keys {
-                            groups
-                                .entry(shard_of_key(&k, cfg.shards))
-                                .or_default()
-                                .push(k);
+                            groups.entry(coll.route_key(&k)).or_default().push(k);
                         }
                         groups
                             .into_iter()
@@ -909,7 +1099,8 @@ impl Node {
                         scope,
                         filter: filter.clone(),
                     };
-                    match Self::propose_routed(rt, queues, cfg, shard, cmd, may_forward).await {
+                    match Self::propose_routed(rt, queues, cfg, coll, shard, cmd, may_forward).await
+                    {
                         Ok((t, n)) => {
                             tokens.extend(t);
                             count += n;
@@ -925,12 +1116,13 @@ impl Node {
                 consistency,
                 tokens,
             } => {
-                let shard = shard_of(id, cfg.shards);
+                let shard = route!(coll.route(id));
                 let consistency = Self::per_shard(consistency, &tokens, shard);
                 Self::get_routed(
                     rt,
                     queues,
                     cfg,
+                    coll,
                     shard,
                     ReadTarget::Id(id),
                     consistency,
@@ -943,12 +1135,13 @@ impl Node {
                 consistency,
                 tokens,
             } => {
-                let shard = shard_of_key(&key, cfg.shards);
+                let shard = coll.route_key(&key);
                 let consistency = Self::per_shard(consistency, &tokens, shard);
                 Self::get_routed(
                     rt,
                     queues,
                     cfg,
+                    coll,
                     shard,
                     ReadTarget::Key(key),
                     consistency,
@@ -962,8 +1155,8 @@ impl Node {
                 tokens,
             } => {
                 let mut receivers = Vec::new();
-                for s in 0..cfg.shards {
-                    let shard = ShardId(s);
+                let shard_list: Vec<ShardId> = coll.shard_ids().collect();
+                for &shard in &shard_list {
                     let c = Self::per_shard(consistency, &tokens, shard);
                     let q = query.clone();
                     receivers.push(Self::send(queues, cores, shard, |reply| {
@@ -980,7 +1173,7 @@ impl Node {
                 let mut outcomes: Vec<Option<Result<Vec<LegList>>>> = Vec::new();
                 let mut forwards: Vec<(usize, CrossReceiver<Response>)> = Vec::new();
                 for (s, rx) in receivers.into_iter().enumerate() {
-                    let shard = ShardId(s as u32);
+                    let shard = shard_list[s];
                     match rx.await {
                         Some(Err(Error::NotLeader {
                             leader_hint: Some(l),
@@ -1012,7 +1205,7 @@ impl Node {
                     }
                 }
                 for (s, frx) in forwards {
-                    let shard = ShardId(s as u32);
+                    let shard = shard_list[s];
                     outcomes[s] = Some(match frx.await {
                         Some(Response::Legs(lists)) => Ok(lists),
                         Some(Response::Error {
@@ -1075,12 +1268,15 @@ impl Node {
                 let mut hits = Vec::with_capacity(fused.len());
                 for (doc_id, score, legs) in fused {
                     let document = if query.with_documents {
-                        let shard = shard_of(doc_id, cfg.shards);
+                        let Ok(shard) = coll.route(doc_id) else {
+                            continue;
+                        };
                         let c = Self::per_shard(consistency, &tokens, shard);
                         match Self::get_routed(
                             rt,
                             queues,
                             cfg,
+                            coll,
                             shard,
                             ReadTarget::Id(doc_id),
                             c,
@@ -1106,8 +1302,12 @@ impl Node {
             }
             Request::Status => {
                 let mut out = Vec::new();
-                for s in 0..cfg.shards {
-                    let shard = ShardId(s);
+                let all: Vec<ShardId> = catalog::current()
+                    .live
+                    .iter()
+                    .flat_map(|c| c.shard_ids().collect::<Vec<_>>())
+                    .collect();
+                for shard in all {
                     if let Some(st) = Self::send(queues, cores, shard, |reply| {
                         CoreRequest::Status { shard, reply }
                     })
@@ -1119,6 +1319,242 @@ impl Node {
                 }
                 Response::Status(out)
             }
+        }
+    }
+
+    /// Reads the catalog from this node's catalog replica.
+    async fn read_catalog(
+        queues: &Queues,
+        cfg: &NodeConfig,
+        consistency: Consistency,
+    ) -> Result<catalog::Catalog> {
+        let docs = Self::send(queues, cfg.cores.max(1), CATALOG_SHARD, |reply| {
+            CoreRequest::CatalogRead { consistency, reply }
+        })
+        .await
+        .ok_or_else(|| Error::Internal("core stopped".into()))??;
+        Ok(catalog::from_entries(default_collection(cfg), &docs))
+    }
+
+    /// A live collection by name: from this node's view, or else from a linearizable read of
+    /// the catalog (a collection just created through another node).
+    async fn resolve(
+        _rt: &Runtime,
+        queues: &Queues,
+        cfg: &NodeConfig,
+        name: &str,
+    ) -> Result<Arc<CollectionDef>> {
+        if let Some(c) = catalog::current().get(name) {
+            return Ok(c);
+        }
+        let fresh = Self::read_catalog(queues, cfg, Consistency::Linearizable).await?;
+        catalog::observe(&fresh.live, &fresh.dropped, true);
+        catalog::current()
+            .get(name)
+            .ok_or_else(|| Error::InvalidRequest(format!("no collection {name:?}")))
+    }
+
+    /// Keeps this node's replicas in line with the catalog: starts the shards it hosts of every
+    /// live collection, stops those of dropped collections and deletes their files. Reads the
+    /// local catalog replica (no leader needed), so a node restarting alone gets its
+    /// collections back.
+    fn spawn_reconciler(rt: &Runtime, queues: Queues, cfg: NodeConfig) {
+        let rt2 = rt.clone();
+        rt.spawn(async move {
+            let mut started: std::collections::HashSet<ShardId> = Default::default();
+            let mut removed: std::collections::HashSet<u32> = Default::default();
+            let cores = cfg.cores.max(1);
+            loop {
+                if let Ok(cat) = Self::read_catalog(&queues, &cfg, Consistency::Stale).await {
+                    catalog::observe(&cat.live, &cat.dropped, false);
+                    let view = catalog::current();
+                    for c in view.live.iter().filter(|c| c.id != 0) {
+                        for shard in c.shard_ids() {
+                            if started.contains(&shard) || !hosts(&cfg, shard) {
+                                continue;
+                            }
+                            let def = c.clone();
+                            let ok = Self::send(&queues, cores, shard, |reply| CoreRequest::Start {
+                                shard,
+                                def,
+                                reply,
+                            })
+                            .await;
+                            if ok == Some(true) {
+                                started.insert(shard);
+                            }
+                        }
+                    }
+                    for d in &view.dropped {
+                        if removed.contains(&d.id) {
+                            continue;
+                        }
+                        for shard in d.shard_ids() {
+                            let _ = Self::send(&queues, cores, shard, |reply| CoreRequest::Stop {
+                                shard,
+                                reply,
+                            })
+                            .await;
+                            started.remove(&shard);
+                        }
+                        let dir = cfg.data_dir.join(catalog::collection_dir(d.id));
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => {
+                                tracing::info!(node = %cfg.id, collection = %d.name, id = d.id, "dropped collection's files deleted");
+                                removed.insert(d.id);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                removed.insert(d.id);
+                            }
+                            Err(e) => tracing::warn!(dir = %dir.display(), "cannot delete a dropped collection: {e}"),
+                        }
+                    }
+                }
+                rt2.sleep(cairn_core::Duration::from_millis(300)).await;
+            }
+        });
+    }
+
+    /// Creates, drops or lists collections. Creations and drops run on the catalog leader,
+    /// one at a time, after a linearizable read: two of them never pick the same id or shards.
+    async fn catalog_request(
+        rt: &Runtime,
+        queues: &Queues,
+        cfg: &NodeConfig,
+        req: Request,
+        may_forward: bool,
+    ) -> Response {
+        let cores = cfg.cores.max(1);
+        if matches!(req, Request::ListCollections) {
+            return match Self::read_catalog(queues, cfg, Consistency::Linearizable).await {
+                Ok(c) => {
+                    catalog::observe(&c.live, &c.dropped, true);
+                    Response::Collections(
+                        c.live
+                            .iter()
+                            .map(|d| serde_json::to_string(d.as_ref()).expect("serializable"))
+                            .collect(),
+                    )
+                }
+                Err(e) => Response::from_error(&e),
+            };
+        }
+        let status = Self::send(queues, cores, CATALOG_SHARD, |reply| CoreRequest::Status {
+            shard: CATALOG_SHARD,
+            reply,
+        })
+        .await
+        .flatten();
+        match status {
+            Some(st) if st.role == cairn_raft::Role::Leader => {}
+            Some(st) => {
+                return match st.leader {
+                    Some(l) if may_forward && l != cfg.id => {
+                        Self::forward(rt, cfg, l, CATALOG_SHARD, req).await
+                    }
+                    hint => Response::from_error(&Error::NotLeader {
+                        shard: CATALOG_SHARD,
+                        leader_hint: hint,
+                    }),
+                };
+            }
+            None => {
+                return Response::from_error(&Error::Internal("no catalog replica".into()));
+            }
+        }
+        let _lock = CatalogLock::acquire(rt).await;
+        let r = async {
+            let cat = Self::read_catalog(queues, cfg, Consistency::Linearizable).await?;
+            let default = default_collection(cfg);
+            match req {
+                Request::CreateCollection {
+                    name,
+                    schema,
+                    shards,
+                } => {
+                    if !catalog::valid_name(&name) || name == catalog::DEFAULT {
+                        return Err(Error::InvalidRequest(format!(
+                            "a collection name is 1 to 64 of a-z, 0-9, '_' and '-', not {name:?} \
+                             (\"default\" is taken)"
+                        )));
+                    }
+                    if shards == 0 || shards > catalog::MAX_SHARDS {
+                        return Err(Error::InvalidRequest(format!(
+                            "shards must be between 1 and {}",
+                            catalog::MAX_SHARDS
+                        )));
+                    }
+                    let user: Schema = serde_json::from_str(&schema)
+                        .map_err(|e| Error::InvalidRequest(format!("schema: {e}")))?;
+                    let schema = Schema::new(user.fields)?.with_reserved()?;
+                    if cat.get(&name).is_some() {
+                        return Err(Error::InvalidRequest(format!(
+                            "collection {name:?} already exists"
+                        )));
+                    }
+                    let (id, base) = cat.next_ids();
+                    if base + shards - 1 > catalog::MAX_SHARD {
+                        return Err(Error::InvalidRequest("no shard ids left".into()));
+                    }
+                    let def = CollectionDef {
+                        name: name.clone(),
+                        id,
+                        base,
+                        shards,
+                        schema,
+                    };
+                    let cmd = Command::UpsertKeyed(vec![catalog::entry_doc(&name, "collection", &def)]);
+                    Self::propose_routed(rt, queues, cfg, &default, CATALOG_SHARD, cmd, false).await?;
+                    catalog::observe(&[Arc::new(def.clone())], &[], false);
+                    tracing::info!(node = %cfg.id, collection = %name, id, base, shards, "collection created");
+                    // Answer once every shard answers a linearizable read (it has a leader).
+                    let t0 = rt.now();
+                    loop {
+                        let probe = Request::Query {
+                            query: Query::new(1),
+                            consistency: Consistency::Linearizable,
+                            tokens: Vec::new(),
+                        };
+                        match Box::pin(Self::handle_in(rt, queues, cfg, &def, probe, true)).await {
+                            Response::Hits(_) => break,
+                            _ if rt.now() - t0 > cairn_core::Duration::from_secs(20) => {
+                                return Err(Error::Internal(format!(
+                                    "collection {name:?} created, but its shards are not ready yet"
+                                )));
+                            }
+                            _ => rt.sleep(cairn_core::Duration::from_millis(100)).await,
+                        }
+                    }
+                    Ok(def)
+                }
+                Request::DropCollection { name } => {
+                    if name == catalog::DEFAULT {
+                        return Err(Error::InvalidRequest(
+                            "the default collection cannot be dropped".into(),
+                        ));
+                    }
+                    let def = cat
+                        .get(&name)
+                        .ok_or_else(|| Error::InvalidRequest(format!("no collection {name:?}")))?;
+                    // The tombstone first: a crash before the second write leaves the collection
+                    // dropped all the same.
+                    let tomb = catalog::entry_doc(&catalog::tombstone_key(def.id), "dropped", &def);
+                    Self::propose_routed(rt, queues, cfg, &default, CATALOG_SHARD, Command::UpsertKeyed(vec![tomb]), false).await?;
+                    Self::propose_routed(rt, queues, cfg, &default, CATALOG_SHARD, Command::DeleteKeys(vec![name.clone()]), false).await?;
+                    let fresh = Self::read_catalog(queues, cfg, Consistency::Linearizable).await?;
+                    catalog::observe(&fresh.live, &fresh.dropped, true);
+                    tracing::info!(node = %cfg.id, collection = %name, id = def.id, "collection dropped");
+                    Ok(def.as_ref().clone())
+                }
+                _ => Err(Error::Internal("not a catalog request".into())),
+            }
+        }
+        .await;
+        match r {
+            Ok(def) => {
+                Response::Collections(vec![serde_json::to_string(&def).expect("serializable")])
+            }
+            Err(e) => Response::from_error(&e),
         }
     }
 

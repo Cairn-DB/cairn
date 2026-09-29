@@ -78,6 +78,29 @@ pub enum Request {
         /// Condition.
         filter: Predicate,
     },
+    /// `req`, for the named collection (ADR 0031); a request without it is for `default`.
+    In {
+        /// Collection name.
+        collection: String,
+        /// The request.
+        req: Box<Request>,
+    },
+    /// Create a collection: answered with its definition (JSON) in `Collections`.
+    CreateCollection {
+        /// Name.
+        name: String,
+        /// Schema, as JSON, without the reserved fields.
+        schema: String,
+        /// Shard count.
+        shards: u32,
+    },
+    /// Drop a collection and delete its data everywhere: answered with its definition.
+    DropCollection {
+        /// Name.
+        name: String,
+    },
+    /// Live collections: answered with their definitions.
+    ListCollections,
 }
 
 /// A response.
@@ -93,6 +116,8 @@ pub enum Response {
     Status(Vec<ReplicaStatus>),
     /// Internal: per-leg lists of one shard.
     Legs(Vec<LegList>),
+    /// Collection definitions, as JSON.
+    Collections(Vec<String>),
     /// Deletion by filter acknowledged: documents removed, and one token per shard touched.
     Deleted {
         /// Documents removed.
@@ -467,6 +492,22 @@ impl Request {
                 scope.encode(&mut w);
                 filter.encode(&mut w);
             }
+            Request::In { collection, req } => {
+                w.u8(13).str(collection).bytes(&req.to_bytes());
+            }
+            Request::CreateCollection {
+                name,
+                schema,
+                shards,
+            } => {
+                w.u8(14).str(name).str(schema).u32(*shards);
+            }
+            Request::DropCollection { name } => {
+                w.u8(15).str(name);
+            }
+            Request::ListCollections => {
+                w.u8(16);
+            }
             Request::GetKey {
                 key,
                 consistency,
@@ -581,6 +622,26 @@ impl Request {
                     tokens,
                 }
             }
+            13 => {
+                let collection = r.str()?.to_owned();
+                let inner = Request::from_bytes(r.bytes()?)?;
+                if matches!(inner, Request::In { .. } | Request::Forwarded(_)) {
+                    return Err(Error::corruption("nested collection request"));
+                }
+                Request::In {
+                    collection,
+                    req: Box::new(inner),
+                }
+            }
+            14 => Request::CreateCollection {
+                name: r.str()?.to_owned(),
+                schema: r.str()?.to_owned(),
+                shards: r.u32()?,
+            },
+            15 => Request::DropCollection {
+                name: r.str()?.to_owned(),
+            },
+            16 => Request::ListCollections,
             12 => Request::DeleteWhere {
                 shard: match r.u32()? {
                     u32::MAX => None,
@@ -650,6 +711,12 @@ impl Response {
                     for (d, k) in &l.keys {
                         w.u64(d.get()).str(k);
                     }
+                }
+            }
+            Response::Collections(defs) => {
+                w.u8(8).u32(defs.len() as u32);
+                for d in defs {
+                    w.str(d);
                 }
             }
             Response::Deleted { count, tokens } => {
@@ -723,6 +790,14 @@ impl Response {
                     });
                 }
                 Response::Legs(lists)
+            }
+            8 => {
+                let n = r.u32()? as usize;
+                let mut defs = Vec::with_capacity(n.min(1 << 12));
+                for _ in 0..n {
+                    defs.push(r.str()?.to_owned());
+                }
+                Response::Collections(defs)
             }
             7 => {
                 let count = r.u64()?;
@@ -831,6 +906,19 @@ mod tests {
                 scope: DeleteScope::All,
                 filter: Predicate::IsNull { field: 2 },
             },
+            Request::In {
+                collection: "docs".into(),
+                req: Box::new(Request::DeleteKeys(vec!["a".into()])),
+            },
+            Request::CreateCollection {
+                name: "docs".into(),
+                schema: "{}".into(),
+                shards: 4,
+            },
+            Request::DropCollection {
+                name: "docs".into(),
+            },
+            Request::ListCollections,
             Request::DeleteWhere {
                 shard: Some(ShardId(3)),
                 scope: DeleteScope::Keys(vec!["k".into()]),
@@ -881,6 +969,7 @@ mod tests {
                 count: 7,
                 tokens: vec![token],
             },
+            Response::Collections(vec!["{}".into(), "{\"name\":\"x\"}".into()]),
             Response::Doc(None),
             Response::Hits(vec![hit]),
             Response::Status(vec![status]),

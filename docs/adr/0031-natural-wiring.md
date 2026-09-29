@@ -173,6 +173,57 @@ Options:
     changing the vector dimension means a new collection.
 - **Compatibility.** The collection created from `--schema` at startup is named `default`, and
   the current `/v1/documents` and `/v1/search` routes act on it.
+- **As implemented (step B, 2026-09-29):**
+  - **The catalog is an ordinary shard group**, with shard id 2^23 - 1 (shard ids fit in the
+    23 bits that internal ids of text ids carry), and a replica on every node. Its documents
+    are the definitions, as JSON, keyed by the collection name. A drop writes a tombstone
+    `dropped/<id>` first, then deletes the name, so a node that was down still learns that
+    it must delete the files.
+  - **Creations and drops run on the catalog leader, one at a time.** A node that is not the
+    leader forwards the request. The leader reads the catalog linearizably, picks the next
+    collection id and shard range past everything ever allocated (never reused), then writes.
+    - Why two leaders cannot both allocate: a deposed leader's write either reached a
+      majority, and then the new leader commits it before its own first read, or it never
+      commits.
+  - **Each node runs a reconciler** that reads its local catalog replica every 300 ms (a
+    stale read, no leader needed). It starts the replicas it hosts of live collections, and
+    stops those of dropped collections before deleting their files (`ReplicaHandle::stop`).
+    A node restarting alone gets its collections back this way.
+  - **Each node's view of the catalog only grows.** A collection seen live is added unless it
+    is known dropped, and a dropped one stays dropped. A complete linearizable listing also
+    marks as dropped the collections it no longer contains. The first version replaced the
+    view on each read: a node answered for a dropped collection until its reconciler caught
+    up, because the listing that showed the drop had been answered by another node (the
+    acceptance suite caught it).
+  - **Data layout:**
+    - a collection's shards live under `c<id>/shard<global shard id>`;
+    - the catalog lives under `catalog/`;
+    - `default` keeps shards `0..--shards` and the top-level `shard<n>` directories of 0.2, so
+      nothing is migrated. `default` is not in the catalog, and cannot be dropped.
+  - **Requests:**
+    - document requests for a named collection travel as `Request::In { collection, req }`;
+    - a node resolves the name from its view of the catalog, or else from a linearizable read
+      (a collection just created through another node);
+    - forwarded requests keep the wrapper.
+  - **Creation answers once every shard answers a linearizable read**, within 20 s, so the
+    collection works through every node as soon as the call returns.
+  - **Not done:**
+    - replication per collection: every collection uses `--replication`;
+    - document counts in `GET /v1/collections/{c}`;
+    - adding fields to an existing schema.
+  - **A bug found on the way,** in existing code: a node forwarding to a peer that had
+    restarted reused its dead connection and waited 10 s for a call nobody would answer.
+    Fixed in the runtime: a connection closed by the peer now fails calls at once.
+  - **Tests:**
+    - unit: routing, catalog entries, id allocation;
+    - simulator: a stopped replica reopens intact;
+    - three processes (`tests/http_collections.rs`): create through one node and use through
+      the others, isolation from `default` with the same ids, per-collection schema,
+      deletion by parent, a node restarted alone, drop with files deleted everywhere,
+      recreation of the name.
+    - The reconciler and the catalog requests are node code on real threads: they are not in
+      the deterministic simulation. The catalog's replication is, since it is an ordinary
+      shard group.
 
 ### 5. HTTP API
 

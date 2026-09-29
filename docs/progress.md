@@ -535,8 +535,29 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     machine; not changed). The CI matrix is the check: run 36582347306 (commit 2a85ba9),
     both entries green, live tests run (TypeScript 6/6, Python 6/6, 0 skipped).
   - Not published to npm/PyPI (public release, owner's go).
-  - Next: acceptance/CI wrap-up of 0.2 step A, then the 0.2 release decision (owner), then
-    step B (collections).
+
+- Release 0.2.0, private (2026-09-29, owner: "parfait go" on: private tag now, public launch
+  with 0.3 after step B). Tag v0.2.0 at ff3df22; release workflow green (verify with the
+  3,000-seed campaign, signed multi-arch image ghcr.io/cairn-db/cairn:0.2.0 and :0.2, GitHub
+  pre-release). Everything private. npm/PyPI not published (names `cairn-db`,
+  `langchain-cairn`, `@cairn-db/client` were free on 2026-09-29; the owner may reserve the
+  npm org).
+
+- 0.3 step B.1, collections (2026-09-29): ADR 0031 section 4, notes there.
+  - Catalog = shard group 2^23-1 on every node; create/drop serialized on its leader after a
+    linearizable read; per-node reconciler (300 ms, local stale read) starts/stops replicas and
+    deletes dropped collections' files; `Request::In` wrapper; HTTP routes under
+    `/v1/collections/{c}`; default collection unchanged.
+  - Found and fixed (runtime): calls on a connection closed by a restarted peer waited out the
+    10 s timeout. The collections test failed 4 runs out of 6 before the fix, 0 out of 8 after.
+    Regression test with positive control.
+  - `ReplicaHandle::stop` (simulator test: stop, reopen, catch up).
+  - The acceptance suite caught a node answering for a dropped collection (its catalog view
+    was replaced by each read, and the listing that showed the drop came from another node).
+    Fixed: the view only grows (ids are never reused). Acceptance 100/100 on 3 nodes
+    (data/acceptance-04.log).
+  - Not done: per-collection replication, counts, schema evolution.
+  - Next: clients' `collection()`, then group-by-parent search, then LangChain/LlamaIndex.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

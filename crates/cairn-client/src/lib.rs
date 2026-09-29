@@ -34,6 +34,8 @@ pub struct Client {
     pub timeout: Duration,
     /// Attempts across redirects and reconnects.
     pub max_attempts: usize,
+    /// The collection requests go to (`None`: `default`).
+    collection: Option<String>,
 }
 
 impl Client {
@@ -57,6 +59,7 @@ impl Client {
             tls: default_tls_slot().lock().expect("tls slot").clone(),
             timeout: Duration::from_secs(10),
             max_attempts: 40,
+            collection: None,
         }
     }
 
@@ -65,6 +68,53 @@ impl Client {
         self.tls = tls;
         self.conns.clear();
         self
+    }
+
+    /// Sends document requests (writes, reads, searches, deletions) to `collection` from now on
+    /// (ADR 0031); `None` for `default`.
+    pub fn set_collection(&mut self, collection: Option<String>) {
+        self.collection = collection.filter(|c| c != "default");
+    }
+
+    /// The collection document requests go to.
+    pub fn collection(&self) -> Option<&str> {
+        self.collection.as_deref()
+    }
+
+    /// Creates a collection; returns its definition (JSON).
+    pub fn create_collection(
+        &mut self,
+        name: &str,
+        schema_json: &str,
+        shards: u32,
+    ) -> Result<String> {
+        self.one_collection(Request::CreateCollection {
+            name: name.into(),
+            schema: schema_json.into(),
+            shards,
+        })
+    }
+
+    /// Drops a collection and deletes its data on every node; returns its definition (JSON).
+    pub fn drop_collection(&mut self, name: &str) -> Result<String> {
+        self.one_collection(Request::DropCollection { name: name.into() })
+    }
+
+    /// Definitions (JSON) of the live collections, `default` first.
+    pub fn list_collections(&mut self) -> Result<Vec<String>> {
+        match self.call(&Request::ListCollections)? {
+            Response::Collections(v) => Ok(v),
+            Response::Error { message, .. } => Err(Error::Internal(message)),
+            other => Err(Error::Internal(format!("unexpected response {other:?}"))),
+        }
+    }
+
+    fn one_collection(&mut self, req: Request) -> Result<String> {
+        match self.call(&req)? {
+            Response::Collections(mut v) if v.len() == 1 => Ok(v.remove(0)),
+            Response::Error { message, .. } => Err(Error::Internal(message)),
+            other => Err(Error::Internal(format!("unexpected response {other:?}"))),
+        }
     }
 
     /// Node the client currently talks to.
@@ -80,7 +130,7 @@ impl Client {
     }
 
     fn conn(&mut self, node: NodeId) -> Result<&ClientConn> {
-        if !self.conns.contains_key(&node) {
+        if self.conns.get(&node).is_none_or(ClientConn::is_closed) {
             let addr = *self.addrs.get(&node).ok_or_else(|| {
                 Error::io(IoErrorKind::Unreachable, format!("unknown node {node}"))
             })?;
@@ -99,7 +149,24 @@ impl Client {
 
     /// Sends a request, following leader hints and rotating on connection failures.
     pub fn call(&mut self, req: &Request) -> Result<Response> {
-        let bytes = req.to_bytes();
+        let bytes = match (&self.collection, req) {
+            (
+                Some(c),
+                Request::Upsert(_)
+                | Request::Delete(_)
+                | Request::Get { .. }
+                | Request::Query { .. }
+                | Request::UpsertKeyed(_)
+                | Request::DeleteKeys(_)
+                | Request::GetKey { .. }
+                | Request::DeleteWhere { .. },
+            ) => Request::In {
+                collection: c.clone(),
+                req: Box::new(req.clone()),
+            }
+            .to_bytes(),
+            _ => req.to_bytes(),
+        };
         let mut last_err = None;
         for _ in 0..self.max_attempts {
             let node = self.current;

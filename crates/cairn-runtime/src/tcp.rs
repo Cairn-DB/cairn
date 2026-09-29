@@ -664,7 +664,8 @@ mod tests {
             // Read the client's hello, then close cleanly (FIN, no reset): the client's next
             // write still succeeds, as with a peer process that exited.
             let (mut s, _) = listener.accept().unwrap();
-            s.set_read_timeout(Some(StdDuration::from_millis(200))).unwrap();
+            s.set_read_timeout(Some(StdDuration::from_millis(200)))
+                .unwrap();
             let mut buf = [0u8; 256];
             let _ = std::io::Read::read(&mut s, &mut buf);
             drop(s);
@@ -673,11 +674,18 @@ mod tests {
         server.join().unwrap();
         let t0 = std::time::Instant::now();
         while !conn.is_closed() {
-            assert!(t0.elapsed() < StdDuration::from_secs(5), "close not noticed");
+            assert!(
+                t0.elapsed() < StdDuration::from_secs(5),
+                "close not noticed"
+            );
             std::thread::sleep(StdDuration::from_millis(10));
         }
         let t0 = std::time::Instant::now();
         assert!(conn.call(b"x", StdDuration::from_secs(10)).is_err());
-        assert!(t0.elapsed() < StdDuration::from_secs(1), "{:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < StdDuration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
+        );
     }
 }

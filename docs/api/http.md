@@ -13,6 +13,46 @@ export KEY=cairn_...                     # used as "Authorization: Bearer $KEY" 
 With rootless podman, use `127.0.0.1` rather than `localhost`: `localhost` may resolve to
 `::1`, and podman's port forwarding resets that connection.
 
+## Collections
+
+A collection has its own schema, shards and documents (ADR 0031). The collection defined at
+startup (`--schema`) is `default`: the routes without a collection name act on it, as in 0.1
+and 0.2.
+
+```bash
+curl -s -X POST localhost:7200/v1/collections -H "Authorization: Bearer $KEY" \
+  -H content-type:application/json -d '{
+    "name": "notes",
+    "shards": 4,
+    "schema": { "fields": [
+      { "name": "embedding", "kind": { "Vector": { "dims": 384, "metric": "Cosine" } } },
+      { "name": "body", "kind": "Text" },
+      { "name": "parent", "kind": "Enum" } ] } }'
+# 201 {"name":"notes","shards":4,"schema":{...}}
+curl -s localhost:7200/v1/collections/notes/search -H "Authorization: Bearer $KEY" \
+  -H content-type:application/json -d '{"text":{"field":"body","query":"otter"}}'
+```
+
+| method and path | role | answer |
+|---|---|---|
+| `POST /v1/collections` | admin | `{"name", "schema", "shards"?}`; 201 with the definition, 409 if the name is taken |
+| `GET /v1/collections` | read | `{"collections":[...]}`, `default` first |
+| `GET /v1/collections/{c}` | read | the definition |
+| `DELETE /v1/collections/{c}` | admin | drops it and deletes its data on every node |
+| `/v1/collections/{c}/documents`, `/documents/{id}`, `/documents/delete`, `/search`, `/schema`, `/tenants/{t}` | as for `default` | as for `default` |
+
+- A name has 1 to 64 characters among `a-z`, `0-9`, `_` and `-`.
+- `shards` defaults to the shard count of `default`.
+- The schema of a collection is fixed. To change it, create a new collection.
+- Creating a collection answers once each of its shards has a leader, usually within a
+  second. It then works through every node.
+- Dropping a collection is final: its documents are gone and each node deletes its files. The
+  name can then be used again, for a new, empty collection. `default` cannot be dropped.
+- Ids, tenants and deletions by filter work in each collection as in `default`. A document id
+  identifies a document within its collection only.
+- Every collection uses the node's `--replication`. Per-collection replication and document
+  counts come later.
+
 ## Documents
 
 A document is a flat JSON object: an `id` plus fields named as in the schema.
@@ -86,6 +126,7 @@ Consistency levels (`consistency`, on reads and searches):
 | `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
 | `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}`, or `{"filter":{...}, "ids"?, "after"?}` | `{"count", "consistency_token"}`; with a filter, `{"deleted", "consistency_token"}` |
 | `POST /v1/search` | read | see below | `{"hits":[...]}` |
+| `…/v1/collections/…` | | see Collections | |
 | `DELETE /v1/tenants/{tenant}` | takedown, unscoped key | `?after=` | `{"deleted", "consistency_token"}`: erases the tenant |
 | `GET /v1/admin/merges` | admin | | `{"paused"}` for the node answering |
 | `POST /v1/admin/merges` | admin | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |

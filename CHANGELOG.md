@@ -7,6 +7,19 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+### Added
+- Collections (ADR 0031): `POST /v1/collections` creates a collection with its own schema and
+  shards, and `DELETE /v1/collections/{c}` drops it and deletes its data on every node. Every
+  document route exists under `/v1/collections/{c}/`. The collection defined at startup is
+  `default`, and the routes of 0.2 act on it, unchanged and without migration. A replicated
+  catalog on every node holds the definitions. Rust client: `set_collection`,
+  `create_collection`, `drop_collection`, `list_collections`.
+
+### Fixed
+- A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
+  before retrying. Calls on a connection closed by the peer now fail at once, and the caller
+  reconnects.
+
 ## [0.2.0] - 2026-09-29
 
 Natural wiring (ADR 0031, step A): your own ids, deletion by filter and by parent, tenants,

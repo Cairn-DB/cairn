@@ -11,6 +11,7 @@
 //! text ids prefixed with the tenant, carry the tenant in `_tenant`, and every read, search
 //! and deletion is restricted to that tenant.
 
+use crate::catalog::{self, CollectionDef};
 use axum::extract::{DefaultBodyLimit, Path, Query as UrlQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -254,6 +255,26 @@ async fn authorize(
     next.run(req).await
 }
 
+/// Path parameters of a route (`c`, `id`, `tenant`), absent on routes without any.
+type Params = Option<Path<std::collections::HashMap<String, String>>>;
+
+fn param<'a>(p: &'a Params, name: &str) -> Option<&'a str> {
+    p.as_ref().and_then(|p| p.0.get(name)).map(String::as_str)
+}
+
+/// The collection a request addresses: `/v1/collections/{c}/...`, or `default`.
+async fn collection(s: &Arc<Shared>, p: &Params) -> ApiResult<Arc<CollectionDef>> {
+    let name = param(p, "c").unwrap_or(catalog::DEFAULT).to_owned();
+    if let Some(c) = catalog::current().get(&name) {
+        return Ok(c);
+    }
+    // Created through another node: a linearizable listing brings it here.
+    refresh_catalog(s).await?;
+    catalog::current()
+        .get(&name)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no collection {name:?}")))
+}
+
 /// Records a takedown: which key asked, for which documents, and the token that proves it
 /// (target `cairn_server::audit`, on by default).
 fn audit_takedown(key: Option<&KeyId>, scope: &Scope, ids: &[ApiId], resp: &Json<Json_>) {
@@ -285,6 +306,26 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/documents/{id}", get(get_doc).delete(delete_one))
         .route("/v1/search", post(search))
         .route("/v1/tenants/{tenant}", axum::routing::delete(erase_tenant))
+        .route(
+            "/v1/collections",
+            get(list_collections).post(create_collection),
+        )
+        .route(
+            "/v1/collections/{c}",
+            get(get_collection).delete(drop_collection),
+        )
+        .route("/v1/collections/{c}/schema", get(schema))
+        .route("/v1/collections/{c}/documents", post(upsert))
+        .route("/v1/collections/{c}/documents/delete", post(delete_many))
+        .route(
+            "/v1/collections/{c}/documents/{id}",
+            get(get_doc).delete(delete_one),
+        )
+        .route("/v1/collections/{c}/search", post(search))
+        .route(
+            "/v1/collections/{c}/tenants/{tenant}",
+            axum::routing::delete(erase_tenant),
+        )
         .route("/v1/admin/merges", get(merges).post(set_merges))
         .layer(axum::middleware::from_fn_with_state(
             shared.clone(),
@@ -300,9 +341,20 @@ async fn with_client<T: Send + 'static>(
     s: &Arc<Shared>,
     f: impl FnOnce(&mut Client) -> cairn_core::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
+    with_client_in(s, catalog::DEFAULT, f).await
+}
+
+/// [`with_client`], with document requests sent to `collection`.
+async fn with_client_in<T: Send + 'static>(
+    s: &Arc<Shared>,
+    collection: &str,
+    f: impl FnOnce(&mut Client) -> cairn_core::Result<T> + Send + 'static,
+) -> ApiResult<T> {
     let s2 = s.clone();
+    let collection = collection.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut c = s2.client();
+        c.set_collection(Some(collection));
         let r = f(&mut c);
         if r.is_ok() {
             s2.give_back(c);
@@ -315,18 +367,122 @@ async fn with_client<T: Send + 'static>(
 }
 
 /// The schema as the client wrote it: reserved fields (ADR 0031) are internal.
-async fn schema(State(s): State<Arc<Shared>>) -> Json<Json_> {
+/// A schema as the client wrote it: reserved fields (ADR 0031) are internal.
+fn visible_schema(schema: &Schema) -> Json_ {
     let visible = Schema {
-        fields: s
-            .cfg
-            .schema
+        fields: schema
             .fields
             .iter()
             .filter(|f| !cairn_core::schema::is_reserved(&f.name))
             .cloned()
             .collect(),
     };
-    Json(serde_json::to_value(&visible).unwrap_or(Json_::Null))
+    serde_json::to_value(&visible).unwrap_or(Json_::Null)
+}
+
+async fn schema(State(s): State<Arc<Shared>>, params: Params) -> ApiResult<Json<Json_>> {
+    let coll = collection(&s, &params).await?;
+    Ok(Json(visible_schema(&coll.schema)))
+}
+
+fn collection_json(c: &CollectionDef) -> Json_ {
+    json!({ "name": c.name, "shards": c.shards, "schema": visible_schema(&c.schema) })
+}
+
+#[derive(Deserialize)]
+struct CreateCollectionBody {
+    name: String,
+    schema: Json_,
+    #[serde(default)]
+    shards: Option<u32>,
+}
+
+/// Creates a collection (ADR 0031): answers once every shard is ready.
+async fn create_collection(
+    State(s): State<Arc<Shared>>,
+    Json(body): Json<CreateCollectionBody>,
+) -> ApiResult<Response> {
+    let shards = match body.shards {
+        Some(n) => n,
+        None => catalog::current()
+            .get(catalog::DEFAULT)
+            .map_or(1, |d| d.shards),
+    };
+    let schema = body.schema.to_string();
+    let name = body.name.clone();
+    let def = with_client(&s, move |c| c.create_collection(&name, &schema, shards))
+        .await
+        .map_err(|e| {
+            if e.1.contains("already exists") {
+                ApiError(StatusCode::CONFLICT, e.1)
+            } else if e.1.contains("collection name")
+                || e.1.contains("shards must")
+                || e.1.contains("schema")
+            {
+                ApiError(StatusCode::BAD_REQUEST, e.1)
+            } else {
+                e
+            }
+        })?;
+    let def: CollectionDef = serde_json::from_str(&def)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(target: "cairn_server::audit", collection = %def.name, shards = def.shards, "collection created");
+    Ok((StatusCode::CREATED, Json(collection_json(&def))).into_response())
+}
+
+/// Lists the live collections (a linearizable read, on whichever node answers) and merges the
+/// listing into this node's view, so that a drop is seen here at once.
+async fn refresh_catalog(s: &Arc<Shared>) -> ApiResult<Vec<Arc<CollectionDef>>> {
+    let defs = with_client(s, |c| c.list_collections()).await?;
+    let defs: Vec<Arc<CollectionDef>> = defs
+        .iter()
+        .filter_map(|d| serde_json::from_str::<CollectionDef>(d).ok())
+        .map(Arc::new)
+        .collect();
+    catalog::observe(&defs, &[], true);
+    Ok(defs)
+}
+
+async fn list_collections(State(s): State<Arc<Shared>>) -> ApiResult<Json<Json_>> {
+    let defs = refresh_catalog(&s).await?;
+    Ok(Json(json!({
+        "collections": defs.iter().map(|d| collection_json(d)).collect::<Vec<_>>()
+    })))
+}
+
+async fn get_collection(State(s): State<Arc<Shared>>, params: Params) -> ApiResult<Json<Json_>> {
+    let coll = collection(&s, &params).await?;
+    Ok(Json(collection_json(&coll)))
+}
+
+/// Drops a collection and deletes its data on every node (admin). Audited.
+async fn drop_collection(
+    State(s): State<Arc<Shared>>,
+    key: Option<axum::Extension<KeyId>>,
+    params: Params,
+) -> ApiResult<Json<Json_>> {
+    let coll = collection(&s, &params).await?;
+    let name = coll.name.clone();
+    let def = with_client(&s, move |c| c.drop_collection(&name))
+        .await
+        .map_err(|e| {
+            if e.1.contains("cannot be dropped") {
+                ApiError(StatusCode::BAD_REQUEST, e.1)
+            } else if e.1.contains("no collection") {
+                ApiError(StatusCode::NOT_FOUND, e.1)
+            } else {
+                e
+            }
+        })?;
+    let def: CollectionDef = serde_json::from_str(&def)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!(
+        target: "cairn_server::audit",
+        key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        collection = %def.name,
+        "collection dropped"
+    );
+    Ok(Json(json!({ "dropped": def.name })))
 }
 
 async fn status(State(s): State<Arc<Shared>>) -> ApiResult<Json<Json_>> {
@@ -820,13 +976,15 @@ fn scope_of(e: ScopeExt) -> Scope {
 async fn upsert(
     State(s): State<Arc<Shared>>,
     scope: ScopeExt,
+    params: Params,
     Json(body): Json<UpsertBody>,
 ) -> ApiResult<Json<Json_>> {
     let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
     let docs = body
         .documents
         .iter()
-        .map(|d| doc_from_json(&s.cfg.schema, scope.tenant.as_deref(), d))
+        .map(|d| doc_from_json(&coll.schema, scope.tenant.as_deref(), d))
         .collect::<ApiResult<Vec<_>>>()?;
     if docs.is_empty() {
         return Err(ApiError::bad("no documents"));
@@ -837,7 +995,7 @@ async fn upsert(
         .partition(|(id, _)| matches!(id, ApiId::Key(_)));
     let keyed: Vec<Document> = keyed.into_iter().map(|x| x.1).collect();
     let plain: Vec<Document> = plain.into_iter().map(|x| x.1).collect();
-    let tokens = with_client(&s, move |c| {
+    let tokens = with_client_in(&s, &coll.name, move |c| {
         let mut t = Vec::new();
         if !plain.is_empty() {
             t.extend(c.upsert(plain)?);
@@ -884,10 +1042,11 @@ fn delete_scopes(ids: &[ApiId]) -> Vec<DeleteScope> {
 /// Runs deletions by filter over each scope: documents removed, and tokens.
 async fn delete_where(
     s: &Arc<Shared>,
+    coll: &CollectionDef,
     scopes: Vec<DeleteScope>,
     filter: Predicate,
 ) -> ApiResult<(u64, Vec<Token>)> {
-    with_client(s, move |c| {
+    with_client_in(s, &coll.name, move |c| {
         let (mut count, mut tokens) = (0, Vec::new());
         for scope in scopes {
             let (n, t) = c.delete_where(scope, filter.clone())?;
@@ -903,9 +1062,11 @@ async fn delete_many(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
     scope: ScopeExt,
+    params: Params,
     Json(body): Json<DeleteBody>,
 ) -> ApiResult<Json<Json_>> {
     let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
     let tenant = scope.tenant.as_deref();
     let ids = body
         .ids
@@ -918,18 +1079,18 @@ async fn delete_many(
             return Err(ApiError::bad("no ids"));
         }
         let n = ids.len();
-        let tokens = delete_ids(&s, &scope, &ids).await?;
+        let tokens = delete_ids(&s, &coll, &scope, &ids).await?;
         let resp = ack(n, &tokens, body.after.as_deref())?;
         audit_takedown(key.as_deref(), &scope, &ids, &resp);
         return Ok(resp);
     };
-    let pred = filter(&s.cfg.schema, f)?;
+    let pred = filter(&coll.schema, f)?;
     if matches!(&pred, Predicate::True) || matches!(&pred, Predicate::And(v) if v.is_empty()) {
         return Err(ApiError::bad(
             "a filter that matches every document is refused: give a condition",
         ));
     }
-    pred.validate(&s.cfg.schema)
+    pred.validate(&coll.schema)
         .map_err(|e| ApiError::bad(e.to_string()))?;
     let scopes = match &ids {
         None => vec![DeleteScope::All],
@@ -940,7 +1101,8 @@ async fn delete_many(
                 .collect::<Vec<_>>(),
         ),
     };
-    let (count, tokens) = delete_where(&s, scopes, scoped(&s.cfg.schema, tenant, pred)?).await?;
+    let (count, tokens) =
+        delete_where(&s, &coll, scopes, scoped(&coll.schema, tenant, pred)?).await?;
     let prior = body
         .after
         .as_deref()
@@ -954,6 +1116,7 @@ async fn delete_many(
     tracing::info!(
         target: "cairn_server::audit",
         key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        collection = %coll.name,
         tenant = tenant.unwrap_or("-"),
         filter = %f,
         ids = ids.as_ref().map_or(0, Vec::len),
@@ -966,11 +1129,16 @@ async fn delete_many(
 
 /// Takes down integer and text ids. Under a tenant, only those of the tenant's documents: the
 /// ids are the tenant's own, and the deletion is also restricted by `_tenant`.
-async fn delete_ids(s: &Arc<Shared>, scope: &Scope, ids: &[ApiId]) -> ApiResult<Vec<Token>> {
+async fn delete_ids(
+    s: &Arc<Shared>,
+    coll: &CollectionDef,
+    scope: &Scope,
+    ids: &[ApiId],
+) -> ApiResult<Vec<Token>> {
     let tenant = scope.tenant.as_deref();
-    if let Some(only) = tenant_filter(&s.cfg.schema, tenant)? {
+    if let Some(only) = tenant_filter(&coll.schema, tenant)? {
         let stored: Vec<ApiId> = ids.iter().map(|id| stored_id(tenant, id)).collect();
-        return Ok(delete_where(s, delete_scopes(&stored), only).await?.1);
+        return Ok(delete_where(s, coll, delete_scopes(&stored), only).await?.1);
     }
     let mut nums = Vec::new();
     let mut keys = Vec::new();
@@ -980,7 +1148,7 @@ async fn delete_ids(s: &Arc<Shared>, scope: &Scope, ids: &[ApiId]) -> ApiResult<
             ApiId::Key(k) => keys.push(k.clone()),
         }
     }
-    with_client(s, move |c| {
+    with_client_in(s, &coll.name, move |c| {
         let mut t = Vec::new();
         if !nums.is_empty() {
             t.extend(c.delete(nums)?);
@@ -1005,12 +1173,16 @@ async fn delete_one(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
     scope: ScopeExt,
-    Path(id): Path<String>,
+    params: Params,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Json<Json_>> {
     let scope = scope_of(scope);
-    let id = path_id(&id, p.id_type.as_deref())?;
-    let tokens = delete_ids(&s, &scope, std::slice::from_ref(&id)).await?;
+    let coll = collection(&s, &params).await?;
+    let id = path_id(
+        param(&params, "id").unwrap_or_default(),
+        p.id_type.as_deref(),
+    )?;
+    let tokens = delete_ids(&s, &coll, &scope, std::slice::from_ref(&id)).await?;
     let resp = ack(1, &tokens, p.after.as_deref())?;
     audit_takedown(key.as_deref(), &scope, &[id], &resp);
     Ok(resp)
@@ -1021,10 +1193,12 @@ async fn erase_tenant(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
     scope: ScopeExt,
-    Path(tenant): Path<String>,
+    params: Params,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Json<Json_>> {
     let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
+    let tenant = param(&params, "tenant").unwrap_or_default().to_owned();
     if scope.from_key {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
@@ -1036,8 +1210,8 @@ async fn erase_tenant(
             "a tenant is 1 to 128 letters, digits, '_', '.' or '-'",
         ));
     }
-    let only = tenant_filter(&s.cfg.schema, Some(&tenant))?.expect("a tenant");
-    let (count, tokens) = delete_where(&s, vec![DeleteScope::All], only).await?;
+    let only = tenant_filter(&coll.schema, Some(&tenant))?.expect("a tenant");
+    let (count, tokens) = delete_where(&s, &coll, vec![DeleteScope::All], only).await?;
     let prior = p
         .after
         .as_deref()
@@ -1051,6 +1225,7 @@ async fn erase_tenant(
     tracing::info!(
         target: "cairn_server::audit",
         key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        collection = %coll.name,
         tenant,
         count,
         token = resp.0["consistency_token"].as_str().unwrap_or(""),
@@ -1062,14 +1237,18 @@ async fn erase_tenant(
 async fn get_doc(
     State(s): State<Arc<Shared>>,
     scope: ScopeExt,
-    Path(id): Path<String>,
+    params: Params,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Response> {
     let scope = scope_of(scope);
-    let id = path_id(&id, p.id_type.as_deref())?;
+    let coll = collection(&s, &params).await?;
+    let id = path_id(
+        param(&params, "id").unwrap_or_default(),
+        p.id_type.as_deref(),
+    )?;
     let (consistency, tokens) = consistency(p.consistency.as_deref(), p.after.as_deref())?;
     let req_id = stored_id(scope.tenant.as_deref(), &id);
-    let doc = with_client(&s, move |c| {
+    let doc = with_client_in(&s, &coll.name, move |c| {
         let req = match req_id {
             ApiId::Num(n) => Request::Get {
                 id: DocId(n),
@@ -1096,10 +1275,10 @@ async fn get_doc(
         scope
             .tenant
             .as_deref()
-            .is_none_or(|t| tenant_of(&s.cfg.schema, d) == Some(t))
+            .is_none_or(|t| tenant_of(&coll.schema, d) == Some(t))
     });
     Ok(match doc {
-        Some(d) => Json(doc_json(&s.cfg.schema, &scope, &d)).into_response(),
+        Some(d) => Json(doc_json(&coll.schema, &scope, &d)).into_response(),
         None => ApiError(StatusCode::NOT_FOUND, format!("no document {id}")).into_response(),
     })
 }
@@ -1191,10 +1370,12 @@ fn hit_json(schema: &Schema, scope: &Scope, h: &Hit) -> Json_ {
 async fn search(
     State(s): State<Arc<Shared>>,
     scope: ScopeExt,
+    params: Params,
     Json(body): Json<SearchBody>,
 ) -> ApiResult<Json<Json_>> {
     let scope = scope_of(scope);
-    let schema = &s.cfg.schema;
+    let coll = collection(&s, &params).await?;
+    let schema = &coll.schema;
     if body.k == 0 || body.k > 10_000 {
         return Err(ApiError::bad("k must be between 1 and 10000"));
     }
@@ -1261,7 +1442,7 @@ async fn search(
     }
     q.with_documents = body.with_documents;
     let (consistency, tokens) = consistency(body.consistency.as_deref(), body.after.as_deref())?;
-    let hits = with_client(&s, move |c| {
+    let hits = with_client_in(&s, &coll.name, move |c| {
         match c.call(&Request::Query {
             query: q,
             consistency,

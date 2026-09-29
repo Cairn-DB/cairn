@@ -280,7 +280,18 @@ pub fn generate(
 /// The role a request needs, or `None` for open routes (`/health`). Unknown routes need
 /// `admin`, so a route added later is closed until it is mapped here.
 pub fn required_role(method: &str, path: &str) -> Option<Role> {
+    // Routes of a named collection need what the same route of `default` needs.
+    if let Some(rest) = path.strip_prefix("/v1/collections/") {
+        return match rest.split_once('/') {
+            Some((_, "schema")) if method == "GET" => Some(Role::Read),
+            Some((_, sub)) => required_role(method, &format!("/v1/{sub}")),
+            None if method == "GET" => Some(Role::Read),
+            // Dropping a collection, and anything unknown.
+            None => Some(Role::Admin),
+        };
+    }
     match (method, path) {
+        ("GET", "/v1/collections") => Some(Role::Read),
         (_, "/health") => None,
         ("GET", "/v1/schema") => Some(Role::Read),
         ("POST", "/v1/search") => Some(Role::Read),
@@ -409,6 +420,44 @@ mod tests {
             Some(Role::Takedown)
         );
         assert_eq!(required_role("GET", "/v1/status"), Some(Role::Admin));
+        assert_eq!(required_role("GET", "/v1/collections"), Some(Role::Read));
+        assert_eq!(required_role("POST", "/v1/collections"), Some(Role::Admin));
+        assert_eq!(
+            required_role("GET", "/v1/collections/docs"),
+            Some(Role::Read)
+        );
+        assert_eq!(
+            required_role("DELETE", "/v1/collections/docs"),
+            Some(Role::Admin)
+        );
+        assert_eq!(
+            required_role("GET", "/v1/collections/docs/schema"),
+            Some(Role::Read)
+        );
+        assert_eq!(
+            required_role("POST", "/v1/collections/docs/documents"),
+            Some(Role::Write)
+        );
+        assert_eq!(
+            required_role("POST", "/v1/collections/docs/documents/delete"),
+            Some(Role::Takedown)
+        );
+        assert_eq!(
+            required_role("GET", "/v1/collections/docs/documents/7"),
+            Some(Role::Read)
+        );
+        assert_eq!(
+            required_role("DELETE", "/v1/collections/docs/tenants/acme"),
+            Some(Role::Takedown)
+        );
+        assert_eq!(
+            required_role("POST", "/v1/collections/docs/search"),
+            Some(Role::Read)
+        );
+        assert_eq!(
+            required_role("POST", "/v1/collections/docs/admin/merges"),
+            Some(Role::Admin)
+        );
         assert_eq!(required_role("POST", "/v1/admin/merges"), Some(Role::Admin));
         assert_eq!(required_role("PUT", "/v1/anything"), Some(Role::Admin));
     }
