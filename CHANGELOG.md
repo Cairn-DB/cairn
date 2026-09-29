@@ -7,6 +7,10 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+### Added
+- Acceptance suite (`examples/acceptance/`): a realistic corpus and 56-72 checks against a
+  running node or cluster, in Python with no dependency.
+
 ## [0.1.0] - 2026-09-28
 
 First developer preview. Everything below is new.

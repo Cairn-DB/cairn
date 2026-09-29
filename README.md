@@ -107,6 +107,10 @@ CAIRN_SEEDS=0..3000 cargo test --release -p cairn-query --test chaos campaign --
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+To check a running node or cluster end to end with realistic data (authentication, every
+field type, search, filters, takedowns on every node), run the
+[acceptance suite](examples/acceptance/README.md).
+
 The Rust client is `cairn-client` (`Client::new(addrs)`, `upsert`, `delete`, `get`, `query`
 with `Consistency::{Linearizable, ReadYourWrites, Stale}`). The HTTP API works from any
 language.
