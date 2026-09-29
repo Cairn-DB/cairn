@@ -12,8 +12,10 @@ wire protocol or the on-disk format; the notes say so.
   shards, and `DELETE /v1/collections/{c}` drops it and deletes its data on every node. Every
   document route exists under `/v1/collections/{c}/`. The collection defined at startup is
   `default`, and the routes of 0.2 act on it, unchanged and without migration. A replicated
-  catalog on every node holds the definitions. Rust client: `set_collection`,
-  `create_collection`, `drop_collection`, `list_collections`.
+  catalog on every node holds the definitions. Clients: `collection(name)` in TypeScript and
+  Python (a view with the same calls), `createCollection`/`create_collection`,
+  `listCollections`, `dropCollection`. Rust client: `set_collection`, `create_collection`,
+  `drop_collection`, `list_collections`.
 
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection

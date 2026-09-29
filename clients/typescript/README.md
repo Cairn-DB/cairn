@@ -37,6 +37,23 @@ read. It therefore reads what it wrote, and never reads back what it deleted, th
 node. To give the same guarantee to another service, pass it `db.token`:
 `new Cairn({ …, token })`, or `db.observe(token)` on an existing client.
 
+## Collections
+
+Without `collection()`, calls act on `default`, the collection defined at startup.
+
+```ts
+const admin = new Cairn({ url, apiKey: ADMIN_KEY });
+await admin.createCollection("notes", { fields: [
+  { name: "embedding", kind: { Vector: { dims: 384, metric: "Cosine" } } },
+  { name: "body", kind: "Text" },
+] }, { shards: 4 });
+const notes = db.collection("notes");   // the same calls, on "notes"
+await notes.upsert([{ id: "n1", embedding: [/* … */], body: "…" }]);
+await admin.dropCollection("notes");   // deletes its data on every node
+```
+
+`createCollection` and `dropCollection` need an admin key. `listCollections` needs a read key.
+
 ## Tenants
 
 ```ts

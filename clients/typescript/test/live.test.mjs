@@ -1,8 +1,8 @@
-// Against a running node (clients/test-live.sh): CAIRN_URL, CAIRN_KEY (read,write,takedown),
+// Against a running node (clients/test-live.sh): CAIRN_URL, CAIRN_ADMIN_KEY, CAIRN_KEY (read,write,takedown),
 // CAIRN_ACME_KEY (scoped to tenant "acme"), CAIRN_READ_KEY (read only). Skipped without them.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Cairn, eq, range, AuthenticationError, ForbiddenError, InvalidInputError } from "../dist/esm/index.js";
+import { Cairn, eq, range, AuthenticationError, ForbiddenError, InvalidInputError, NotFoundError } from "../dist/esm/index.js";
 
 const url = process.env.CAIRN_URL;
 const skip = !url && "CAIRN_URL not set";
@@ -63,4 +63,26 @@ test("the client against a live node", { skip }, async () => {
   assert.deepEqual(await db.search({ k: 10 }), []);
   assert.ok((await root.forgetTenant("acme")).deleted >= 1);
   assert.equal(await acme.get("shared"), null);
+});
+
+test("collections against a live node", { skip }, async () => {
+  const admin = new Cairn({ url, apiKey: process.env.CAIRN_ADMIN_KEY });
+  const name = `ts-notes-${process.pid}`;
+  const schema = { fields: [{ name: "embedding", kind: { Vector: { dims: 2, metric: "L2" } } }, { name: "body", kind: "Text" }, { name: "parent", kind: "Enum" }] };
+  const created = await admin.createCollection(name, schema, { shards: 2 });
+  assert.deepEqual(created, { name, shards: 2, schema });
+  assert.ok((await admin.listCollections()).some((c) => c.name === name));
+  const app = new Cairn({ url, apiKey: process.env.CAIRN_KEY });
+  const notes = app.collection(name);
+  await notes.upsert([0, 1, 2, 3].map((i) => ({ id: `n${i}`, embedding: [i, 1], body: `walrus ${i}`, parent: `p${i % 2}` })));
+  assert.equal((await notes.get("n1")).body, "walrus 1");
+  assert.equal(await app.get("n1"), null, "not in default");
+  assert.equal((await notes.search({ text: { field: "body", query: "walrus" } })).length, 4);
+  assert.equal((await notes.delete({ parent: "p0" })).deleted, 2);
+  assert.deepEqual((await notes.search({ k: 10 })).map((h) => h.id).sort(), ["n1", "n3"]);
+  assert.deepEqual(await notes.schema(), schema);
+  await assert.rejects(app.createCollection("x", schema), ForbiddenError);
+  await admin.dropCollection(name);
+  assert.ok(!(await admin.listCollections()).some((c) => c.name === name));
+  await assert.rejects(notes.search({ k: 1 }), NotFoundError);
 });

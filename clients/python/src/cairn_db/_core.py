@@ -184,7 +184,14 @@ class TokenBox:
         self.value = merge_tokens(self.value, token)
 
 
-def doc_path(id: Id, after: str, consistency: Optional[str]) -> str:
+def collection_base(collection: Optional[str]) -> str:
+    """Path prefix of a collection's routes."""
+    if not collection or collection == "default":
+        return "/v1"
+    return "/v1/collections/" + urllib.parse.quote(collection, safe="")
+
+
+def doc_path(id: Id, after: str, consistency: Optional[str], base: str = "/v1") -> str:
     """The path of a document: digits are an integer id, so a text id of digits says so."""
     params: list[tuple[str, str]] = []
     if isinstance(id, bool) or not isinstance(id, (str, int)):
@@ -192,9 +199,9 @@ def doc_path(id: Id, after: str, consistency: Optional[str]) -> str:
     if isinstance(id, int):
         if id < 0:
             raise InvalidInputError(f"an integer id is non-negative: {id}", 400)
-        path = f"/v1/documents/{id}"
+        path = f"{base}/documents/{id}"
     else:
-        path = "/v1/documents/" + urllib.parse.quote(id, safe="")
+        path = f"{base}/documents/" + urllib.parse.quote(id, safe="")
         if id.isdigit():
             params.append(("id_type", "text"))
     if after:

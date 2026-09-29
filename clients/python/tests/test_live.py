@@ -1,4 +1,4 @@
-"""Against a running node (clients/test-live.sh): CAIRN_URL, CAIRN_KEY (read,write,takedown),
+"""Against a running node (clients/test-live.sh): CAIRN_URL, CAIRN_ADMIN_KEY, CAIRN_KEY (read,write,takedown),
 CAIRN_ACME_KEY (scoped to tenant "acme"), CAIRN_READ_KEY (read only). Skipped without them."""
 
 import asyncio
@@ -83,3 +83,27 @@ def test_async_client_against_a_live_node():
             assert await db.search(text="lynx", text_field="text") == []
 
     asyncio.run(run())
+
+
+def test_collections_against_a_live_node():
+    admin = c.Client(URL, os.environ["CAIRN_ADMIN_KEY"])
+    name = f"py-notes-{os.getpid()}"
+    schema = {"fields": [{"name": "embedding", "kind": {"Vector": {"dims": 2, "metric": "L2"}}},
+                         {"name": "body", "kind": "Text"}, {"name": "parent", "kind": "Enum"}]}
+    assert admin.create_collection(name, schema, shards=2) == {"name": name, "shards": 2, "schema": schema}
+    assert name in [x["name"] for x in admin.list_collections()]
+    app = c.Client(URL, os.environ["CAIRN_KEY"])
+    notes = app.collection(name)
+    notes.upsert([{"id": f"n{i}", "embedding": [float(i), 1.0], "body": f"walrus {i}", "parent": f"p{i % 2}"} for i in range(4)])
+    assert notes.get("n1")["body"] == "walrus 1"
+    assert app.get("n1") is None, "not in default"
+    assert len(notes.search(text="walrus", text_field="body")) == 4
+    assert notes.delete(parent="p0").deleted == 2
+    assert sorted(h.id for h in notes.search(k=10)) == ["n1", "n3"]
+    assert notes.schema() == schema
+    with pytest.raises(c.ForbiddenError):
+        app.create_collection("x", schema)
+    admin.drop_collection(name)
+    assert name not in [x["name"] for x in admin.list_collections()]
+    with pytest.raises(c.NotFoundError):
+        notes.search(k=1)

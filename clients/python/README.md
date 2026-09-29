@@ -40,6 +40,23 @@ read. It therefore reads what it wrote, and never reads back what it deleted, th
 node. To give the same guarantee to another service, pass it `db.token`:
 `Client(..., token=token)`, or `db.observe(token)` on an existing client.
 
+## Collections
+
+Without `collection()`, calls act on `default`, the collection defined at startup.
+
+```python
+admin = Client(url, api_key=ADMIN_KEY)
+admin.create_collection("notes", {"fields": [
+    {"name": "embedding", "kind": {"Vector": {"dims": 384, "metric": "Cosine"}}},
+    {"name": "body", "kind": "Text"},
+]}, shards=4)
+notes = db.collection("notes")   # the same calls, on "notes"
+notes.upsert([{"id": "n1", "embedding": [...], "body": "..."}])
+admin.drop_collection("notes")   # deletes its data on every node
+```
+
+`create_collection` and `drop_collection` need an admin key. `list_collections` needs a read key.
+
 ## Tenants
 
 ```python

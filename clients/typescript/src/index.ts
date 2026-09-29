@@ -10,6 +10,7 @@
  * const hits = await db.search({ text: { field: "text", query: "nuclear" }, filter: eq("lang", "en") });
  * await db.delete({ parent: "doc-1" });          // the document and all its chunks
  * const acme = db.withTenant("acme");           // unscoped key acting for one tenant
+ * const notes = db.collection("notes");          // another collection, same calls
  * await db.forgetTenant("acme");                 // erase a tenant
  * ```
  *
@@ -115,6 +116,13 @@ export type DeleteRequest =
   | { filter: Filter }
   | { parent: Id };
 
+/** A collection's definition (`schema` without the reserved fields). */
+export interface Collection {
+  name: string;
+  shards: number;
+  schema: { fields: { name: string; kind: unknown }[] };
+}
+
 export interface CairnOptions {
   /** One node's address, or several: requests rotate among them on failure. */
   url: string | string[];
@@ -131,6 +139,8 @@ export interface CairnOptions {
   token?: string;
   /** A `fetch` implementation (default: the global one). */
   fetch?: typeof fetch;
+  /** The collection document calls act on (default: `default`). See `collection()`. */
+  collection?: string;
 }
 
 /** Any error from the API or the network. */
@@ -194,16 +204,17 @@ export function mergeTokens(...tokens: (string | undefined)[]): string {
     .join(",");
 }
 
-/** The path of a document: digits are an integer id, so a text id made of digits says so. */
+/** The path of a document under its collection's prefix: digits are an integer id, so a text
+ * id made of digits says so. */
 function docPath(id: Id): string {
   if (typeof id === "number") {
     if (!Number.isSafeInteger(id) || id < 0) {
       throw new InvalidInputError(`an integer id is a non-negative safe integer: ${id}`, 400);
     }
-    return `/v1/documents/${id}`;
+    return `/documents/${id}`;
   }
   const q = /^[0-9]+$/.test(id) ? "id_type=text" : "";
-  return `/v1/documents/${encodeURIComponent(id)}${q ? `?${q}` : ""}`;
+  return `/documents/${encodeURIComponent(id)}${q ? `?${q}` : ""}`;
 }
 
 /** Token state shared by a client and its tenant views. */
@@ -240,15 +251,47 @@ export class Cairn {
     return new Cairn({ ...this.opts, tenant }, this.box);
   }
 
+  /** A view acting on collection `name`, sharing this client's token and tenant. */
+  collection(name: string): Cairn {
+    return new Cairn({ ...this.opts, collection: name }, this.box);
+  }
+
+  /** Creates a collection (admin key); resolves once it is ready on every node. */
+  async createCollection(
+    name: string,
+    schema: { fields: { name: string; kind: unknown }[] },
+    opts: { shards?: number } = {},
+  ): Promise<Collection> {
+    const body: Record<string, unknown> = { name, schema };
+    if (opts.shards !== undefined) body.shards = opts.shards;
+    return (await this.call("POST", "/v1/collections", body)) as Collection;
+  }
+
+  /** The live collections, `default` first. */
+  async listCollections(): Promise<Collection[]> {
+    return ((await this.call("GET", "/v1/collections")) as { collections: Collection[] }).collections;
+  }
+
+  /** Drops a collection and deletes its data on every node (admin key). */
+  async dropCollection(name: string): Promise<void> {
+    await this.call("DELETE", `/v1/collections/${encodeURIComponent(name)}`);
+  }
+
+  /** Path prefix of this client's collection. */
+  private get base(): string {
+    const c = this.opts.collection;
+    return c && c !== "default" ? `/v1/collections/${encodeURIComponent(c)}` : "/v1";
+  }
+
   /** Inserts or replaces documents. */
   async upsert(documents: Document[]): Promise<WriteResult> {
-    const r = await this.call("POST", "/v1/documents", this.after({ documents }));
+    const r = await this.call("POST", `${this.base}/documents`, this.after({ documents }));
     return this.written(r);
   }
 
   /** One document, or `null` when there is none (or it was taken down). */
   async get(id: Id, opts: { consistency?: Consistency } = {}): Promise<Document | null> {
-    let path = docPath(id);
+    let path = this.base + docPath(id);
     const params = new URLSearchParams();
     if (this.box.value) params.set("after", this.box.value);
     if (opts.consistency) params.set("consistency", opts.consistency);
@@ -276,7 +319,7 @@ export class Cairn {
     if (req.oversample !== undefined) body.oversample = req.oversample;
     if (req.withDocuments !== undefined) body.with_documents = req.withDocuments;
     if (req.consistency) body.consistency = req.consistency;
-    const r = (await this.call("POST", "/v1/search", this.after(body))) as { hits: Hit[] };
+    const r = (await this.call("POST", `${this.base}/search`, this.after(body))) as { hits: Hit[] };
     return r.hits;
   }
 
@@ -294,7 +337,7 @@ export class Cairn {
     } else {
       body = { filter: req.filter };
     }
-    const r = (await this.call("POST", "/v1/documents/delete", this.after(body))) as {
+    const r = (await this.call("POST", `${this.base}/documents/delete`, this.after(body))) as {
       count?: number;
       deleted?: number;
       consistency_token: string;
@@ -306,7 +349,7 @@ export class Cairn {
   /** Erases a tenant: every document it holds (unscoped keys with the takedown role). */
   async forgetTenant(tenant: string): Promise<DeleteResult> {
     const q = this.box.value ? `?after=${encodeURIComponent(this.box.value)}` : "";
-    const r = (await this.call("DELETE", `/v1/tenants/${encodeURIComponent(tenant)}${q}`)) as {
+    const r = (await this.call("DELETE", `${this.base}/tenants/${encodeURIComponent(tenant)}${q}`)) as {
       deleted: number;
       consistency_token: string;
     };
@@ -316,7 +359,7 @@ export class Cairn {
 
   /** The collection schema (reserved fields hidden). */
   async schema(): Promise<{ fields: { name: string; kind: unknown }[] }> {
-    return (await this.call("GET", "/v1/schema")) as { fields: { name: string; kind: unknown }[] };
+    return (await this.call("GET", `${this.base}/schema`)) as { fields: { name: string; kind: unknown }[] };
   }
 
   private after(body: Record<string, unknown>): Record<string, unknown> {

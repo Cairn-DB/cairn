@@ -21,6 +21,7 @@ from ._core import (
     UnavailableError,
     VectorLeg,
     WriteResult,
+    collection_base,
     delete_body,
     delete_result,
     doc_path,
@@ -41,6 +42,7 @@ class _Base:
         timeout: float = 30.0,
         retries: int = 3,
         token: Optional[str] = None,
+        collection: Optional[str] = None,
         _box: Optional[TokenBox] = None,
     ) -> None:
         urls = [url] if isinstance(url, str) else list(url)
@@ -53,6 +55,8 @@ class _Base:
         self._timeout = timeout
         self._retries = retries
         self._box = _box or TokenBox(merge_tokens(token) if token else "")
+        self._collection = collection
+        self._base = collection_base(collection)
         self._next = 0
 
     @property
@@ -73,16 +77,19 @@ class _Base:
             h["cairn-tenant"] = self._tenant
         return h
 
-    def _view_args(self, tenant: str) -> dict[str, Any]:
-        return dict(
+    def _view_args(self, **changes: Any) -> dict[str, Any]:
+        args: dict[str, Any] = dict(
             url=self._urls,
             api_key=self._api_key,
-            tenant=tenant,
+            tenant=self._tenant,
             parent_field=self._parent_field,
             timeout=self._timeout,
             retries=self._retries,
+            collection=self._collection,
             _box=self._box,
         )
+        args.update(changes)
+        return args
 
     def _outcome(self, res: Optional[httpx.Response], err: Optional[Exception], url: str) -> Any:
         """The decoded answer, or the error to raise (retry when it is an UnavailableError)."""
@@ -106,6 +113,7 @@ class Client(_Base):
     >>> hits = db.search(text="nuclear", text_field="text", filter=eq("lang", "en"))
     >>> db.delete(parent="doc-1")              # the document and all its chunks
     >>> db.with_tenant("acme").get("doc-1")    # an unscoped key acting for one tenant
+    >>> db.collection("notes").search(...)      # another collection, same calls
     >>> db.forget_tenant("acme")               # erase a tenant
 
     Reads pass the token of this client's writes and takedowns, so it reads its own writes and
@@ -127,7 +135,26 @@ class Client(_Base):
 
     def with_tenant(self, tenant: str) -> "Client":
         """A view acting for ``tenant`` (unscoped keys), sharing this client's token."""
-        return Client(**self._view_args(tenant))
+        return Client(**self._view_args(tenant=tenant))
+
+    def collection(self, name: str) -> "Client":
+        """A view acting on collection ``name``, sharing this client's token and tenant."""
+        return Client(**self._view_args(collection=name))
+
+    def create_collection(self, name: str, schema: Mapping[str, Any], *, shards: Optional[int] = None) -> dict[str, Any]:
+        """Creates a collection (admin key); returns once it is ready on every node."""
+        body: dict[str, Any] = {"name": name, "schema": dict(schema)}
+        if shards is not None:
+            body["shards"] = shards
+        return self._call("POST", "/v1/collections", body)
+
+    def list_collections(self) -> list[dict[str, Any]]:
+        """The live collections, ``default`` first."""
+        return self._call("GET", "/v1/collections")["collections"]
+
+    def drop_collection(self, name: str) -> None:
+        """Drops a collection and deletes its data on every node (admin key)."""
+        self._call("DELETE", "/v1/collections/" + urllib.parse.quote(name, safe=""))
 
     def _call(self, method: str, path: str, body: Any = None) -> Any:
         last: Exception = UnavailableError("no attempt", 0)
@@ -154,14 +181,14 @@ class Client(_Base):
         body: dict[str, Any] = {"documents": list(documents)}
         if self.token:
             body["after"] = self.token
-        r = self._call("POST", "/v1/documents", body)
+        r = self._call("POST", f"{self._base}/documents", body)
         self.observe(r["consistency_token"])
         return WriteResult(count=r["count"], token=r["consistency_token"])
 
     def get(self, id: Id, *, consistency: Optional[Consistency] = None) -> Optional[Document]:
         """One document, or ``None`` when there is none (or it was taken down)."""
         try:
-            return self._call("GET", doc_path(id, self.token, consistency))
+            return self._call("GET", doc_path(id, self.token, consistency, self._base))
         except NotFoundError:
             return None
 
@@ -185,7 +212,7 @@ class Client(_Base):
             fusion=fusion, oversample=oversample, with_documents=with_documents,
             consistency=consistency, after=self.token,
         )
-        return [Hit.from_json(h) for h in self._call("POST", "/v1/search", body)["hits"]]
+        return [Hit.from_json(h) for h in self._call("POST", f"{self._base}/search", body)["hits"]]
 
     def delete(
         self,
@@ -198,20 +225,20 @@ class Client(_Base):
         the deletion is applied), by ``parent`` (a document's chunks), or ``ids`` that also
         match ``filter``."""
         body = delete_body(ids=ids, filter=filter, parent=parent, parent_field=self._parent_field, after=self.token)
-        r = self._call("POST", "/v1/documents/delete", body)
+        r = self._call("POST", f"{self._base}/documents/delete", body)
         self.observe(r["consistency_token"])
         return delete_result(r)
 
     def forget_tenant(self, tenant: str) -> DeleteResult:
         """Erases a tenant: every document it holds (unscoped keys with the takedown role)."""
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""
-        r = self._call("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant, safe='')}{q}")
+        r = self._call("DELETE", f"{self._base}/tenants/{urllib.parse.quote(tenant, safe='')}{q}")
         self.observe(r["consistency_token"])
         return delete_result(r)
 
     def schema(self) -> dict[str, Any]:
         """The collection schema (reserved fields hidden)."""
-        return self._call("GET", "/v1/schema")
+        return self._call("GET", f"{self._base}/schema")
 
 
 class AsyncClient(_Base):
@@ -232,7 +259,25 @@ class AsyncClient(_Base):
 
     def with_tenant(self, tenant: str) -> "AsyncClient":
         """A view acting for ``tenant`` (unscoped keys), sharing this client's token."""
-        return AsyncClient(**self._view_args(tenant))
+        return AsyncClient(**self._view_args(tenant=tenant))
+
+    def collection(self, name: str) -> "AsyncClient":
+        """A view acting on collection ``name``, sharing this client's token and tenant."""
+        return AsyncClient(**self._view_args(collection=name))
+
+    async def create_collection(
+        self, name: str, schema: Mapping[str, Any], *, shards: Optional[int] = None
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"name": name, "schema": dict(schema)}
+        if shards is not None:
+            body["shards"] = shards
+        return await self._call("POST", "/v1/collections", body)
+
+    async def list_collections(self) -> list[dict[str, Any]]:
+        return (await self._call("GET", "/v1/collections"))["collections"]
+
+    async def drop_collection(self, name: str) -> None:
+        await self._call("DELETE", "/v1/collections/" + urllib.parse.quote(name, safe=""))
 
     async def _call(self, method: str, path: str, body: Any = None) -> Any:
         last: Exception = UnavailableError("no attempt", 0)
@@ -258,13 +303,13 @@ class AsyncClient(_Base):
         body: dict[str, Any] = {"documents": list(documents)}
         if self.token:
             body["after"] = self.token
-        r = await self._call("POST", "/v1/documents", body)
+        r = await self._call("POST", f"{self._base}/documents", body)
         self.observe(r["consistency_token"])
         return WriteResult(count=r["count"], token=r["consistency_token"])
 
     async def get(self, id: Id, *, consistency: Optional[Consistency] = None) -> Optional[Document]:
         try:
-            return await self._call("GET", doc_path(id, self.token, consistency))
+            return await self._call("GET", doc_path(id, self.token, consistency, self._base))
         except NotFoundError:
             return None
 
@@ -287,7 +332,7 @@ class AsyncClient(_Base):
             fusion=fusion, oversample=oversample, with_documents=with_documents,
             consistency=consistency, after=self.token,
         )
-        r = await self._call("POST", "/v1/search", body)
+        r = await self._call("POST", f"{self._base}/search", body)
         return [Hit.from_json(h) for h in r["hits"]]
 
     async def delete(
@@ -298,15 +343,15 @@ class AsyncClient(_Base):
         parent: Optional[Id] = None,
     ) -> DeleteResult:
         body = delete_body(ids=ids, filter=filter, parent=parent, parent_field=self._parent_field, after=self.token)
-        r = await self._call("POST", "/v1/documents/delete", body)
+        r = await self._call("POST", f"{self._base}/documents/delete", body)
         self.observe(r["consistency_token"])
         return delete_result(r)
 
     async def forget_tenant(self, tenant: str) -> DeleteResult:
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""
-        r = await self._call("DELETE", f"/v1/tenants/{urllib.parse.quote(tenant, safe='')}{q}")
+        r = await self._call("DELETE", f"{self._base}/tenants/{urllib.parse.quote(tenant, safe='')}{q}")
         self.observe(r["consistency_token"])
         return delete_result(r)
 
     async def schema(self) -> dict[str, Any]:
-        return await self._call("GET", "/v1/schema")
+        return await self._call("GET", f"{self._base}/schema")
