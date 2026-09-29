@@ -35,7 +35,7 @@ curl -s localhost:7200/v1/collections/notes/search -H "Authorization: Bearer $KE
 
 | method and path | role | answer |
 |---|---|---|
-| `POST /v1/collections` | admin | `{"name", "schema", "shards"?}`; 201 with the definition, 409 if the name is taken |
+| `POST /v1/collections` | admin | `{"name", "schema", "shards"?, "expires_field"?}`; 201 with the definition, 409 if the name is taken |
 | `GET /v1/collections` | read | `{"collections":[...]}`, `default` first |
 | `GET /v1/collections/{c}` | read | the definition |
 | `DELETE /v1/collections/{c}` | admin | drops it and deletes its data on every node |
@@ -52,6 +52,27 @@ curl -s localhost:7200/v1/collections/notes/search -H "Authorization: Bearer $KE
   identifies a document within its collection only.
 - Every collection uses the node's `--replication`. Per-collection replication and document
   counts come later.
+
+## Retention
+
+A collection can expire its documents (ADR 0031): name a field that holds each document's
+expiry, in Unix milliseconds, as `expires_field` when creating the collection (an `I64` or
+`Date` field), or with `--expires-field` for `default`.
+
+```bash
+curl -s -X POST localhost:7200/v1/collections -H "Authorization: Bearer $KEY" \
+  -H content-type:application/json -d '{"name": "sessions", "expires_field": "until",
+  "schema": {"fields": [{"name": "text", "kind": "Text"}, {"name": "until", "kind": "Date"}]}}'
+```
+
+- **Reads.** From its expiry on, a document is never returned by the HTTP API, neither by
+  reads nor by searches.
+- **Deletion.** The shard leaders delete expired documents every `--retention-interval-ms`
+  (10 s by default). Each deletion is a deletion by filter carrying the time, so every
+  replica deletes the same documents. The audit log records it (`expired documents deleted`,
+  with the collection, shard, count, time and token).
+- A document without a value in the field never expires. Writing a new expiry postpones it.
+- The binary protocol does not hide expired documents between sweeps.
 
 ## Documents
 

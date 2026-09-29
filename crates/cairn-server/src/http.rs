@@ -386,7 +386,39 @@ async fn schema(State(s): State<Arc<Shared>>, params: Params) -> ApiResult<Json<
 }
 
 fn collection_json(c: &CollectionDef) -> Json_ {
-    json!({ "name": c.name, "shards": c.shards, "schema": visible_schema(&c.schema) })
+    let mut j = json!({ "name": c.name, "shards": c.shards, "schema": visible_schema(&c.schema) });
+    if let Some(f) = &c.expires_field {
+        j["expires_field"] = json!(f);
+    }
+    j
+}
+
+/// Wall-clock time for retention (ADR 0031), in Unix milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// `p`, restricted to documents not expired now: expired documents are hidden at once,
+/// before the shard leaders delete them.
+fn unexpired(coll: &CollectionDef, p: Predicate) -> Predicate {
+    match coll.expired(now_ms()) {
+        None => p,
+        Some(expired) => {
+            let live = Predicate::Not(Box::new(expired));
+            if matches!(p, Predicate::True) {
+                live
+            } else {
+                Predicate::And(vec![p, live])
+            }
+        }
+    }
+}
+
+/// Whether a document has expired.
+fn is_expired(coll: &CollectionDef, d: &Document) -> bool {
+    coll.expired(now_ms()).is_some_and(|p| p.matches(d))
 }
 
 #[derive(Deserialize)]
@@ -395,6 +427,9 @@ struct CreateCollectionBody {
     schema: Json_,
     #[serde(default)]
     shards: Option<u32>,
+    /// Retention: a field holding each document's expiry, in Unix milliseconds.
+    #[serde(default)]
+    expires_field: Option<String>,
 }
 
 /// Creates a collection (ADR 0031): answers once every shard is ready.
@@ -410,20 +445,24 @@ async fn create_collection(
     };
     let schema = body.schema.to_string();
     let name = body.name.clone();
-    let def = with_client(&s, move |c| c.create_collection(&name, &schema, shards))
-        .await
-        .map_err(|e| {
-            if e.1.contains("already exists") {
-                ApiError(StatusCode::CONFLICT, e.1)
-            } else if e.1.contains("collection name")
-                || e.1.contains("shards must")
-                || e.1.contains("schema")
-            {
-                ApiError(StatusCode::BAD_REQUEST, e.1)
-            } else {
-                e
-            }
-        })?;
+    let expires = body.expires_field.clone();
+    let def = with_client(&s, move |c| {
+        c.create_collection(&name, &schema, shards, expires.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        if e.1.contains("already exists") {
+            ApiError(StatusCode::CONFLICT, e.1)
+        } else if e.1.contains("collection name")
+            || e.1.contains("shards must")
+            || e.1.contains("schema")
+            || e.1.contains("expires_field")
+        {
+            ApiError(StatusCode::BAD_REQUEST, e.1)
+        } else {
+            e
+        }
+    })?;
     let def: CollectionDef = serde_json::from_str(&def)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tracing::info!(target: "cairn_server::audit", collection = %def.name, shards = def.shards, "collection created");
@@ -1276,6 +1315,7 @@ async fn get_doc(
             .tenant
             .as_deref()
             .is_none_or(|t| tenant_of(&coll.schema, d) == Some(t))
+            && !is_expired(&coll, d)
     });
     Ok(match doc {
         Some(d) => Json(doc_json(&coll.schema, &scope, &d)).into_response(),
@@ -1426,7 +1466,7 @@ async fn search(
     user_filter
         .validate(schema)
         .map_err(|e| ApiError::bad(e.to_string()))?;
-    q.filter = scoped(schema, scope.tenant.as_deref(), user_filter)?;
+    q.filter = unexpired(&coll, scoped(schema, scope.tenant.as_deref(), user_filter)?);
     if let Some(f) = body.fusion {
         q.fusion = match f {
             FusionBody::Rrf { k } => Fusion::Rrf { k },

@@ -93,6 +93,8 @@ pub enum Request {
         schema: String,
         /// Shard count.
         shards: u32,
+        /// Retention field (empty: none).
+        expires_field: String,
     },
     /// Drop a collection and delete its data everywhere: answered with its definition.
     DropCollection {
@@ -499,8 +501,13 @@ impl Request {
                 name,
                 schema,
                 shards,
+                expires_field,
             } => {
-                w.u8(14).str(name).str(schema).u32(*shards);
+                w.u8(14)
+                    .str(name)
+                    .str(schema)
+                    .u32(*shards)
+                    .str(expires_field);
             }
             Request::DropCollection { name } => {
                 w.u8(15).str(name);
@@ -637,6 +644,7 @@ impl Request {
                 name: r.str()?.to_owned(),
                 schema: r.str()?.to_owned(),
                 shards: r.u32()?,
+                expires_field: r.str()?.to_owned(),
             },
             15 => Request::DropCollection {
                 name: r.str()?.to_owned(),
@@ -914,6 +922,7 @@ mod tests {
                 name: "docs".into(),
                 schema: "{}".into(),
                 shards: 4,
+                expires_field: "expires".into(),
             },
             Request::DropCollection {
                 name: "docs".into(),

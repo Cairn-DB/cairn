@@ -566,8 +566,12 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   `parent`). Live: LangChain.js 1/1, LangChain + LlamaIndex 2/2 (venv in the scratchpad:
   langchain-core 1.6.6, llama-index-core 0.14.25, @langchain/core 1.2.13). Requirements found:
   Python 3.10+, Node 20+; CI runs adapters on Node 22 / Python 3.13 only.
-  - Step B complete. Next (owner): public launch as 0.3 (repo public, npm/PyPI, image :0.3,
-    announcement), then step C (retention, partial updates, Kafka, proof of deletion).
+  - Step B complete. Owner chose step C before the public launch ("étape c").
+- 0.3 step C.1, retention (2026-09-29): ADR 0031 "step C.1" notes. `Runtime::unix_millis`;
+  per-collection `expires_field` (+ `--expires-field`, `--retention-interval-ms`); leader sweep
+  = probe then `DeleteWhere{field <= now}`; HTTP hides expired docs at once; audited.
+  `tests/http_retention.rs` (3/3 runs); idle sweeps add no log entries (checked).
+  - Next: C.2 partial updates (Patch).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

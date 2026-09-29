@@ -109,3 +109,16 @@ def test_collections_against_a_live_node():
     assert name not in [x["name"] for x in admin.list_collections()]
     with pytest.raises(c.NotFoundError):
         notes.search(k=1)
+
+
+def test_retention_through_the_client():
+    admin = c.Client(URL, os.environ["CAIRN_ADMIN_KEY"])
+    name = f"py-ttl-{os.getpid()}"
+    schema = {"fields": [{"name": "body", "kind": "Text"}, {"name": "until", "kind": "I64"}]}
+    assert admin.create_collection(name, schema, expires_field="until")["expires_field"] == "until"
+    col = c.Client(URL, os.environ["CAIRN_KEY"]).collection(name)
+    now = int(time.time() * 1000)
+    col.upsert([{"id": "gone", "body": "x", "until": now - 1000}, {"id": "kept", "body": "x", "until": now + 600_000}])
+    assert col.get("gone") is None
+    assert [h.id for h in col.search(k=10)] == ["kept"]
+    admin.drop_collection(name)

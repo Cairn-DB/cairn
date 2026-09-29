@@ -43,9 +43,49 @@ pub struct CollectionDef {
     pub shards: u32,
     /// Schema, with the reserved fields.
     pub schema: Schema,
+    /// Retention (ADR 0031): documents whose value of this field (Unix milliseconds) has
+    /// passed are hidden from reads and deleted by the shard leaders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_field: Option<String>,
 }
 
 impl CollectionDef {
+    /// Checks the retention field: an `I64` or `Date` field of the schema, not reserved.
+    pub fn check_retention(&self) -> Result<()> {
+        let Some(f) = &self.expires_field else {
+            return Ok(());
+        };
+        let kind = self
+            .schema
+            .index_of(f)
+            .filter(|_| !cairn_core::schema::is_reserved(f))
+            .map(|i| &self.schema.fields[i].kind)
+            .ok_or_else(|| Error::InvalidRequest(format!("expires_field: no field {f:?}")))?;
+        if matches!(kind, FieldKind::I64 | FieldKind::Date) {
+            Ok(())
+        } else {
+            Err(Error::InvalidRequest(format!(
+                "expires_field: {f:?} must be an I64 or Date field (Unix milliseconds)"
+            )))
+        }
+    }
+
+    /// The filter matching the documents expired at `now_ms`.
+    pub fn expired(&self, now_ms: i64) -> Option<cairn_core::Predicate> {
+        let field = self.schema.index_of(self.expires_field.as_deref()?)?;
+        let value = match self.schema.fields[field].kind {
+            FieldKind::Date => Value::Date(now_ms),
+            _ => Value::I64(now_ms),
+        };
+        Some(cairn_core::Predicate::Range {
+            field,
+            lo: None,
+            hi: Some(value),
+            lo_inclusive: false,
+            hi_inclusive: true,
+        })
+    }
+
     /// The shard of a document id.
     pub fn route(&self, id: DocId) -> Result<ShardId> {
         match id.keyed_shard() {
@@ -262,6 +302,7 @@ mod tests {
             base,
             shards,
             schema: catalog_schema(),
+            expires_field: None,
         }
     }
 

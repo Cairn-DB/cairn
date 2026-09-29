@@ -88,3 +88,16 @@ test("collections against a live node", { skip }, async () => {
   assert.ok(!(await admin.listCollections()).some((c) => c.name === name));
   await assert.rejects(notes.search({ k: 1 }), NotFoundError);
 });
+
+test("retention through the client", { skip }, async () => {
+  const admin = new Cairn({ url, apiKey: process.env.CAIRN_ADMIN_KEY });
+  const name = `ts-ttl-${process.pid}`;
+  const schema = { fields: [{ name: "body", kind: "Text" }, { name: "until", kind: "I64" }] };
+  const created = await admin.createCollection(name, schema, { expiresField: "until" });
+  assert.equal(created.expires_field, "until");
+  const c = new Cairn({ url, apiKey: process.env.CAIRN_KEY }).collection(name);
+  await c.upsert([{ id: "gone", body: "x", until: Date.now() - 1000 }, { id: "kept", body: "x", until: Date.now() + 600000 }]);
+  assert.equal(await c.get("gone"), null);
+  assert.deepEqual((await c.search({ k: 10 })).map((h) => h.id), ["kept"]);
+  await admin.dropCollection(name);
+});

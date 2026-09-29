@@ -124,6 +124,8 @@ export type DeleteRequest =
 export interface Collection {
   name: string;
   shards: number;
+  /** Retention: the field holding each document's expiry (Unix milliseconds). */
+  expires_field?: string;
   schema: { fields: { name: string; kind: unknown }[] };
 }
 
@@ -264,10 +266,11 @@ export class Cairn {
   async createCollection(
     name: string,
     schema: { fields: { name: string; kind: unknown }[] },
-    opts: { shards?: number } = {},
+    opts: { shards?: number; expiresField?: string } = {},
   ): Promise<Collection> {
     const body: Record<string, unknown> = { name, schema };
     if (opts.shards !== undefined) body.shards = opts.shards;
+    if (opts.expiresField) body.expires_field = opts.expiresField;
     return (await this.call("POST", "/v1/collections", body)) as Collection;
   }
 

@@ -141,11 +141,22 @@ class Client(_Base):
         """A view acting on collection ``name``, sharing this client's token and tenant."""
         return Client(**self._view_args(collection=name))
 
-    def create_collection(self, name: str, schema: Mapping[str, Any], *, shards: Optional[int] = None) -> dict[str, Any]:
-        """Creates a collection (admin key); returns once it is ready on every node."""
+    def create_collection(
+        self,
+        name: str,
+        schema: Mapping[str, Any],
+        *,
+        shards: Optional[int] = None,
+        expires_field: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Creates a collection (admin key); returns once it is ready on every node. With
+        ``expires_field`` (a field holding each document's expiry, Unix milliseconds), expired
+        documents are hidden at once and then deleted."""
         body: dict[str, Any] = {"name": name, "schema": dict(schema)}
         if shards is not None:
             body["shards"] = shards
+        if expires_field:
+            body["expires_field"] = expires_field
         return self._call("POST", "/v1/collections", body)
 
     def list_collections(self) -> list[dict[str, Any]]:
@@ -268,11 +279,18 @@ class AsyncClient(_Base):
         return AsyncClient(**self._view_args(collection=name))
 
     async def create_collection(
-        self, name: str, schema: Mapping[str, Any], *, shards: Optional[int] = None
+        self,
+        name: str,
+        schema: Mapping[str, Any],
+        *,
+        shards: Optional[int] = None,
+        expires_field: Optional[str] = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"name": name, "schema": dict(schema)}
         if shards is not None:
             body["shards"] = shards
+        if expires_field:
+            body["expires_field"] = expires_field
         return await self._call("POST", "/v1/collections", body)
 
     async def list_collections(self) -> list[dict[str, Any]]:

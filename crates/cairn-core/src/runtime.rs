@@ -132,6 +132,11 @@ pub trait Runtime: Clone + 'static {
     /// Current monotonic time.
     fn now(&self) -> Instant;
 
+    /// Wall-clock time, in milliseconds since the Unix epoch. Engine code never decides with it:
+    /// a node reads it to put a time into a command (retention, ADR 0031), and every replica
+    /// applies that command with the time it carries. The simulator starts at a fixed date.
+    fn unix_millis(&self) -> i64;
+
     /// Completes when `now() >= deadline`.
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
 

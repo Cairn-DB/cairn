@@ -257,6 +257,12 @@ impl Runtime for RealRuntime {
     type Disk = BlockingDisk;
     type Network = NoNetwork;
 
+    fn unix_millis(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
     fn now(&self) -> Instant {
         self.handle.now()
     }

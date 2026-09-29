@@ -49,6 +49,11 @@ impl Runtime for SimRuntime {
     type Disk = SimDisk;
     type Network = SimNetwork;
 
+    fn unix_millis(&self) -> i64 {
+        // 2026-01-01T00:00:00Z plus simulated time: deterministic.
+        1_767_225_600_000 + i64::try_from(self.handle.now().as_nanos() / 1_000_000).unwrap_or(0)
+    }
+
     fn now(&self) -> Instant {
         self.handle.now()
     }

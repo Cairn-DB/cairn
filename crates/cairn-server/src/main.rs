@@ -90,6 +90,14 @@ struct Cli {
     /// or `cairn-bench merges resume`). Merges already committed still complete.
     #[arg(long)]
     merges_paused: bool,
+    /// Retention of the `default` collection (ADR 0031): a field (I64 or Date) holding each
+    /// document's expiry in Unix milliseconds. Expired documents are hidden from HTTP reads at
+    /// once, and deleted by the shard leaders.
+    #[arg(long)]
+    expires_field: Option<String>,
+    /// How often shard leaders delete expired documents (milliseconds; 0: never).
+    #[arg(long, default_value_t = 10_000)]
+    retention_interval_ms: u64,
     /// Do not move shard leaderships to their preferred replicas (ADR 0020).
     #[arg(long)]
     no_leader_balancing: bool,
@@ -295,6 +303,8 @@ fn main() -> anyhow::Result<()> {
         tick_ms: cli.tick_ms,
         drop_prob: cli.drop_prob,
         merges_paused: cli.merges_paused,
+        expires_field: cli.expires_field.clone(),
+        retention_interval_ms: cli.retention_interval_ms,
     })?;
     eprintln!(
         "cairn-server node {} listening on {} ({} cores)",

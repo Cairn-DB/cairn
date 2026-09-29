@@ -27,6 +27,11 @@ wire protocol or the on-disk format; the notes say so.
   - Search one hit per document, and hybrid search.
   - Tested against a live node. Python 3.10+ and Node 20+, as their frameworks require.
 
+- Retention (ADR 0031): a collection's `expires_field` (or `--expires-field` for `default`)
+  holds each document's expiry in Unix milliseconds. Expired documents are hidden from HTTP
+  reads and searches at once, then deleted by the shard leaders every
+  `--retention-interval-ms`, audited. Clients: `expiresField` / `expires_field` at creation.
+
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
   before retrying. Calls on a connection closed by the peer now fail at once, and the caller

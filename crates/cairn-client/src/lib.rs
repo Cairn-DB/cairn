@@ -81,17 +81,20 @@ impl Client {
         self.collection.as_deref()
     }
 
-    /// Creates a collection; returns its definition (JSON).
+    /// Creates a collection, with an optional retention field (ADR 0031); returns its
+    /// definition (JSON).
     pub fn create_collection(
         &mut self,
         name: &str,
         schema_json: &str,
         shards: u32,
+        expires_field: Option<&str>,
     ) -> Result<String> {
         self.one_collection(Request::CreateCollection {
             name: name.into(),
             schema: schema_json.into(),
             shards,
+            expires_field: expires_field.unwrap_or_default().into(),
         })
     }
 

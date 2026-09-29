@@ -87,6 +87,7 @@ only peers with a certificate from the same CA, for the name `node-<id>.cairn`.
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen ingest write,read
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen compliance takedown
   # 0.2: a key that only ever reaches the tenant "acme" (see docs/api/http.md, Tenants)
+  # 0.3: retention of the default collection: --expires-field <I64 or Date field, Unix ms>
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen acme-app read,write --tenant acme
   ```
   Each prints the key once and a `{"id","sha256","roles"}` entry. Collect the entries in a

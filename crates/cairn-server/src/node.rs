@@ -94,6 +94,10 @@ pub struct NodeConfig {
     pub drop_prob: f64,
     /// Start with merges paused ([`Node::set_merges_paused`]).
     pub merges_paused: bool,
+    /// Retention field of the `default` collection (ADR 0031).
+    pub expires_field: Option<String>,
+    /// How often shard leaders delete expired documents, in milliseconds.
+    pub retention_interval_ms: u64,
 }
 
 enum CoreRequest {
@@ -262,6 +266,7 @@ fn default_collection(cfg: &NodeConfig) -> CollectionDef {
         base: 0,
         shards: cfg.shards,
         schema: cfg.schema.clone(),
+        expires_field: cfg.expires_field.clone(),
     }
 }
 
@@ -300,6 +305,7 @@ impl Node {
                 catalog::MAX_SHARD
             )));
         }
+        default_collection(&cfg).check_retention()?;
         catalog::install(catalog::from_entries(default_collection(&cfg), &[]));
         job_slots(cfg.compaction_slots).set_merges_paused(cfg.merges_paused);
         let cores_n = cfg.cores.max(1);
@@ -386,6 +392,7 @@ impl Node {
         if core == 0 {
             Self::spawn_dispatcher(&rt, queues.clone(), cfg.cores.max(1));
             Self::spawn_reconciler(&rt, queues.clone(), cfg.clone());
+            Self::spawn_retention(&rt, queues.clone(), cfg.clone());
             Self::spawn_coordinator(&rt, queues, cfg);
         }
         let _ = ex.run();
@@ -1415,6 +1422,80 @@ impl Node {
         });
     }
 
+    /// Retention (ADR 0031): every `retention_interval_ms`, for each collection with an
+    /// `expires_field`, each shard this node leads deletes its expired documents. The time is
+    /// read here and carried by the command, so every replica deletes the same documents.
+    fn spawn_retention(rt: &Runtime, queues: Queues, cfg: NodeConfig) {
+        if cfg.retention_interval_ms == 0 {
+            return;
+        }
+        let rt2 = rt.clone();
+        rt.spawn(async move {
+            let cores = cfg.cores.max(1);
+            loop {
+                rt2.sleep(cairn_core::Duration::from_millis(cfg.retention_interval_ms))
+                    .await;
+                let now = rt2.unix_millis();
+                for coll in catalog::current().live {
+                    let Some(filter) = coll.expired(now) else {
+                        continue;
+                    };
+                    for shard in coll.shard_ids() {
+                        let leads = Self::send(&queues, cores, shard, |reply| {
+                            CoreRequest::Status { shard, reply }
+                        })
+                        .await
+                        .flatten()
+                        .is_some_and(|st| st.role == cairn_raft::Role::Leader);
+                        if !leads {
+                            continue;
+                        }
+                        // Look before writing: a sweep that finds nothing adds nothing to the log.
+                        let mut probe = Query::new(1);
+                        probe.filter = filter.clone();
+                        let found =
+                            Self::send(&queues, cores, shard, |reply| CoreRequest::QueryLegs {
+                                shard,
+                                query: probe,
+                                consistency: Consistency::Stale,
+                                reply,
+                            })
+                            .await
+                            .and_then(Result::ok)
+                            .is_some_and(|lists| lists.iter().any(|l| !l.hits.is_empty()));
+                        if !found {
+                            continue;
+                        }
+                        let cmd = Command::DeleteWhere {
+                            scope: DeleteScope::All,
+                            filter: filter.clone(),
+                        };
+                        match Self::send(&queues, cores, shard, |reply| CoreRequest::Propose {
+                            shard,
+                            cmd,
+                            reply,
+                        })
+                        .await
+                        {
+                            Some(Ok(a)) if a.deleted > 0 => tracing::info!(
+                                target: "cairn_server::audit",
+                                collection = %coll.name,
+                                %shard,
+                                count = a.deleted,
+                                expired_before = now,
+                                token = %format!("{}.{}", a.token.shard.get(), a.token.index.get()),
+                                "expired documents deleted"
+                            ),
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => tracing::debug!(%shard, "retention sweep: {e}"),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Creates, drops or lists collections. Creations and drops run on the catalog leader,
     /// one at a time, after a linearizable read: two of them never pick the same id or shards.
     async fn catalog_request(
@@ -1471,6 +1552,7 @@ impl Node {
                     name,
                     schema,
                     shards,
+                    expires_field,
                 } => {
                     if !catalog::valid_name(&name) || name == catalog::DEFAULT {
                         return Err(Error::InvalidRequest(format!(
@@ -1502,7 +1584,9 @@ impl Node {
                         base,
                         shards,
                         schema,
+                        expires_field: (!expires_field.is_empty()).then_some(expires_field),
                     };
+                    def.check_retention()?;
                     let cmd = Command::UpsertKeyed(vec![catalog::entry_doc(&name, "collection", &def)]);
                     Self::propose_routed(rt, queues, cfg, &default, CATALOG_SHARD, cmd, false).await?;
                     catalog::observe(&[Arc::new(def.clone())], &[], false);

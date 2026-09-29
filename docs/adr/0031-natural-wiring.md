@@ -335,6 +335,29 @@ Step A changes the segment format and the protocol: upgrading from 0.1 needs the
 full-cluster restart that ADR 0018 already requires across versions. Step B adds the catalog
 and its files. Existing data becomes the `default` collection without migration.
 
+### As implemented: step C.1, retention (2026-09-29)
+
+- **Where the time comes from.** A collection names its expiry field. Every
+  `--retention-interval-ms`, each node, for each shard it leads:
+  - reads the wall clock through a new runtime method, `Runtime::unix_millis` (the simulator
+    starts it at a fixed date);
+  - checks locally whether any document has expired, so a sweep that finds nothing writes
+    nothing;
+  - if one has, proposes `DeleteWhere { All, field <= now }`.
+  The time is in the command, so every replica deletes the same documents, as for any
+  deletion by filter. Engine code never reads the clock.
+- **Reads** hide expired documents at once in the HTTP API, with `field > now` added to
+  searches and checked on point reads. Expiry is therefore exact for readers, and the sweep
+  only reclaims space. The binary protocol has no such check.
+- **Audit:** one `expired documents deleted` line per shard and sweep that deleted something,
+  with the count, the time and the token.
+- **Tested:**
+  - a node with 300 ms sweeps (`tests/http_retention.rs`): a document hidden from its expiry
+    on, then deleted and audited; a collection with a Date field; documents already expired
+    when written are never visible; an invalid field is refused;
+  - an idle node with retention: the logs do not grow (commit indexes unchanged over 15
+    sweeps).
+
 ## Validation
 
 - **Property tests**: the dictionary assigns the same ids on every replica whatever the order
