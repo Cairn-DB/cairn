@@ -1077,3 +1077,38 @@ fn text_ids_agree_across_replicas_through_crash_and_snapshot() {
         }
     });
 }
+
+/// A stopped replica (a dropped collection's, ADR 0031) answers no more requests, and its
+/// directory reopens with everything it had applied: stopping closes, it does not corrupt.
+#[test]
+fn a_stopped_replica_closes_cleanly_and_reopens() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(33, SimConfig::default());
+    let handles = spawn_three(&sim, &mut ex, 6000, true);
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = handles.clone();
+    ex.block_on(async move {
+        wait_leader(&rt, &hs).await;
+        for i in 1..=80u64 {
+            propose(&rt, &hs, Command::Upsert(vec![doc(i)])).await;
+        }
+        wait_converged(&rt, &hs, 80).await;
+        hs[2].stop().await;
+        assert!(!hs[2].is_alive());
+        assert!(hs[2].get(DocId(1), Consistency::Stale).await.is_err());
+        // The other two still make progress.
+        propose(&rt, &hs, Command::Delete(vec![DocId(5)])).await;
+    });
+    let (sim2, hh) = (sim.clone(), ex.handle());
+    let again = ex.block_on(async move {
+        Replica::spawn(sim2.runtime(NodeId(3), &hh), config(NodeId(3), 6000), schema())
+            .await
+            .unwrap()
+    });
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let hs = vec![handles[0].clone(), handles[1].clone(), again];
+    ex.block_on(async move {
+        wait_converged(&rt, &hs, 79).await;
+        check_all_docs(&hs, 80, &[5]).await;
+    });
+}

@@ -219,6 +219,8 @@ enum Event {
     ),
     Get(DocRef, Consistency, Sender<Result<Option<Document>>>),
     Status(Sender<ReplicaStatus>),
+    /// Stop the replica: its actor exits and closes its files, then answers.
+    Stop(Sender<()>),
     /// A flushed segment was built and written outside the actor (ADR 0021).
     FlushWritten {
         id: SegmentId,
@@ -266,6 +268,7 @@ impl Event {
             Event::QueryLegs(..) => "query_legs",
             Event::Get(..) => "get",
             Event::Status(..) => "status",
+            Event::Stop(_) => "stop",
             Event::FlushWritten { .. } => "flush_written",
             Event::CompactWritten { .. } => "compact_written",
             Event::IndexesReady { .. } => "indexes_ready",
@@ -300,6 +303,7 @@ impl Drop for AliveGuard {
                 Event::Query(_, _, done) => done.send(closed()),
                 Event::QueryLegs(_, _, done) => done.send(closed()),
                 Event::Get(_, _, done) => done.send(closed()),
+                Event::Stop(done) => done.send(()),
                 Event::Status(_)
                 | Event::Tick
                 | Event::Net(..)
@@ -330,6 +334,17 @@ impl ReplicaHandle {
     /// Whether the replica is still running.
     pub fn is_alive(&self) -> bool {
         self.alive.get()
+    }
+
+    /// Stops the replica: resolves once its actor has exited and closed its files. Requests
+    /// sent afterwards fail as for a stopped replica.
+    pub async fn stop(&self) {
+        if !self.alive.get() {
+            return;
+        }
+        let (tx, rx) = oneshot();
+        self.inbox.push(Event::Stop(tx));
+        let _ = rx.await;
     }
 
     /// Proposes a command; resolves once applied here, or with `NotLeader`.
@@ -603,6 +618,8 @@ pub struct Replica<R: Runtime> {
     /// Flush state (ADR 0016), reset when the replica reopens.
     flush: FlushState,
     persist: Persistence,
+    /// Set by [`ReplicaHandle::stop`]: answered once the actor has closed everything.
+    stopped: Option<Sender<()>>,
 }
 
 /// What a persistence task reports: its sequence, the log index it made durable, the outcome.
@@ -872,6 +889,7 @@ impl<R: Runtime> Replica<R> {
             deferred: std::collections::VecDeque::new(),
             flush: FlushState::default(),
             persist: Persistence::default(),
+            stopped: None,
         };
         replica.persist.durable = replica.log_durable_now();
         replica.persist.next_seq = 1;
@@ -901,7 +919,18 @@ impl<R: Runtime> Replica<R> {
         };
         rt.spawn(async move {
             let _guard = guard;
-            if let Err(e) = replica.run(resume).await {
+            let r = replica.run(resume).await;
+            if r.is_ok() {
+                // Stopped on request: close the engine's files before answering.
+                let done = replica.stopped.take();
+                drop(replica);
+                drop(_guard);
+                if let Some(done) = done {
+                    done.send(());
+                }
+                return;
+            }
+            if let Err(e) = r {
                 tracing::error!(node = %cfg.id, shard = %cfg.shard, "replica stopped: {e}");
                 // Keep answering so callers fail fast instead of waiting forever.
                 loop {
@@ -911,6 +940,7 @@ impl<R: Runtime> Replica<R> {
                         Event::Query(_, _, done) => done.send(closed()),
                         Event::QueryLegs(_, _, done) => done.send(closed()),
                         Event::Get(_, _, done) => done.send(closed()),
+                        Event::Stop(done) => done.send(()),
                         Event::Status(_)
                         | Event::Tick
                         | Event::Net(..)
@@ -934,6 +964,10 @@ impl<R: Runtime> Replica<R> {
         self.drain_ready().await?;
         loop {
             let ev = self.inbox.pop().await;
+            if let Event::Stop(done) = ev {
+                self.stopped = Some(done);
+                return Ok(());
+            }
             let kind = ev.kind();
             let t0 = self.rt.now();
             let step = async {
@@ -1155,6 +1189,8 @@ impl<R: Runtime> Replica<R> {
                 self.drive_flushes().await?;
                 self.release_deferred();
             }
+            // Handled by `run` before dispatch.
+            Event::Stop(done) => done.send(()),
             Event::Status(done) => {
                 let st = self.engine.store();
                 done.send(ReplicaStatus {
