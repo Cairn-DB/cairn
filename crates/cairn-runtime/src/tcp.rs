@@ -562,6 +562,9 @@ pub struct ClientConn {
     writer: Mutex<ChannelWriter>,
     pending: Arc<Mutex<HashMap<u64, std::sync::mpsc::Sender<Bytes>>>>,
     next_req: AtomicU64,
+    /// Set when the peer closed the connection. A write to a closed socket can still succeed
+    /// (the kernel buffers it), so without this a call would wait out its whole timeout.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClientConn {
@@ -589,6 +592,8 @@ impl ClientConn {
         let pending: Arc<Mutex<HashMap<u64, std::sync::mpsc::Sender<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let p2 = pending.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c2 = closed.clone();
         std::thread::spawn(move || {
             while let Ok((kind, req, payload)) = read_frame(&mut reader) {
                 if kind == KIND_CLIENT_RESP
@@ -597,12 +602,15 @@ impl ClientConn {
                     let _ = tx.send(Bytes::from(payload));
                 }
             }
+            // Closed first, then pending cleared: a call either sees the flag or is cleared.
+            c2.store(true, Ordering::SeqCst);
             p2.lock().expect("pending").clear();
         });
         Ok(ClientConn {
             writer: Mutex::new(writer),
             pending,
             next_req: AtomicU64::new(1),
+            closed,
         })
     }
 
@@ -611,14 +619,65 @@ impl ClientConn {
         let req = self.next_req.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending.lock().expect("pending").insert(req, tx);
+        if self.is_closed() {
+            self.pending.lock().expect("pending").remove(&req);
+            return Err(Error::io(
+                IoErrorKind::Unreachable,
+                "connection closed by the peer",
+            ));
+        }
         {
             let mut w = self.writer.lock().expect("writer");
             write_frame(&mut *w, KIND_CLIENT_REQ, req, payload)
                 .map_err(|e| Error::io(IoErrorKind::Other, e))?;
         }
-        rx.recv_timeout(timeout).map_err(|_| {
+        rx.recv_timeout(timeout).map_err(|e| {
             self.pending.lock().expect("pending").remove(&req);
-            Error::io(IoErrorKind::Other, "request timed out")
+            match e {
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    Error::io(IoErrorKind::Unreachable, "connection closed by the peer")
+                }
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    Error::io(IoErrorKind::Other, "request timed out")
+                }
+            }
         })
+    }
+
+    /// Whether the peer closed the connection: calls on it fail at once, reconnect instead.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that went away (a restarted node) fails a call at once instead of after its
+    /// timeout: forwarding then reconnects or tries another host without a 10 s stall.
+    #[test]
+    fn a_closed_connection_fails_calls_at_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // Read the client's hello, then close cleanly (FIN, no reset): the client's next
+            // write still succeeds, as with a peer process that exited.
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_read_timeout(Some(StdDuration::from_millis(200))).unwrap();
+            let mut buf = [0u8; 256];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            drop(s);
+        });
+        let conn = ClientConn::connect(addr).unwrap();
+        server.join().unwrap();
+        let t0 = std::time::Instant::now();
+        while !conn.is_closed() {
+            assert!(t0.elapsed() < StdDuration::from_secs(5), "close not noticed");
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        let t0 = std::time::Instant::now();
+        assert!(conn.call(b"x", StdDuration::from_secs(10)).is_err());
+        assert!(t0.elapsed() < StdDuration::from_secs(1), "{:?}", t0.elapsed());
     }
 }
