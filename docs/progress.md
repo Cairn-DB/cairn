@@ -571,7 +571,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   per-collection `expires_field` (+ `--expires-field`, `--retention-interval-ms`); leader sweep
   = probe then `DeleteWhere{field <= now}`; HTTP hides expired docs at once; audited.
   `tests/http_retention.rs` (3/3 runs); idle sweeps add no log entries (checked).
-  - Next: C.2 partial updates (Patch).
+- 0.3 step C.2, partial updates (2026-09-29): ADR 0031 "step C.2". First design (Patch in the
+  log, resolved at apply) rejected before testing: replay after a restart could lose the
+  document (seed-100 masks). Chosen: leader resolves in log order (barrier), proposes whole
+  documents. Chaos with patches: 3,000 seeds OK (285,094 reads); positive control (no
+  barrier) fails at seed 24. Process tests, clients live.
+  - Next: C.3 Kafka ingestion (ADR 0024, proposed): needs a broker to test and a client
+    library; decide the dependency first.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

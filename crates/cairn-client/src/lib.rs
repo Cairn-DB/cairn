@@ -162,7 +162,8 @@ impl Client {
                 | Request::UpsertKeyed(_)
                 | Request::DeleteKeys(_)
                 | Request::GetKey { .. }
-                | Request::DeleteWhere { .. },
+                | Request::DeleteWhere { .. }
+                | Request::Patch { .. },
             ) => Request::In {
                 collection: c.clone(),
                 req: Box::new(req.clone()),
@@ -272,6 +273,18 @@ impl Client {
         })?;
         match r {
             Response::Deleted { count, tokens } => {
+                let tokens = self.expect_ack(Response::Ack(tokens))?;
+                Ok((count, tokens))
+            }
+            other => self.expect_ack(other).map(|t| (0, t)),
+        }
+    }
+
+    /// Changes fields of existing documents (ADR 0031): each op sets or clears fields of one
+    /// document. Missing documents are left missing. Returns how many were changed.
+    pub fn patch(&mut self, ops: Vec<cairn_proto::PatchOp>) -> Result<(u64, Vec<Token>)> {
+        match self.call(&Request::Patch { shard: None, ops })? {
+            Response::Patched { count, tokens } => {
                 let tokens = self.expect_ack(Response::Ack(tokens))?;
                 Ok((count, tokens))
             }

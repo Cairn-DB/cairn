@@ -19,7 +19,7 @@ use cairn_core::{
 use cairn_index::DefaultIndexer;
 use cairn_raft::{Entry, HardState, InitialState, Message, Raft, Ready, Role, Snapshot};
 use cairn_storage::manifest::{Manifest, ManifestStore};
-use cairn_storage::{Command, LogEntry, Store};
+use cairn_storage::{Command, LogEntry, PatchOp, PatchTarget, Store};
 
 /// Consistency level of a read (ADR 0010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,13 @@ pub struct Token {
     /// Log index.
     pub index: LogIndex,
 }
+
+/// A patch waiting at the leader: changes, guard, and who to answer.
+type PendingPatch = (
+    Vec<PatchOp>,
+    Option<cairn_core::Predicate>,
+    Sender<Result<Applied>>,
+);
 
 /// A command committed and applied by the leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +228,13 @@ enum Event {
     Status(Sender<ReplicaStatus>),
     /// Stop the replica: its actor exits and closes its files, then answers.
     Stop(Sender<()>),
+    /// Change fields of documents (ADR 0031), those matching the guard if one is given:
+    /// resolved by the leader into whole documents, in log order.
+    Patch(
+        Vec<PatchOp>,
+        Option<cairn_core::Predicate>,
+        Sender<Result<Applied>>,
+    ),
     /// A flushed segment was built and written outside the actor (ADR 0021).
     FlushWritten {
         id: SegmentId,
@@ -269,6 +283,7 @@ impl Event {
             Event::Get(..) => "get",
             Event::Status(..) => "status",
             Event::Stop(_) => "stop",
+            Event::Patch(..) => "patch",
             Event::FlushWritten { .. } => "flush_written",
             Event::CompactWritten { .. } => "compact_written",
             Event::IndexesReady { .. } => "indexes_ready",
@@ -304,6 +319,7 @@ impl Drop for AliveGuard {
                 Event::QueryLegs(_, _, done) => done.send(closed()),
                 Event::Get(_, _, done) => done.send(closed()),
                 Event::Stop(done) => done.send(()),
+                Event::Patch(_, _, done) => done.send(closed()),
                 Event::Status(_)
                 | Event::Tick
                 | Event::Net(..)
@@ -334,6 +350,22 @@ impl ReplicaHandle {
     /// Whether the replica is still running.
     pub fn is_alive(&self) -> bool {
         self.alive.get()
+    }
+
+    /// Changes fields of existing documents (ADR 0031), those matching `guard` when given.
+    /// Resolves with the number of documents changed; leader only. A missing document is left
+    /// missing, and a change the schema refuses is skipped.
+    pub async fn patch(
+        &self,
+        ops: Vec<PatchOp>,
+        guard: Option<cairn_core::Predicate>,
+    ) -> Result<Applied> {
+        if !self.alive.get() {
+            return closed();
+        }
+        let (tx, rx) = oneshot();
+        self.inbox.push(Event::Patch(ops, guard, tx));
+        rx.await.unwrap_or_else(closed)
     }
 
     /// Stops the replica: resolves once its actor has exited and closed its files. Requests
@@ -620,6 +652,10 @@ pub struct Replica<R: Runtime> {
     persist: Persistence,
     /// Set by [`ReplicaHandle::stop`]: answered once the actor has closed everything.
     stopped: Option<Sender<()>>,
+    /// Patches waiting for everything before them to be applied (leader).
+    patches: std::collections::VecDeque<PendingPatch>,
+    /// Documents each patch's last entry changed, reported when it commits.
+    patch_counts: HashMap<LogIndex, u64>,
 }
 
 /// What a persistence task reports: its sequence, the log index it made durable, the outcome.
@@ -890,6 +926,8 @@ impl<R: Runtime> Replica<R> {
             flush: FlushState::default(),
             persist: Persistence::default(),
             stopped: None,
+            patches: std::collections::VecDeque::new(),
+            patch_counts: HashMap::default(),
         };
         replica.persist.durable = replica.log_durable_now();
         replica.persist.next_seq = 1;
@@ -941,6 +979,7 @@ impl<R: Runtime> Replica<R> {
                         Event::QueryLegs(_, _, done) => done.send(closed()),
                         Event::Get(_, _, done) => done.send(closed()),
                         Event::Stop(done) => done.send(()),
+                        Event::Patch(_, _, done) => done.send(closed()),
                         Event::Status(_)
                         | Event::Tick
                         | Event::Net(..)
@@ -976,6 +1015,7 @@ impl<R: Runtime> Replica<R> {
                 self.drain_ready().await?;
                 let t2 = self.rt.now();
                 self.serve_waiting().await?;
+                self.serve_patches().await?;
                 Ok::<_, Error>((t1, t2))
             }
             .await;
@@ -1016,8 +1056,20 @@ impl<R: Runtime> Replica<R> {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("bad frame from {from}: {e}"),
             },
+            Event::Patch(ops, guard, done) => {
+                if self.raft.role() == Role::Leader {
+                    self.patches.push_back((ops, guard, done));
+                } else {
+                    done.send(Err(Error::NotLeader {
+                        shard: self.cfg.shard,
+                        leader_hint: self.raft.leader(),
+                    }));
+                }
+            }
             Event::Propose(cmd, done) => {
-                if self.over_write_limit() {
+                // Writes wait behind pending patches, which must see everything before them
+                // and nothing after.
+                if self.over_write_limit() || !self.patches.is_empty() {
                     self.deferred.push_back((cmd, done));
                 } else {
                     self.propose(cmd, done);
@@ -1728,6 +1780,7 @@ impl<R: Runtime> Replica<R> {
                     tracing::info!(node = %self.cfg.id, shard = %self.cfg.shard, %id, "own compaction rejected");
                     self.flush.own_compaction = None;
                 }
+                let patched = self.patch_counts.remove(&e.index);
                 if let Some((term, done)) = self.waiting_commit.remove(&e.index) {
                     if term == e.term {
                         done.send(Ok(Applied {
@@ -1735,7 +1788,7 @@ impl<R: Runtime> Replica<R> {
                                 shard: self.cfg.shard,
                                 index: e.index,
                             },
-                            deleted,
+                            deleted: patched.unwrap_or(deleted),
                         }));
                     } else {
                         done.send(Err(Error::NotLeader {
@@ -1783,6 +1836,7 @@ impl<R: Runtime> Replica<R> {
             }
             // Proposals from a lost leadership can never commit with their term.
             if self.raft.role() != Role::Leader && !self.waiting_commit.is_empty() {
+                self.patch_counts.clear();
                 let hint = self.raft.leader();
                 for (_, (_, done)) in self.waiting_commit.drain() {
                     done.send(Err(Error::NotLeader {
@@ -2284,9 +2338,103 @@ impl<R: Runtime> Replica<R> {
         self.engine.store().memtable_bytes() >= 2 * self.cfg.engine.store.memtable_max_bytes
     }
 
+    /// Resolves pending patches (leader), in order: once everything in the log is applied, each
+    /// document is read as it stands, changed, checked, and proposed whole. Proposals that
+    /// arrived meanwhile wait, so nothing lands between the read and the write, and the log
+    /// holds only whole documents (replaying it never depends on reading state).
+    async fn serve_patches(&mut self) -> Result<()> {
+        let mut proposed = false;
+        while let Some((ops, guard, done)) = self.patches.pop_front() {
+            if self.raft.role() != Role::Leader {
+                done.send(Err(Error::NotLeader {
+                    shard: self.cfg.shard,
+                    leader_hint: self.raft.leader(),
+                }));
+                continue;
+            }
+            if self.engine.store().applied_index() < self.raft.last_index() {
+                self.patches.push_front((ops, guard, done));
+                break;
+            }
+            let key_field = self.schema.index_of(cairn_core::schema::KEY_FIELD);
+            let (mut plain, mut keyed) = (Vec::new(), Vec::new());
+            for op in ops {
+                let id = match &op.target {
+                    PatchTarget::Id(id) => Some(*id),
+                    PatchTarget::Key(k) => self.engine.store().key_to_id(k),
+                };
+                let Some(id) = id else {
+                    continue;
+                };
+                let Some(mut d) = self.engine.get(id).await? else {
+                    continue;
+                };
+                if guard.as_ref().is_some_and(|g| !g.matches(&d)) {
+                    continue;
+                }
+                let mut ok = true;
+                for (field, value) in op.set {
+                    let f = field as usize;
+                    // A document's text id is its identity: a patch cannot change it.
+                    if f >= d.values.len() || Some(f) == key_field {
+                        ok = false;
+                        break;
+                    }
+                    d.values[f] = value;
+                }
+                if !ok || d.validate(&self.schema).is_err() {
+                    continue;
+                }
+                if id.is_keyed() {
+                    keyed.push(d);
+                } else {
+                    plain.push(d);
+                }
+            }
+            let count = (plain.len() + keyed.len()) as u64;
+            let mut last = None;
+            let mut failed = None;
+            for cmd in [Command::Upsert(plain), Command::UpsertKeyed(keyed)] {
+                if matches!(&cmd, Command::Upsert(v) | Command::UpsertKeyed(v) if v.is_empty()) {
+                    continue;
+                }
+                match self.raft.propose(cmd.to_bytes()) {
+                    Ok(i) => last = Some(i),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            match (failed, last) {
+                (Some(e), _) => done.send(Err(e)),
+                (None, Some(i)) => {
+                    self.patch_counts.insert(i, count);
+                    self.waiting_commit.insert(i, (self.raft.term(), done));
+                    proposed = true;
+                }
+                // Nothing to change: answered at once, with the position it was read at.
+                (None, None) => done.send(Ok(Applied {
+                    token: Token {
+                        shard: self.cfg.shard,
+                        index: self.engine.store().applied_index(),
+                    },
+                    deleted: 0,
+                })),
+            }
+        }
+        if self.patches.is_empty() {
+            self.release_deferred();
+        }
+        if proposed {
+            self.drain_ready().await?;
+        }
+        Ok(())
+    }
+
     /// Releases held-back proposals while under the limit.
     fn release_deferred(&mut self) {
-        while !self.over_write_limit() {
+        while !self.over_write_limit() && self.patches.is_empty() {
             let Some((cmd, done)) = self.deferred.pop_front() else {
                 break;
             };

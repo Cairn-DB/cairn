@@ -13,7 +13,7 @@ use cairn_runtime::tcp::ClientConn;
 use cairn_runtime::{
     CrossQueue, CrossReceiver, CrossSender, Executor, TcpNetwork, TcpNetworkConfig, cross_oneshot,
 };
-use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
+use cairn_storage::{Command, DeleteScope, LogConfig, PatchOp, PatchTarget, StoreConfig};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -138,6 +138,13 @@ enum CoreRequest {
         def: Arc<CollectionDef>,
         reply: CrossSender<bool>,
     },
+    /// Patches documents of a shard this node leads (ADR 0031).
+    Patch {
+        shard: ShardId,
+        ops: Vec<PatchOp>,
+        guard: Option<cairn_core::Predicate>,
+        reply: CrossSender<Result<Applied>>,
+    },
     /// Stops this node's replica of a shard, if it runs one; answers once its files are closed.
     Stop {
         shard: ShardId,
@@ -187,6 +194,34 @@ fn prepare_docs(schema: &Schema, docs: Vec<Document>, keyed: bool) -> Result<Vec
             Ok(d)
         })
         .collect()
+}
+
+/// Checks patches against the schema before they are sent (ADR 0031): known fields, values
+/// of the field's kind, and no reserved field (a text id or a tenant is not patched).
+fn check_patch(schema: &Schema, ops: &[PatchOp]) -> Result<()> {
+    for op in ops {
+        for (f, v) in &op.set {
+            let field = schema
+                .fields
+                .get(*f as usize)
+                .ok_or_else(|| Error::InvalidRequest(format!("patch: no field {f}")))?;
+            if cairn_core::schema::is_reserved(&field.name) {
+                return Err(Error::InvalidRequest(format!(
+                    "patch: field {:?} is reserved",
+                    field.name
+                )));
+            }
+            if let Some(v) = v
+                && !v.matches(&field.kind)
+            {
+                return Err(Error::InvalidRequest(format!(
+                    "patch: wrong value for field {:?}",
+                    field.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 type Runtime = PoolRuntime<TcpNetwork>;
@@ -477,6 +512,7 @@ impl Node {
             | CoreRequest::QueryLegs { shard, .. }
             | CoreRequest::Status { shard, .. }
             | CoreRequest::Start { shard, .. }
+            | CoreRequest::Patch { shard, .. }
             | CoreRequest::Stop { shard, .. } => *shard,
             CoreRequest::CatalogRead { .. } => CATALOG_SHARD,
         };
@@ -539,6 +575,7 @@ impl Node {
                 CoreRequest::QueryLegs { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Status { reply, .. } => reply.send(None),
                 CoreRequest::CatalogRead { reply, .. } => reply.send(Err(e())),
+                CoreRequest::Patch { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Net { .. } | CoreRequest::Start { .. } | CoreRequest::Stop { .. } => {}
             }
             return;
@@ -584,6 +621,9 @@ impl Node {
                         .map(|hits| hits.into_iter().filter_map(|hit| hit.document).collect()),
                 )
             }),
+            CoreRequest::Patch {
+                ops, guard, reply, ..
+            } => rt.spawn(async move { reply.send(h.patch(ops, guard).await) }),
             CoreRequest::Start { .. } | CoreRequest::Stop { .. } => unreachable!("handled above"),
         }
     }
@@ -904,6 +944,80 @@ impl Node {
             };
         }
         match req {
+            Request::Patch { shard, ops } => {
+                if let Err(e) = check_patch(&coll.schema, &ops) {
+                    return Response::from_error(&e);
+                }
+                let mut groups: HashMap<ShardId, Vec<PatchOp>> = HashMap::default();
+                for op in ops {
+                    let s = match (&shard, &op.target) {
+                        (Some(s), _) => *s,
+                        (None, PatchTarget::Id(id)) => route!(coll.route(*id)),
+                        (None, PatchTarget::Key(k)) => coll.route_key(k),
+                    };
+                    groups.entry(s).or_default().push(op);
+                }
+                // Expired documents are gone for readers: a patch leaves them alone.
+                let guard = coll
+                    .expired(rt.unix_millis())
+                    .map(|p| cairn_core::Predicate::Not(Box::new(p)));
+                let (mut count, mut tokens) = (0, Vec::new());
+                for (s, group) in groups {
+                    let (g2, ops2) = (guard.clone(), group.clone());
+                    let r = Self::send(queues, cores, s, |reply| CoreRequest::Patch {
+                        shard: s,
+                        ops: ops2,
+                        guard: g2,
+                        reply,
+                    })
+                    .await;
+                    match r {
+                        Some(Ok(a)) => {
+                            count += a.deleted;
+                            tokens.push(a.token);
+                        }
+                        Some(Err(Error::NotLeader {
+                            leader_hint: Some(l),
+                            ..
+                        })) if may_forward && l != cfg.id => {
+                            let req = Request::Patch {
+                                shard: Some(s),
+                                ops: group,
+                            };
+                            match Self::forward(rt, cfg, l, s, Self::wrap(coll, req)).await {
+                                Response::Patched {
+                                    count: n,
+                                    tokens: t,
+                                } => {
+                                    count += n;
+                                    tokens.extend(t);
+                                }
+                                Response::Error {
+                                    message,
+                                    leader_hint,
+                                } => {
+                                    return Response::from_error(&Self::not_leader(
+                                        s,
+                                        &message,
+                                        leader_hint,
+                                    ));
+                                }
+                                other => {
+                                    return Response::from_error(&Error::Internal(format!(
+                                        "unexpected forward response {other:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        Some(Err(e)) => return Response::from_error(&e),
+                        None => {
+                            return Response::from_error(&Error::Internal("core stopped".into()));
+                        }
+                    }
+                }
+                tokens.sort();
+                Response::Patched { count, tokens }
+            }
             Request::Forwarded(_)
             | Request::In { .. }
             | Request::CreateCollection { .. }

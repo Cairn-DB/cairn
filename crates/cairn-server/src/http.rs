@@ -22,7 +22,7 @@ use cairn_client::Client;
 use cairn_core::{
     DocId, Document, FieldKind, HashMap, LogIndex, NodeId, Predicate, Schema, ShardId, Value,
 };
-use cairn_proto::{DeleteScope, Request, Response as Wire};
+use cairn_proto::{DeleteScope, PatchOp, PatchTarget, Request, Response as Wire};
 use cairn_query::{Consistency, Fusion, Hit, Query, ReplicaStatus, TextLeg, Token, VectorLeg};
 use cairn_runtime::tls::ClientTls;
 use serde::Deserialize;
@@ -303,7 +303,11 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/documents", post(upsert))
         .route("/v1/documents/delete", post(delete_many))
-        .route("/v1/documents/{id}", get(get_doc).delete(delete_one))
+        .route("/v1/documents/patch", post(patch_many))
+        .route(
+            "/v1/documents/{id}",
+            get(get_doc).delete(delete_one).patch(patch_one),
+        )
         .route("/v1/search", post(search))
         .route("/v1/tenants/{tenant}", axum::routing::delete(erase_tenant))
         .route(
@@ -317,9 +321,10 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/collections/{c}/schema", get(schema))
         .route("/v1/collections/{c}/documents", post(upsert))
         .route("/v1/collections/{c}/documents/delete", post(delete_many))
+        .route("/v1/collections/{c}/documents/patch", post(patch_many))
         .route(
             "/v1/collections/{c}/documents/{id}",
-            get(get_doc).delete(delete_one),
+            get(get_doc).delete(delete_one).patch(patch_one),
         )
         .route("/v1/collections/{c}/search", post(search))
         .route(
@@ -1198,6 +1203,105 @@ async fn delete_ids(
         Ok(t)
     })
     .await
+}
+
+/// The changes of one document: `{"field": value}` sets, `{"field": null}` clears.
+fn patch_op(schema: &Schema, tenant: Option<&str>, id: &ApiId, set: &Json_) -> ApiResult<PatchOp> {
+    let obj = set
+        .as_object()
+        .ok_or_else(|| ApiError::bad("\"set\" is an object of fields"))?;
+    let mut changes = Vec::new();
+    for (k, v) in obj {
+        if k == "id" || cairn_core::schema::is_reserved(k) {
+            return Err(ApiError::bad(format!("field {k:?} cannot be patched")));
+        }
+        let i = schema
+            .index_of(k)
+            .ok_or_else(|| ApiError::bad(format!("unknown field {k:?}")))?;
+        changes.push((i as u32, field_value(&schema.fields[i].kind, k, v)?));
+    }
+    Ok(PatchOp {
+        target: match stored_id(tenant, id) {
+            ApiId::Num(n) => PatchTarget::Id(DocId(n)),
+            ApiId::Key(k) => PatchTarget::Key(k),
+        },
+        set: changes,
+    })
+}
+
+async fn run_patch(
+    s: &Arc<Shared>,
+    coll: &CollectionDef,
+    ops: Vec<PatchOp>,
+    after: Option<&str>,
+) -> ApiResult<Json<Json_>> {
+    let (count, tokens) = with_client_in(s, &coll.name, move |c| c.patch(ops)).await?;
+    let prior = after.map(parse_tokens).transpose()?.unwrap_or_default();
+    Ok(Json(json!({
+        "patched": count,
+        "consistency_token": merge_tokens(&prior, &tokens),
+    })))
+}
+
+#[derive(Deserialize)]
+struct PatchOneBody {
+    set: Json_,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// Changes some fields of one document (ADR 0031); a missing document is not created.
+async fn patch_one(
+    State(s): State<Arc<Shared>>,
+    scope: ScopeExt,
+    params: Params,
+    UrlQuery(p): UrlQuery<ReadParams>,
+    Json(body): Json<PatchOneBody>,
+) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
+    let id = path_id(
+        param(&params, "id").unwrap_or_default(),
+        p.id_type.as_deref(),
+    )?;
+    let op = patch_op(&coll.schema, scope.tenant.as_deref(), &id, &body.set)?;
+    run_patch(&s, &coll, vec![op], body.after.as_deref()).await
+}
+
+#[derive(Deserialize)]
+struct PatchManyBody {
+    patches: Vec<Json_>,
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// Changes fields of several documents: `{"patches": [{"id": ..., "set": {...}}]}`.
+async fn patch_many(
+    State(s): State<Arc<Shared>>,
+    scope: ScopeExt,
+    params: Params,
+    Json(body): Json<PatchManyBody>,
+) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
+    if body.patches.is_empty() {
+        return Err(ApiError::bad("no patches"));
+    }
+    let ops = body
+        .patches
+        .iter()
+        .map(|p| {
+            let id = api_id(
+                p.get("id")
+                    .ok_or_else(|| ApiError::bad("a patch needs an \"id\""))?,
+            )?;
+            let set = p
+                .get("set")
+                .ok_or_else(|| ApiError::bad("a patch needs \"set\""))?;
+            patch_op(&coll.schema, scope.tenant.as_deref(), &id, set)
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    run_patch(&s, &coll, ops, body.after.as_deref()).await
 }
 
 #[derive(Deserialize)]

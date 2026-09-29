@@ -1,7 +1,7 @@
 //! Commands carried by log entries.
 
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::{DocId, Document, Error, NodeId, Predicate, Result, SegmentId};
+use cairn_core::{DocId, Document, Error, NodeId, Predicate, Result, SegmentId, Value};
 
 /// One replicated command (a log entry payload).
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,76 @@ pub enum Command {
         /// it from there before building it itself.
         from: NodeId,
     },
+}
+
+/// The document a [`PatchOp`] changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatchTarget {
+    /// By id.
+    Id(DocId),
+    /// By text id.
+    Key(String),
+}
+
+/// One document's changes: each field is set, or cleared with `None` (ADR 0031). Patches never
+/// enter the log: the shard leader resolves them into whole documents, in log order (see
+/// `ReplicaHandle::patch`), so replaying the log never depends on reading state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchOp {
+    /// The document.
+    pub target: PatchTarget,
+    /// `(field position, new value)`.
+    pub set: Vec<(u32, Option<Value>)>,
+}
+
+impl PatchOp {
+    /// Encodes one change.
+    pub fn encode(&self, w: &mut Writer) {
+        match &self.target {
+            PatchTarget::Id(id) => {
+                w.u8(0).u64(id.get());
+            }
+            PatchTarget::Key(k) => {
+                w.u8(1).str(k);
+            }
+        }
+        w.u32(self.set.len() as u32);
+        for (f, v) in &self.set {
+            w.u32(*f);
+            match v {
+                None => {
+                    w.u8(0);
+                }
+                Some(v) => {
+                    w.u8(1);
+                    v.encode(w);
+                }
+            }
+        }
+    }
+
+    /// Decodes one change.
+    pub fn decode(r: &mut Reader<'_>) -> Result<PatchOp> {
+        let target = match r.u8()? {
+            0 => PatchTarget::Id(DocId(r.u64()?)),
+            1 => PatchTarget::Key(r.str()?.to_owned()),
+            t => return Err(Error::corruption(format!("unknown patch target {t}"))),
+        };
+        let n = r.u32()? as usize;
+        if n > 1 << 16 {
+            return Err(Error::corruption("patch too large"));
+        }
+        let mut set = Vec::with_capacity(n);
+        for _ in 0..n {
+            let f = r.u32()?;
+            let v = match r.u8()? {
+                0 => None,
+                _ => Some(Value::decode(r)?),
+            };
+            set.push((f, v));
+        }
+        Ok(PatchOp { target, set })
+    }
 }
 
 /// The candidates of a [`Command::DeleteWhere`].
@@ -305,7 +375,7 @@ mod tests {
                 scope: DeleteScope::All,
                 filter: Predicate::Eq {
                     field: 1,
-                    value: cairn_core::Value::Enum("acme".into()),
+                    value: Value::Enum("acme".into()),
                 },
             },
             Command::DeleteWhere {

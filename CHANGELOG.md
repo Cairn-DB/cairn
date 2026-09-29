@@ -32,6 +32,11 @@ wire protocol or the on-disk format; the notes say so.
   reads and searches at once, then deleted by the shard leaders every
   `--retention-interval-ms`, audited. Clients: `expiresField` / `expires_field` at creation.
 
+- Partial updates (ADR 0031): `PATCH /v1/documents/{id}` and `POST /v1/documents/patch` change
+  some fields (`null` clears one) and keep the others, without creating missing or expired
+  documents. The shard leader resolves each patch in log order into a whole document, so a
+  patch is atomic with respect to other writes. Clients: `patch`, `patchMany` / `patch_many`.
+
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
   before retrying. Calls on a connection closed by the peer now fail at once, and the caller

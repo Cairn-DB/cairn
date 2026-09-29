@@ -3,7 +3,9 @@
 //! against a per-key model with real-time bounds, read-your-writes tokens are honoured, no
 //! read that promises read-your-takedown returns a removed document, and the replicas converge.
 //! Deletions by filter (ADR 0031) take part: "every document whose version is at most X",
-//! resolved by each replica when it applies the entry.
+//! resolved by each replica when it applies the entry. Patches (ADR 0031) change a document's
+//! `pad` field: they never bring a deleted document back nor change its version, and the
+//! replicas end with the same whole documents.
 
 use bytes::Bytes;
 use cairn_core::Runtime;
@@ -14,7 +16,7 @@ use cairn_core::{
 use cairn_index::{HnswParams, VectorIndexParams};
 use cairn_query::{Consistency, EngineConfig, Replica, ReplicaConfig, ReplicaHandle, Token};
 use cairn_sim::{SimConfig, SimRuntime, Simulation};
-use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
+use cairn_storage::{Command, DeleteScope, LogConfig, PatchOp, PatchTarget, StoreConfig};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -94,6 +96,40 @@ fn delete_below_cmd(bound: i64) -> Command {
             lo_inclusive: false,
             hi_inclusive: true,
         },
+    }
+}
+
+/// Sets `pad` of `key` to `byte`s, by id or text id.
+fn patch_op(key: u64, byte: u8) -> PatchOp {
+    PatchOp {
+        target: if is_keyed(key) {
+            PatchTarget::Key(text_id(key))
+        } else {
+            PatchTarget::Id(DocId(key))
+        },
+        set: vec![(2, Some(Value::Blob(Bytes::from(vec![byte; 40]))))],
+    }
+}
+
+/// A patch through whichever replica leads, retried until acknowledged or stopped.
+async fn patch_retrying(
+    rt: &SimRuntime,
+    handles: &[ReplicaHandle],
+    op: PatchOp,
+    start: usize,
+    stop: &Rc<RefCell<bool>>,
+) {
+    let mut target = start;
+    while !*stop.borrow() {
+        match handles[target].patch(vec![op.clone()], None).await {
+            Ok(_) => return,
+            Err(cairn_core::Error::NotLeader {
+                leader_hint: Some(l),
+                ..
+            }) => target = (l.get() - 1) as usize,
+            Err(_) => target = (target + 1) % handles.len(),
+        }
+        rt.sleep(Duration::from_millis(15)).await;
     }
 }
 
@@ -302,7 +338,18 @@ fn spawn_client(
                 let mut h = history.borrow_mut();
                 h[pos].ret = r.now();
                 h[pos].op = Op::Delete { key, token };
-            } else if roll < 11 {
+            } else if roll < 13 {
+                // A patch of `pad`: not a change of version, never a resurrection (checked by
+                // the model through every read), and the same everywhere (checked at the end).
+                patch_retrying(
+                    &r,
+                    &handles,
+                    patch_op(key, rng.below(250) as u8),
+                    start,
+                    &stop,
+                )
+                .await;
+            } else if roll < 14 {
                 // Old versions only: recent writes survive, so the model keeps live keys.
                 let bound = *versions.borrow() - rng.below(12) as i64;
                 let pos = {
@@ -686,19 +733,14 @@ fn run(seed: u64) -> (usize, usize, u64) {
         applied.iter().all(|a| *a == applied[0]),
         "seed {seed}: replicas did not converge: {statuses:#?}"
     );
-    let docs: Vec<Vec<Option<i64>>> = ex.block_on({
+    let docs: Vec<Vec<Option<Document>>> = ex.block_on({
         let hs = handles.clone();
         async move {
             let mut all = Vec::new();
             for h in &hs {
                 let mut v = Vec::new();
                 for k in (1..=KEYS).chain(KEYED_OFFSET + 1..=KEYED_OFFSET + KEYS) {
-                    v.push(
-                        get_any(h, k, Consistency::Stale)
-                            .await
-                            .unwrap()
-                            .map(|d| version_of(&d)),
-                    );
+                    v.push(get_any(h, k, Consistency::Stale).await.unwrap());
                 }
                 all.push(v);
             }

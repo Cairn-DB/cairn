@@ -34,13 +34,18 @@ test("the client against a live node", { skip }, async () => {
   assert.equal((await other.get("doc-2#0")).parent, "doc-2");
 
   // Deletion by parent, by ids with a filter, by id.
+  assert.equal((await db.patch("doc-1#2", { text: "ocelot patched", n: null })).count, 1);
+  assert.deepEqual(await db.get("doc-1#2"), { id: "doc-1#2", parent: "doc-1", text: "ocelot patched", embedding: vec(2) });
+  assert.equal((await db.patchMany([{ id: 42, set: { n: 43 } }, { id: "nope", set: { n: 1 } }])).count, 1);
+  assert.equal((await db.get(42)).n, 43);
+  await assert.rejects(db.patch(42, { nope: 1 }), InvalidInputError);
   assert.equal((await db.delete({ parent: "doc-1" })).deleted, 4);
   assert.equal(await db.get("doc-1#0"), null);
   hits = await db.search({ k: 20, text: { field: "text", query: "ocelot" } });
   assert.deepEqual(hits.map((h) => h.id), ["doc-2#0"]);
   assert.equal((await db.delete({ ids: [42, "007"], filter: eq("n", 7) })).deleted, 1);
   assert.equal(await db.get("007"), null);
-  assert.equal((await db.get(42)).n, 42);
+  assert.equal((await db.get(42)).n, 43);
   assert.equal((await db.delete({ ids: [42] })).count, 1);
   assert.equal(await db.get(42), null);
 

@@ -296,6 +296,22 @@ export class Cairn {
     return this.written(r);
   }
 
+  /** Changes some fields of one document: `{ field: value }` sets, `{ field: null }` clears.
+   * A missing document is not created. Resolves with the number of documents changed. */
+  async patch(id: Id, set: Record<string, unknown>): Promise<WriteResult> {
+    return this.patchMany([{ id, set }]);
+  }
+
+  /** Changes fields of several documents. */
+  async patchMany(patches: { id: Id; set: Record<string, unknown> }[]): Promise<WriteResult> {
+    const r = (await this.call("POST", `${this.base}/documents/patch`, this.after({ patches }))) as {
+      patched: number;
+      consistency_token: string;
+    };
+    this.observe(r.consistency_token);
+    return { count: r.patched, token: r.consistency_token };
+  }
+
   /** One document, or `null` when there is none (or it was taken down). */
   async get(id: Id, opts: { consistency?: Consistency } = {}): Promise<Document | null> {
     let path = this.base + docPath(id);

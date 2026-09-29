@@ -973,43 +973,7 @@ impl<R: Runtime> Store<R> {
             }
             Command::UpsertKeyed(docs) => {
                 for d in docs {
-                    // Invalid documents are skipped on every replica alike (see `Upsert`).
-                    let key = self.key_field.and_then(|field| match d.values.get(field) {
-                        Some(Some(cairn_core::Value::Blob(b))) => std::str::from_utf8(b)
-                            .ok()
-                            .filter(|k| !k.is_empty())
-                            .map(str::to_owned),
-                        _ => None,
-                    });
-                    let Some(key) = key else {
-                        tracing::warn!(%index, "skipping a document without a valid text id");
-                        continue;
-                    };
-                    let mut checked = d.clone();
-                    if let Err(e) = checked.validate(&self.manifest.schema) {
-                        tracing::warn!(%index, key, "skipping an invalid document: {e}");
-                        continue;
-                    }
-                    // Every write of a text id takes a new internal id from the counter, and the
-                    // previous one is deleted. The counter is the only input: a replica that
-                    // restarted replays the same ids, even when its deletion files already mask
-                    // rows that a later entry replaced (they are persisted at publication, past
-                    // the manifest's applied index), which a lookup would have taken for a
-                    // missing text id (chaos seed 100).
-                    let Some(id) = DocId::keyed(self.cfg.shard, self.next_key) else {
-                        tracing::warn!(%index, key, "text id space exhausted: document skipped");
-                        continue;
-                    };
-                    self.next_key += 1;
-                    let mut d = checked;
-                    d.id = id;
-                    if let Some(old) = self.keys.insert(key.clone(), id) {
-                        self.key_of.borrow_mut().remove(&old);
-                        self.mask_in_segments(old);
-                        self.memtable.delete(old, index);
-                    }
-                    self.key_of.borrow_mut().insert(id, key);
-                    self.memtable.upsert(d, index);
+                    self.upsert_keyed(index, d);
                 }
             }
             Command::DeleteKeys(keys) => {
@@ -1112,6 +1076,49 @@ impl<R: Runtime> Store<R> {
         out.sort_unstable();
         out.dedup();
         Ok(out)
+    }
+
+    /// Writes one document identified by a text id (in its `_key` field): a new internal id
+    /// from the counter, and the previous one, if any, deleted. Returns whether it was written.
+    fn upsert_keyed(&mut self, index: LogIndex, d: &Document) -> bool {
+        // Invalid documents are skipped on every replica alike (see `Upsert`).
+        let key = self.key_field.and_then(|field| match d.values.get(field) {
+            Some(Some(cairn_core::Value::Blob(b))) => std::str::from_utf8(b)
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        });
+        let Some(key) = key else {
+            tracing::warn!(%index, "skipping a document without a valid text id");
+            return false;
+        };
+        let mut checked = d.clone();
+        if let Err(e) = checked.validate(&self.manifest.schema) {
+            tracing::warn!(%index, key, "skipping an invalid document: {e}");
+            return false;
+        }
+        // Every write of a text id takes a new internal id from the counter, and the
+        // previous one is deleted. The counter is the only input: a replica that
+        // restarted replays the same ids, even when its deletion files already mask
+        // rows that a later entry replaced (they are persisted at publication, past
+        // the manifest's applied index), which a lookup would have taken for a
+        // missing text id (chaos seed 100).
+        let Some(id) = DocId::keyed(self.cfg.shard, self.next_key) else {
+            tracing::warn!(%index, key, "text id space exhausted: document skipped");
+            return false;
+        };
+        self.next_key += 1;
+        let mut d = checked;
+        d.id = id;
+        if let Some(old) = self.keys.insert(key.clone(), id) {
+            self.key_of.borrow_mut().remove(&old);
+            self.mask_in_segments(old);
+            self.memtable.delete(old, index);
+        }
+        self.key_of.borrow_mut().insert(id, key);
+        self.memtable.upsert(d, index);
+        true
     }
 
     /// Drops the text id of a deleted document, if it had one.

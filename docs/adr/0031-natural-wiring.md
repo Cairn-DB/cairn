@@ -358,6 +358,40 @@ and its files. Existing data becomes the `default` collection without migration.
   - an idle node with retention: the logs do not grow (commit indexes unchanged over 15
     sweeps).
 
+### As implemented: step C.2, partial updates (2026-09-29)
+
+- **The first design was unsafe, and was dropped before any test ran against it.** A
+  `Patch` command applied by each replica against its current document (read, merge, write)
+  cannot be replayed:
+  - deletion files persisted at a publication can already mask rows that entries after the
+    manifest point replaced (chaos seed 100, step A);
+  - so after a restart, a replayed patch could find its own document masked by its own
+    earlier write, skip it, and lose the document.
+  Full-document writes and deletions do not read, and replay safely.
+- **Chosen: the log only ever holds whole documents.** The shard leader resolves patches in
+  log order:
+  - a patch waits until everything in the leader's log is applied, and proposals arriving
+    meanwhile wait behind it;
+  - the leader reads each document, applies the changes, validates, and proposes an
+    ordinary `Upsert` (or `UpsertKeyed` for text ids);
+  - no entry lands between the read and the write, so a patch is atomic with respect to
+    other writes, and replay never depends on reading state.
+  - Cost: while patches are pending, a shard's writes wait for one commit round.
+- **Rules:**
+  - a missing document is left missing;
+  - a guard (added by the node when the collection has retention) leaves expired documents
+    alone;
+  - the node refuses reserved fields and values of the wrong kind before sending.
+- **Tested:**
+  - the chaos campaign now includes patches (a document's `pad` field, by id and by text id).
+    The model checks that a patch never changes a version or brings a deleted document back.
+    Convergence compares whole documents across replicas. 3,000 seeds, 0 violations.
+    Positive control: without the log-order barrier, seed 24 fails;
+  - three processes: patch through a node that forwards, text and integer ids, clearing a
+    field, never creating, the 400 cases;
+  - retention: an expired document is not patched;
+  - both clients' live tests.
+
 ## Validation
 
 - **Property tests**: the dictionary assigns the same ids on every replica whatever the order

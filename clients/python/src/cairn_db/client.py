@@ -196,6 +196,20 @@ class Client(_Base):
         self.observe(r["consistency_token"])
         return WriteResult(count=r["count"], token=r["consistency_token"])
 
+    def patch(self, id: Id, set: Mapping[str, Any]) -> WriteResult:
+        """Changes some fields of one document (``None`` clears a field). A missing document
+        is not created. ``count`` is the number of documents changed."""
+        return self.patch_many([{"id": id, "set": dict(set)}])
+
+    def patch_many(self, patches: Sequence[Mapping[str, Any]]) -> WriteResult:
+        """Changes fields of several documents: ``[{"id": ..., "set": {...}}]``."""
+        body: dict[str, Any] = {"patches": [dict(p) for p in patches]}
+        if self.token:
+            body["after"] = self.token
+        r = self._call("POST", f"{self._base}/documents/patch", body)
+        self.observe(r["consistency_token"])
+        return WriteResult(count=r["patched"], token=r["consistency_token"])
+
     def get(self, id: Id, *, consistency: Optional[Consistency] = None) -> Optional[Document]:
         """One document, or ``None`` when there is none (or it was taken down)."""
         try:
@@ -326,6 +340,17 @@ class AsyncClient(_Base):
         r = await self._call("POST", f"{self._base}/documents", body)
         self.observe(r["consistency_token"])
         return WriteResult(count=r["count"], token=r["consistency_token"])
+
+    async def patch(self, id: Id, set: Mapping[str, Any]) -> WriteResult:
+        return await self.patch_many([{"id": id, "set": dict(set)}])
+
+    async def patch_many(self, patches: Sequence[Mapping[str, Any]]) -> WriteResult:
+        body: dict[str, Any] = {"patches": [dict(p) for p in patches]}
+        if self.token:
+            body["after"] = self.token
+        r = await self._call("POST", f"{self._base}/documents/patch", body)
+        self.observe(r["consistency_token"])
+        return WriteResult(count=r["patched"], token=r["consistency_token"])
 
     async def get(self, id: Id, *, consistency: Optional[Consistency] = None) -> Optional[Document]:
         try:

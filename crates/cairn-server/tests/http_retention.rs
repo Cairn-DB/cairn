@@ -172,6 +172,14 @@ fn expired_documents_are_hidden_then_deleted() {
     assert_eq!(st, 404, "an expired document was read");
     let (_, res) = http(web, "POST", "/v1/search", Some(&search));
     assert_eq!(ids(&res), ["later", "never"]);
+    // A patch leaves an expired document alone (it would otherwise come back).
+    let (st, ack) = http(
+        web,
+        "PATCH",
+        "/v1/documents/soon",
+        Some(&json!({ "set": { "expires": now_ms() + 600_000 } })),
+    );
+    assert_eq!((st, &ack["patched"]), (200, &json!(0)), "{ack}");
     // And deleted by its shard's leader.
     wait_audit(&log, "default", 1);
 

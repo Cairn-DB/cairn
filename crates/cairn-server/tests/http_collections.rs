@@ -225,6 +225,79 @@ fn collections_are_created_used_and_dropped_across_the_cluster() {
     assert_eq!(st, 400);
     let (st, _) = http(web[0], "GET", "/v1/collections/nope/documents/1", None);
     assert_eq!(st, 404);
+    // Partial updates (ADR 0031): through any node, of text and integer ids, never creating.
+    let (st, ack) = http(
+        web[2],
+        "PATCH",
+        "/v1/collections/notes/documents/n2",
+        Some(&json!({ "set": { "body": "otter patched" }, "after": after })),
+    );
+    assert_eq!((st, &ack["patched"]), (200, &json!(1)), "{ack}");
+    let tp = ack["consistency_token"].as_str().unwrap().to_owned();
+    for w in &web {
+        let (st, d) = http(
+            *w,
+            "GET",
+            &format!("/v1/collections/notes/documents/n2?after={after},{tp}"),
+            None,
+        );
+        assert_eq!(st, 200);
+        assert_eq!(d["body"], "otter patched");
+        assert_eq!(d["parent"], "p2", "untouched fields are kept");
+        assert_eq!(d["embedding"], json!([2.0, 1.0]));
+    }
+    let (st, ack) = http(
+        web[0],
+        "POST",
+        "/v1/documents",
+        Some(
+            &json!({ "documents": [{ "id": 7, "embedding": [1.0, 0.0, 0.0, 0.0], "text": "seven" }] }),
+        ),
+    );
+    assert_eq!(st, 200, "{ack}");
+    let t7 = ack["consistency_token"].as_str().unwrap().to_owned();
+    let (st, ack) = http(
+        web[1],
+        "POST",
+        "/v1/documents/patch",
+        Some(&json!({ "patches": [
+            { "id": 7, "set": { "text": null } },
+            { "id": "missing", "set": { "text": "x" } },
+            { "id": 424242, "set": { "text": "x" } },
+        ], "after": t7 })),
+    );
+    assert_eq!((st, &ack["patched"]), (200, &json!(1)), "{ack}");
+    let tp = ack["consistency_token"].as_str().unwrap().to_owned();
+    let (st, d) = http(
+        web[2],
+        "GET",
+        &format!("/v1/documents/7?after={t7},{tp}"),
+        None,
+    );
+    assert_eq!(st, 200);
+    assert!(d.get("text").is_none(), "cleared: {d}");
+    let (st, _) = http(
+        web[2],
+        "GET",
+        &format!("/v1/documents/missing?after={tp}"),
+        None,
+    );
+    assert_eq!(st, 404, "a patch does not create");
+    for bad in [
+        json!({ "set": { "_tenant": "x" } }),
+        json!({ "set": { "nope": 1 } }),
+        json!({ "set": { "embedding": [1.0] } }),
+        json!({ "set": { "id": 3 } }),
+    ] {
+        let (st, e) = http(
+            web[0],
+            "PATCH",
+            "/v1/collections/notes/documents/n2",
+            Some(&bad),
+        );
+        assert_eq!(st, 400, "{bad}: {e}");
+    }
+
     // One hit per parent (group_by): each parent once, at its best chunk's rank.
     let q = json!({ "k": 10, "vector": { "field": "embedding", "values": [11.0, 1.0] }, "group_by": "parent", "after": after });
     let (st, res) = http(web[0], "POST", "/v1/collections/notes/search", Some(&q));

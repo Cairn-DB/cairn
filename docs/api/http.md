@@ -145,6 +145,8 @@ Consistency levels (`consistency`, on reads and searches):
 | `POST /v1/documents` | write | `{"documents":[...], "after"?}` | `{"count", "consistency_token"}` |
 | `GET /v1/documents/{id}` | read | `?consistency=&after=` | the document, or 404 |
 | `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
+| `PATCH /v1/documents/{id}` | write | `{"set": {...}, "after"?}` | `{"patched", "consistency_token"}` |
+| `POST /v1/documents/patch` | write | `{"patches": [{"id", "set"}], "after"?}` | `{"patched", "consistency_token"}` |
 | `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}`, or `{"filter":{...}, "ids"?, "after"?}` | `{"count", "consistency_token"}`; with a filter, `{"deleted", "consistency_token"}` |
 | `POST /v1/search` | read | see below | `{"hits":[...]}` |
 | `…/v1/collections/…` | | see Collections | |
@@ -156,6 +158,24 @@ Merge pause (ADR 0028): a paused node starts no new merge. Merges already runnin
 committed in a shard's log, still complete; `merges_running` and `merges_pending` in
 `/v1/status` show when none is left. The call applies to one node: call it on every node to
 pause the cluster. It is an administrative endpoint with no authentication (see Security).
+
+## Partial updates
+
+```bash
+curl -s -X PATCH localhost:7200/v1/documents/sku-42 -H "Authorization: Bearer $KEY" \
+  -H content-type:application/json -d '{"set": {"price": 1990, "promo": null}}'
+# {"patched": 1, "consistency_token": "2.88"}
+```
+
+- `PATCH /v1/documents/{id}` with `{"set": {...}}` changes the named fields of one document
+  and keeps the others. A value sets the field, and `null` clears it.
+  `POST /v1/documents/patch` with `{"patches": [{"id": ..., "set": {...}}]}` changes several
+  documents. Both need the `write` role.
+- A missing document is not created (`"patched": 0`), and neither is an expired one.
+- Each patch is atomic with respect to other writes. The shard leader reads the document at
+  the patch's place in the log order, then writes the whole document. A concurrent write to
+  the same document lands entirely before or entirely after it.
+- Reserved fields and the id cannot be patched.
 
 ## Deletion by filter
 

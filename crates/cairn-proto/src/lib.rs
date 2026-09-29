@@ -9,7 +9,7 @@ use cairn_query::{
     Consistency, Fusion, Hit, LegList, Query, ReplicaStatus, TextLeg, Token, VectorLeg,
 };
 use cairn_raft::Role;
-pub use cairn_storage::DeleteScope;
+pub use cairn_storage::{DeleteScope, PatchOp, PatchTarget};
 
 /// A client request.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +103,14 @@ pub enum Request {
     },
     /// Live collections: answered with their definitions.
     ListCollections,
+    /// Change fields of existing documents (ADR 0031), routed to their shards: answered with
+    /// `Patched`. With `shard`, one shard's part (forwarded).
+    Patch {
+        /// One shard only (a forwarded part), or all the ops' shards.
+        shard: Option<ShardId>,
+        /// The changes.
+        ops: Vec<PatchOp>,
+    },
 }
 
 /// A response.
@@ -120,6 +128,13 @@ pub enum Response {
     Legs(Vec<LegList>),
     /// Collection definitions, as JSON.
     Collections(Vec<String>),
+    /// Patch acknowledged: documents changed, and one token per shard touched.
+    Patched {
+        /// Documents changed.
+        count: u64,
+        /// Tokens.
+        tokens: Vec<Token>,
+    },
     /// Deletion by filter acknowledged: documents removed, and one token per shard touched.
     Deleted {
         /// Documents removed.
@@ -515,6 +530,14 @@ impl Request {
             Request::ListCollections => {
                 w.u8(16);
             }
+            Request::Patch { shard, ops } => {
+                w.u8(17)
+                    .u32(shard.map_or(u32::MAX, |s| s.get()))
+                    .u32(ops.len() as u32);
+                for op in ops {
+                    op.encode(&mut w);
+                }
+            }
             Request::GetKey {
                 key,
                 consistency,
@@ -650,6 +673,21 @@ impl Request {
                 name: r.str()?.to_owned(),
             },
             16 => Request::ListCollections,
+            17 => {
+                let shard = match r.u32()? {
+                    u32::MAX => None,
+                    s => Some(ShardId(s)),
+                };
+                let n = r.u32()? as usize;
+                if n > 1 << 20 {
+                    return Err(Error::corruption("patch batch too large"));
+                }
+                let mut ops = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    ops.push(PatchOp::decode(&mut r)?);
+                }
+                Request::Patch { shard, ops }
+            }
             12 => Request::DeleteWhere {
                 shard: match r.u32()? {
                     u32::MAX => None,
@@ -719,6 +757,12 @@ impl Response {
                     for (d, k) in &l.keys {
                         w.u64(d.get()).str(k);
                     }
+                }
+            }
+            Response::Patched { count, tokens } => {
+                w.u8(9).u64(*count).u32(tokens.len() as u32);
+                for t in tokens {
+                    enc_token(&mut w, t);
                 }
             }
             Response::Collections(defs) => {
@@ -798,6 +842,15 @@ impl Response {
                     });
                 }
                 Response::Legs(lists)
+            }
+            9 => {
+                let count = r.u64()?;
+                let n = r.u32()? as usize;
+                let mut tokens = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    tokens.push(dec_token(&mut r)?);
+                }
+                Response::Patched { count, tokens }
             }
             8 => {
                 let n = r.u32()? as usize;
@@ -928,6 +981,19 @@ mod tests {
                 name: "docs".into(),
             },
             Request::ListCollections,
+            Request::Patch {
+                shard: Some(ShardId(2)),
+                ops: vec![
+                    PatchOp {
+                        target: PatchTarget::Id(DocId(4)),
+                        set: vec![(1, Some(cairn_core::Value::I64(-3))), (2, None)],
+                    },
+                    PatchOp {
+                        target: PatchTarget::Key("é".into()),
+                        set: vec![],
+                    },
+                ],
+            },
             Request::DeleteWhere {
                 shard: Some(ShardId(3)),
                 scope: DeleteScope::Keys(vec!["k".into()]),
@@ -979,6 +1045,10 @@ mod tests {
                 tokens: vec![token],
             },
             Response::Collections(vec!["{}".into(), "{\"name\":\"x\"}".into()]),
+            Response::Patched {
+                count: 3,
+                tokens: vec![token],
+            },
             Response::Doc(None),
             Response::Hits(vec![hit]),
             Response::Status(vec![status]),

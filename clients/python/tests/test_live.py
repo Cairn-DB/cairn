@@ -42,11 +42,17 @@ def test_client_against_a_live_node():
     other = c.Client(URL, os.environ["CAIRN_KEY"], tenant=RUN, token=db.token)
     assert other.get("doc-2#0")["parent"] == "doc-2"
 
+    assert db.patch("doc-1#2", {"text": "ocelot patched", "n": None}).count == 1
+    assert db.get("doc-1#2") == {"id": "doc-1#2", "parent": "doc-1", "text": "ocelot patched", "embedding": vec(2)}
+    assert db.patch_many([{"id": 42, "set": {"n": 43}}, {"id": "nope", "set": {"n": 1}}]).count == 1
+    assert db.get(42)["n"] == 43
+    with pytest.raises(c.InvalidInputError):
+        db.patch(42, {"nope": 1})
     assert db.delete(parent="doc-1").deleted == 4
     assert db.get("doc-1#0") is None
     assert [h.id for h in db.search(k=20, text="ocelot", text_field="text")] == ["doc-2#0"]
     assert db.delete(ids=[42, "007"], filter=c.eq("n", 7)).deleted == 1
-    assert db.get("007") is None and db.get(42)["n"] == 42
+    assert db.get("007") is None and db.get(42)["n"] == 43
     assert db.delete(ids=[42]).count == 1
     assert db.get(42) is None
 
