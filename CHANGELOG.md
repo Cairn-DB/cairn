@@ -20,6 +20,13 @@ wire protocol or the on-disk format; the notes say so.
 - `group_by` in searches (ADR 0031): one hit per value of a field, for instance each document
   once at its best chunk. Clients: `groupBy` / `group_by`, and the hit's `group`.
 
+- LangChain (Python `langchain-cairn`, JavaScript `@cairn-db/langchain`) and LlamaIndex
+  (`llama-index-vector-stores-cairn`) vector stores, in `integrations/`.
+  - Any metadata round-trips, and declared fields can be filtered.
+  - Deletion by source document: `delete(parent=...)`, and LlamaIndex's `delete_ref_doc`.
+  - Search one hit per document, and hybrid search.
+  - Tested against a live node. Python 3.10+ and Node 20+, as their frameworks require.
+
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
   before retrying. Calls on a connection closed by the peer now fail at once, and the caller

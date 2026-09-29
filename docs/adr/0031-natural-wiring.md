@@ -280,6 +280,26 @@ Both clients share one design and live in this repository, tested in CI against 
       `clients/test-live.sh`;
     - in CI on Node 18 with Python 3.9, and Node 22 with Python 3.13.
   - Not published to npm or PyPI: that is a public release, which needs the owner's go.
+- **Integrations as implemented (step B.3, 2026-09-29):**
+  - `integrations/langchain-cairn` (Python), `integrations/langchain-js`, and
+    `integrations/llama-index-vector-stores-cairn`.
+  - One storage layout for all three: text, embedding, `parent` (the source document), the
+    whole metadata as JSON in a `metadata` blob (so a loader's arbitrary metadata
+    round-trips), and declared metadata fields (filterable).
+    - A helper builds the matching schema (`collection_schema` / `collectionSchema`).
+    - LlamaIndex keeps its own node serialization in the blob, so nodes come back whole.
+  - Deleting a source document is one deletion by filter on `parent`: LangChain
+    `delete(parent=...)`, LlamaIndex `delete(ref_doc_id)` / `delete_ref_doc`.
+  - Scores: similarity for Cosine and Dot, squared distance for L2, with matching relevance
+    functions.
+  - Also exposed: one hit per parent, and hybrid search (vector + BM25).
+  - Framework constraints: current langchain-core and llama-index-core need Python 3.10+, and
+    @langchain/core 1.x needs Node 20+. The LangChain.js adapter ships as ESM only: its
+    CommonJS build would need subpath-export resolution that tsc does not offer for
+    CommonJS output.
+  - Tested against a live node, in `clients/test-live.sh` and in CI (Node 22 and
+    Python 3.13): adds, filters, relevance scores, grouping, retriever, hybrid search,
+    deletions by parent and ids, and `VectorStoreIndex` end to end for LlamaIndex.
 - **Integrations**:
   - LangChain (`langchain-cairn` in Python, `@cairn-db/langchain` in JavaScript) and LlamaIndex
     (Python), as vector-store adapters;

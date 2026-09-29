@@ -561,7 +561,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
 - 0.3 step B.2, `group_by` search (2026-09-29): HTTP-level, widening candidates 4k -> 10,000;
   3-process test incl. widening past 40 chunks of one parent (positive control fails without
   widening); clients `groupBy`/`group_by` (live 7/7 each).
-  - Next: LangChain (Python, JS) and LlamaIndex adapters.
+- 0.3 step B.3, integrations (2026-09-29): `integrations/langchain-cairn`, `langchain-js`,
+  `llama-index-vector-stores-cairn`; one storage layout (metadata blob + declared fields,
+  `parent`). Live: LangChain.js 1/1, LangChain + LlamaIndex 2/2 (venv in the scratchpad:
+  langchain-core 1.6.6, llama-index-core 0.14.25, @langchain/core 1.2.13). Requirements found:
+  Python 3.10+, Node 20+; CI runs adapters on Node 22 / Python 3.13 only.
+  - Step B complete. Next (owner): public launch as 0.3 (repo public, npm/PyPI, image :0.3,
+    announcement), then step C (retention, partial updates, Kafka, proof of deletion).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

@@ -2,7 +2,7 @@
 # Runs both clients' tests against a fresh local node (ADR 0031): builds cairn-server, starts
 # one node with an admin key, an unscoped key, a key scoped to tenant "acme" and a read-only
 # key, then runs
-# the TypeScript and Python suites (unit and live). Needs cargo, node >= 18, python3 with
+# the TypeScript and Python suites (unit and live), and the LangChain and LlamaIndex adapters'. Needs cargo, node >= 18, python3 with
 # httpx and pytest. Usage: clients/test-live.sh [--release]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,5 +42,21 @@ echo "== TypeScript" >&2
 (cd "$here/typescript" && { [[ -d node_modules ]] || npm ci --no-audit --no-fund; } && npm test) || status=1
 echo "== Python" >&2
 (cd "$here/python" && PYTHONPATH=src python3 -m pytest -q -p no:cacheprovider tests) || status=1
+if (( $(node -p 'process.versions.node.split(".")[0]') >= 20 )); then
+  echo "== LangChain.js adapter" >&2
+  (cd "$here/../integrations/langchain-js" && { [[ -d node_modules ]] || npm ci --no-audit --no-fund; } && npm test) || status=1
+else
+  echo "== LangChain.js adapter skipped: @langchain/core needs Node 20+" >&2
+fi
+# LangChain and LlamaIndex adapters: with a Python (CAIRN_PY) that has langchain-core and
+# llama-index-core.
+py="${CAIRN_PY:-python3}"
+if "$py" -c "import langchain_core, llama_index.core, httpx, pytest" 2>/dev/null; then
+  echo "== LangChain and LlamaIndex adapters" >&2
+  (cd "$root" && PYTHONPATH="clients/python/src:integrations/langchain-cairn/src:integrations/llama-index-vector-stores-cairn" \
+    "$py" -m pytest -q -p no:cacheprovider integrations/langchain-cairn/tests integrations/llama-index-vector-stores-cairn/tests) || status=1
+else
+  echo "== adapters skipped: $py lacks langchain-core or llama-index-core (set CAIRN_PY)" >&2
+fi
 [[ $status == 0 ]] || { echo "== node log" >&2; tail -50 "$work/node.log" >&2; }
 exit $status

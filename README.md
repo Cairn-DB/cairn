@@ -111,14 +111,20 @@ To check a running node or cluster end to end with realistic data (authenticatio
 field type, search, filters, takedowns on every node), run the
 [acceptance suite](examples/acceptance/README.md).
 
-Clients (0.2, not published to npm or PyPI yet):
+Clients (not published to npm or PyPI yet):
 - TypeScript and JavaScript: [`clients/typescript`](clients/typescript) (`@cairn-db/client`,
   on `fetch`, no runtime dependency);
 - Python: [`clients/python`](clients/python) (`cairn-db`, sync and async, on `httpx`);
 - Rust: `cairn-client`, over the binary protocol (`Client::new(addrs)`, `upsert`, `delete`,
   `delete_where`, `get`, `query`).
 
-`clients/test-live.sh` runs both HTTP clients' tests against a fresh local node. The HTTP API
+Integrations (0.3, not published yet):
+- LangChain for Python: [`integrations/langchain-cairn`](integrations/langchain-cairn);
+- LangChain.js: [`integrations/langchain-js`](integrations/langchain-js);
+- LlamaIndex: [`integrations/llama-index-vector-stores-cairn`](integrations/llama-index-vector-stores-cairn).
+
+`clients/test-live.sh` runs the clients' and the integrations' tests against a fresh local
+node. The HTTP API
 works from any language.
 
 ## Design
