@@ -78,6 +78,8 @@ test("collections against a live node", { skip }, async () => {
   assert.equal((await notes.get("n1")).body, "walrus 1");
   assert.equal(await app.get("n1"), null, "not in default");
   assert.equal((await notes.search({ text: { field: "body", query: "walrus" } })).length, 4);
+  const grouped = await notes.search({ vector: { field: "embedding", values: [3, 1] }, groupBy: "parent" });
+  assert.deepEqual(grouped.map((h) => [h.id, h.group]), [["n3", "p1"], ["n2", "p0"]]);
   assert.equal((await notes.delete({ parent: "p0" })).deleted, 2);
   assert.deepEqual((await notes.search({ k: 10 })).map((h) => h.id).sort(), ["n1", "n3"]);
   assert.deepEqual(await notes.schema(), schema);

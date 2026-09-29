@@ -225,7 +225,74 @@ fn collections_are_created_used_and_dropped_across_the_cluster() {
     assert_eq!(st, 400);
     let (st, _) = http(web[0], "GET", "/v1/collections/nope/documents/1", None);
     assert_eq!(st, 404);
-    // Deletion by parent inside the collection.
+    // One hit per parent (group_by): each parent once, at its best chunk's rank.
+    let q = json!({ "k": 10, "vector": { "field": "embedding", "values": [11.0, 1.0] }, "group_by": "parent", "after": after });
+    let (st, res) = http(web[0], "POST", "/v1/collections/notes/search", Some(&q));
+    assert_eq!(st, 200, "{res}");
+    let groups: Vec<(String, String)> = res["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["id"].as_str().unwrap().to_owned(),
+                h["group"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    // Nearest to (11, 1): n11 (p2), then n10 (p1), then n9 (p0).
+    assert_eq!(
+        groups,
+        vec![
+            ("n11".into(), "p2".into()),
+            ("n10".into(), "p1".into()),
+            ("n9".into(), "p0".into())
+        ]
+    );
+    let mut q2 = q.clone();
+    q2["k"] = json!(2);
+    q2["with_documents"] = json!(false);
+    let (_, res) = http(web[1], "POST", "/v1/collections/notes/search", Some(&q2));
+    let hits = res["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits.iter()
+            .all(|h| h.get("document").is_none() && h["group"].is_string())
+    );
+    // 40 chunks of one parent crowd the top: the search widens until it finds a second parent.
+    let big: Vec<Value> = (0..40)
+        .map(|i| json!({ "id": format!("big{i}"), "embedding": [100.0 + i as f32 * 0.01, 1.0], "body": "big", "parent": "big" }))
+        .collect();
+    let (st, ack) = http(
+        web[0],
+        "POST",
+        "/v1/collections/notes/documents",
+        Some(&json!({ "documents": big, "after": after })),
+    );
+    assert_eq!(st, 200, "{ack}");
+    let after_big = ack["consistency_token"].as_str().unwrap().to_owned();
+    let q3 = json!({ "k": 2, "vector": { "field": "embedding", "values": [100.0, 1.0] }, "group_by": "parent", "with_documents": false, "after": format!("{after},{after_big}") });
+    let (_, res) = http(web[2], "POST", "/v1/collections/notes/search", Some(&q3));
+    let got: Vec<(&str, &str)> = res["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["id"].as_str().unwrap(), h["group"].as_str().unwrap()))
+        .collect();
+    assert_eq!(got, vec![("big0", "big"), ("n11", "p2")], "{res}");
+    let (st, ack) = http(
+        web[0],
+        "POST",
+        "/v1/collections/notes/documents/delete",
+        Some(&json!({ "filter": { "field": "parent", "eq": "big" }, "after": after_big })),
+    );
+    assert_eq!((st, &ack["deleted"]), (200, &json!(40)), "{ack}");
+    let after = format!("{after},{}", ack["consistency_token"].as_str().unwrap());
+    let mut bad = q.clone();
+    bad["group_by"] = json!("embedding");
+    let (st, _) = http(web[1], "POST", "/v1/collections/notes/search", Some(&bad));
+    assert_eq!(st, 400);
+
     let (st, ack) = http(
         web[2],
         "POST",

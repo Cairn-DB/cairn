@@ -291,6 +291,7 @@ components:
         with_documents: { type: boolean, default: true }
         consistency: { $ref: "#/components/schemas/Consistency" }
         after: { $ref: "#/components/schemas/Token" }
+        group_by: { type: string, description: "One hit per value of this scalar field (e.g. a chunk's parent); hits carry it as `group`." }
     VectorLeg:
       type: object
       required: [field, values]
@@ -310,6 +311,7 @@ components:
               - type: "null"
               - { type: object, properties: { rank: { type: integer }, score: { type: number } } }
         document: { $ref: "#/components/schemas/Document" }
+        group: { description: "The hit's value of the group_by field, when grouping." }
     ReplicaStatus:
       type: object
       properties:

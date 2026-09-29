@@ -144,6 +144,8 @@ class Hit:
     document: Optional[Document] = None
     tenant: Optional[str] = None
     """The hit's tenant, shown to unscoped keys only."""
+    group: Any = None
+    """The hit's value of the ``group_by`` field."""
 
     @staticmethod
     def from_json(h: Mapping[str, Any]) -> "Hit":
@@ -153,6 +155,7 @@ class Hit:
             legs=[LegHit(**leg) if leg else None for leg in h.get("legs", [])],
             document=h.get("document"),
             tenant=h.get("_tenant"),
+            group=h.get("group"),
         )
 
 
@@ -224,6 +227,7 @@ def search_body(
     with_documents: Optional[bool],
     consistency: Optional[str],
     after: str,
+    group_by: Optional[str] = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if k is not None:
@@ -246,6 +250,8 @@ def search_body(
         body["with_documents"] = with_documents
     if consistency:
         body["consistency"] = consistency
+    if group_by:
+        body["group_by"] = group_by
     if after:
         body["after"] = after
     return body

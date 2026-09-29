@@ -205,12 +205,14 @@ class Client(_Base):
         oversample: Optional[int] = None,
         with_documents: Optional[bool] = None,
         consistency: Optional[Consistency] = None,
+        group_by: Optional[str] = None,
     ) -> list[Hit]:
-        """Hybrid search: vector legs, a text leg and a filter, fused."""
+        """Hybrid search: vector legs, a text leg and a filter, fused. ``group_by`` returns one
+        hit per value of that field (each document once, at its best chunk)."""
         body = search_body(
             k=k, vector=vector, text=text, text_field=text_field, all_terms=all_terms, filter=filter,
             fusion=fusion, oversample=oversample, with_documents=with_documents,
-            consistency=consistency, after=self.token,
+            consistency=consistency, after=self.token, group_by=group_by,
         )
         return [Hit.from_json(h) for h in self._call("POST", f"{self._base}/search", body)["hits"]]
 
@@ -326,11 +328,12 @@ class AsyncClient(_Base):
         oversample: Optional[int] = None,
         with_documents: Optional[bool] = None,
         consistency: Optional[Consistency] = None,
+        group_by: Optional[str] = None,
     ) -> list[Hit]:
         body = search_body(
             k=k, vector=vector, text=text, text_field=text_field, all_terms=all_terms, filter=filter,
             fusion=fusion, oversample=oversample, with_documents=with_documents,
-            consistency=consistency, after=self.token,
+            consistency=consistency, after=self.token, group_by=group_by,
         )
         r = await self._call("POST", f"{self._base}/search", body)
         return [Hit.from_json(h) for h in r["hits"]]

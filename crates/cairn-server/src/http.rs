@@ -1328,6 +1328,9 @@ struct SearchBody {
     consistency: Option<String>,
     #[serde(default)]
     after: Option<String>,
+    /// One hit per value of this field (ADR 0031): a document's best chunk, for instance.
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 fn default_k() -> usize {
@@ -1442,23 +1445,90 @@ async fn search(
     }
     q.with_documents = body.with_documents;
     let (consistency, tokens) = consistency(body.consistency.as_deref(), body.after.as_deref())?;
-    let hits = with_client_in(&s, &coll.name, move |c| {
-        match c.call(&Request::Query {
-            query: q,
-            consistency,
-            tokens,
-        })? {
-            Wire::Hits(h) => Ok(h),
-            Wire::Error { message, .. } => Err(cairn_core::Error::Internal(message)),
-            other => Err(cairn_core::Error::Internal(format!(
-                "unexpected response {other:?}"
-            ))),
+    let run = |q: Query| {
+        let tokens = tokens.clone();
+        with_client_in(&s, &coll.name, move |c| {
+            match c.call(&Request::Query {
+                query: q,
+                consistency,
+                tokens,
+            })? {
+                Wire::Hits(h) => Ok(h),
+                Wire::Error { message, .. } => Err(cairn_core::Error::Internal(message)),
+                other => Err(cairn_core::Error::Internal(format!(
+                    "unexpected response {other:?}"
+                ))),
+            }
+        })
+    };
+    let Some(group) = &body.group_by else {
+        let hits = run(q).await?;
+        return Ok(Json(json!({
+            "hits": hits.iter().map(|h| hit_json(schema, &scope, h)).collect::<Vec<_>>()
+        })));
+    };
+    // One hit per group: fetch more candidates than `k`, keep each group's best in rank order,
+    // and widen (up to 10,000 candidates) while fewer than `k` groups came back and more exist.
+    let field = schema
+        .index_of(group)
+        .filter(|_| !cairn_core::schema::is_reserved(group))
+        .ok_or_else(|| ApiError::bad(format!("group_by: unknown field {group:?}")))?;
+    if matches!(
+        schema.fields[field].kind,
+        FieldKind::Vector { .. } | FieldKind::Blob | FieldKind::Set
+    ) {
+        return Err(ApiError::bad(format!(
+            "group_by: {group:?} is not a scalar field"
+        )));
+    }
+    let k = body.k;
+    let mut fetch = (k * 4).clamp(k, 10_000);
+    let (hits, keys) = loop {
+        let mut qk = q.clone();
+        qk.k = fetch;
+        qk.with_documents = true;
+        let hits = run(qk).await?;
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut kept = Vec::new();
+        let mut keys = Vec::new();
+        for h in &hits {
+            let value = h
+                .document
+                .as_ref()
+                .and_then(|d| d.values.get(field).cloned().flatten());
+            // A hit without a value is a group of its own.
+            let key = match &value {
+                Some(v) => format!("{v:?}"),
+                None => format!("\u{0}{}", h.doc_id.get()),
+            };
+            if seen.insert(key) {
+                kept.push(h.clone());
+                keys.push(value);
+            }
+            if kept.len() == k {
+                break;
+            }
         }
-    })
-    .await?;
-    Ok(Json(json!({
-        "hits": hits.iter().map(|h| hit_json(schema, &scope, h)).collect::<Vec<_>>()
-    })))
+        if kept.len() >= k || hits.len() < fetch || fetch >= 10_000 {
+            break (kept, keys);
+        }
+        fetch = (fetch * 2).min(10_000);
+    };
+    let out: Vec<Json_> = hits
+        .iter()
+        .zip(keys)
+        .map(|(h, value)| {
+            let mut j = hit_json(schema, &scope, h);
+            j["group"] = value.as_ref().map_or(Json_::Null, value_json);
+            if !body.with_documents
+                && let Some(m) = j.as_object_mut()
+            {
+                m.remove("document");
+            }
+            j
+        })
+        .collect();
+    Ok(Json(json!({ "hits": out })))
 }
 
 #[cfg(test)]

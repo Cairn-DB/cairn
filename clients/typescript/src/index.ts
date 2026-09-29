@@ -85,6 +85,8 @@ export interface SearchRequest {
   /** Return each hit's document (default true). */
   withDocuments?: boolean;
   consistency?: Consistency;
+  /** One hit per value of this field, e.g. `"parent"`: each document once, at its best chunk. */
+  groupBy?: string;
 }
 
 export interface Hit {
@@ -94,6 +96,8 @@ export interface Hit {
   legs: ({ rank: number; score: number } | null)[];
   document?: Document;
   _tenant?: string;
+  /** The hit's value of the `groupBy` field. */
+  group?: unknown;
 }
 
 export interface WriteResult {
@@ -319,6 +323,7 @@ export class Cairn {
     if (req.oversample !== undefined) body.oversample = req.oversample;
     if (req.withDocuments !== undefined) body.with_documents = req.withDocuments;
     if (req.consistency) body.consistency = req.consistency;
+    if (req.groupBy) body.group_by = req.groupBy;
     const r = (await this.call("POST", `${this.base}/search`, this.after(body))) as { hits: Hit[] };
     return r.hits;
   }

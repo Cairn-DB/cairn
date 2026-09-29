@@ -98,6 +98,8 @@ def test_collections_against_a_live_node():
     assert notes.get("n1")["body"] == "walrus 1"
     assert app.get("n1") is None, "not in default"
     assert len(notes.search(text="walrus", text_field="body")) == 4
+    grouped = notes.search(vector={"field": "embedding", "values": [3.0, 1.0]}, group_by="parent")
+    assert [(h.id, h.group) for h in grouped] == [("n3", "p1"), ("n2", "p0")]
     assert notes.delete(parent="p0").deleted == 2
     assert sorted(h.id for h in notes.search(k=10)) == ["n1", "n3"]
     assert notes.schema() == schema

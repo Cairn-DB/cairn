@@ -557,7 +557,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     Fixed: the view only grows (ids are never reused). Acceptance 100/100 on 3 nodes
     (data/acceptance-04.log).
   - Not done: per-collection replication, counts, schema evolution.
-  - Next: clients' `collection()`, then group-by-parent search, then LangChain/LlamaIndex.
+  - Clients: `collection(name)` views, create/list/drop (live 7/7 each).
+- 0.3 step B.2, `group_by` search (2026-09-29): HTTP-level, widening candidates 4k -> 10,000;
+  3-process test incl. widening past 40 chunks of one parent (positive control fails without
+  widening); clients `groupBy`/`group_by` (live 7/7 each).
+  - Next: LangChain (Python, JS) and LlamaIndex adapters.
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

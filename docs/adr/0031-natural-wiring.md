@@ -295,6 +295,20 @@ Both clients share one design and live in this repository, tested in CI against 
 |---|---|---|
 | A | text ids; `DeleteWhere` (by filter and by parent); tenant-scoped keys and tenant erasure; TypeScript and Python clients on the `default` collection; acceptance suite extended | 0.2 |
 | B | collections (catalog, create and drop), `/v1/collections/...` routes, a search option to return one hit per parent; LangChain and LlamaIndex adapters | 0.3 |
+
+**One hit per parent (step B.2, 2026-09-29).**
+- Implemented as `group_by` in the HTTP search, without a protocol change. The search ranks
+  4 × `k` candidates with their documents, keeps each group's best hit in rank order, and
+  doubles the candidates (up to 10,000) while it has fewer than `k` groups and more
+  candidates exist.
+- Exact while one group's chunks do not fill 10,000 candidates. It reads candidate
+  documents, so it costs more than a plain search.
+- A grouping inside the shards (legs carrying the group value) would be cheaper. It is
+  deferred until a measurement shows the need.
+- Tested:
+  - three processes: order, `k` groups, no documents when asked, the 400 case, and widening
+    past a parent with 40 chunks (positive control: without widening, the test fails);
+  - both clients' live tests.
 | C | retention (an expiry field, deleted through `DeleteWhere` proposed by the leader with the time in the command), partial updates (`Patch`, applied against the current document), Kafka ingestion (ADR 0024), exportable proof of deletion | later |
 
 Step A changes the segment format and the protocol: upgrading from 0.1 needs the

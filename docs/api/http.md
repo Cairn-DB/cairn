@@ -226,6 +226,13 @@ clients (mutual TLS) is not tenant-aware.
 - Each hit has `id`, the fused `score`, `legs` (rank and raw score in each leg, `null`
   where the document is absent from that leg), and the `document` unless
   `with_documents` is false.
+- `group_by` (a scalar field, for instance `"parent"`) returns at most one hit per value of
+  that field: each document once, at the rank of its best chunk. Hits carry the value as
+  `group`.
+  - The search ranks more candidates than `k` (4 times, doubling up to 10,000) until it has
+    `k` groups or runs out of candidates. If a few parents own more than 10,000 of the best
+    chunks, fewer than `k` groups come back.
+  - It reads each candidate's document, so it costs more than a plain search.
 
 ## Errors
 

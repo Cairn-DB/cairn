@@ -17,6 +17,9 @@ wire protocol or the on-disk format; the notes say so.
   `listCollections`, `dropCollection`. Rust client: `set_collection`, `create_collection`,
   `drop_collection`, `list_collections`.
 
+- `group_by` in searches (ADR 0031): one hit per value of a field, for instance each document
+  once at its best chunk. Clients: `groupBy` / `group_by`, and the hit's `group`.
+
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
   before retrying. Calls on a connection closed by the peer now fail at once, and the caller
