@@ -1,6 +1,6 @@
 # ADR 0031: Natural wiring: text ids, deletion by filter, tenants, collections, clients
 
-- Status: proposed (the owner asked for it on 2026-09-29; to validate before any code)
+- Status: accepted (the owner validated the design on 2026-09-29)
 - Date: 2026-09-29
 
 ## Context

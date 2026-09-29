@@ -68,6 +68,7 @@ A Rust database engine that is:
 | D5 | Log replication for recent writes, immutable segment shipping for bulk data (Lucene/Quickwit style) | Followers should not rebuild the whole index from the log. Flushes: ADR 0016 (leader builds, followers fetch); compaction is still local. |
 | D6 | Followers may serve reads with bounded staleness; leader serves linearizable reads | Read scaling for a read-heavy workload. |
 | D7 | Every source of nondeterminism (time, network, disk, randomness, scheduling where feasible) sits behind an injectable trait | Deterministic simulation (FoundationDB / TigerBeetle style) cannot be retrofitted cheaply. |
+| D8 | Natural wiring (ADR 0031): text ids through a per-shard dictionary; deletion by filter resolved in the log (`DeleteWhere`), which also deletes a parent's chunks; tenants enforced by the API key; collections created from a replicated catalog; TypeScript and Python clients, then LangChain and LlamaIndex adapters | Most uses (`docs/use-cases.md`) need these to wire Cairn in without glue code, and deletion by criterion extends the deletion guarantee from ids to "this user", "this customer", "this document and its chunks". |
 
 ## 5. Open questions (propose, justify, and challenge my assumptions)
 
