@@ -15,8 +15,19 @@ With rootless podman, use `127.0.0.1` rather than `localhost`: `localhost` may r
 
 ## Documents
 
-A document is a flat JSON object: an unsigned integer `id` plus fields named as in the
-schema. JSON types by field kind:
+A document is a flat JSON object: an `id` plus fields named as in the schema.
+
+**Ids** (ADR 0031):
+- An `id` is either your own string of 1 to 1024 bytes (`"article/2024-17"`, a UUID, anything),
+  or an unsigned integer below 2^63.
+- Reads, searches and takedowns return the id as you wrote it.
+- Writing a document again with the same id replaces it.
+- In a URL path, digits mean an integer id. A string id made only of digits is reached with
+  `?id_type=text`, for example `GET /v1/documents/12345?id_type=text`. Encode other characters
+  as usual (`%2F` for `/`).
+- Field names starting with `_` are reserved.
+
+JSON types by field kind:
 
 | field kind | JSON |
 |---|---|

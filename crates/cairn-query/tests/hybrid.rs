@@ -92,6 +92,7 @@ fn cfg(memtable_max_bytes: usize) -> EngineConfig {
             max_deleted_fraction: 0.3,
             target_segment_rows: 0,
             min_merge: 4,
+            shard: 0,
         },
         vector: VectorIndexParams {
             hnsw: HnswParams {

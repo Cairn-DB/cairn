@@ -205,6 +205,7 @@ impl LegsJob {
             lists.push(LegList {
                 hits,
                 higher_is_better,
+                keys: Vec::new(),
             });
         }
         Ok(lists)
@@ -430,6 +431,7 @@ impl<R: Runtime> ShardEngine<R> {
                 score,
                 legs,
                 document,
+                key: self.store.id_to_key(doc_id),
             });
         }
         Ok(out)
@@ -482,6 +484,7 @@ impl<R: Runtime> ShardEngine<R> {
             return Ok(LegsJob::ready(vec![LegList {
                 hits,
                 higher_is_better: true,
+                keys: Vec::new(),
             }]));
         }
         let mut parts = Vec::new();
@@ -584,6 +587,7 @@ impl<R: Runtime> ShardEngine<R> {
             lists.push(LegList {
                 hits,
                 higher_is_better: false,
+                keys: Vec::new(),
             });
         }
         if let Some(t) = &q.text {
@@ -612,6 +616,7 @@ impl<R: Runtime> ShardEngine<R> {
                     .map(|(s, row)| (all[row as usize].id, s))
                     .collect(),
                 higher_is_better: true,
+                keys: Vec::new(),
             });
         }
         if lists.is_empty() {

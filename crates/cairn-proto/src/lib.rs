@@ -53,6 +53,20 @@ pub enum Request {
     /// Pause (`true`) or resume merges on the node that receives it (not forwarded): answered
     /// with an empty `Ack`. Merges already running or committed still complete.
     SetMergesPaused(bool),
+    /// Insert or replace documents identified by text ids (ADR 0031), held in their `_key`
+    /// field; routed by `shard_of_key`.
+    UpsertKeyed(Vec<Document>),
+    /// Delete documents by text id (a takedown).
+    DeleteKeys(Vec<String>),
+    /// Point read by text id.
+    GetKey {
+        /// Text id.
+        key: String,
+        /// Consistency level.
+        consistency: Consistency,
+        /// Per-shard read-your-writes tokens.
+        tokens: Vec<Token>,
+    },
 }
 
 /// A response.
@@ -230,6 +244,14 @@ fn enc_hit(w: &mut Writer, h: &Hit) {
             d.encode(w);
         }
     }
+    match &h.key {
+        None => {
+            w.u8(0);
+        }
+        Some(k) => {
+            w.u8(1).str(k);
+        }
+    }
 }
 
 fn dec_hit(r: &mut Reader<'_>) -> Result<Hit> {
@@ -253,11 +275,16 @@ fn dec_hit(r: &mut Reader<'_>) -> Result<Hit> {
         0 => None,
         _ => Some(Document::decode(r)?),
     };
+    let key = match r.u8()? {
+        0 => None,
+        _ => Some(r.str()?.to_owned()),
+    };
     Ok(Hit {
         doc_id,
         score,
         legs,
         document,
+        key,
     })
 }
 
@@ -401,6 +428,30 @@ impl Request {
             Request::SetMergesPaused(paused) => {
                 w.u8(8).u8(u8::from(*paused));
             }
+            Request::UpsertKeyed(docs) => {
+                w.u8(9).u32(docs.len() as u32);
+                for d in docs {
+                    d.encode(&mut w);
+                }
+            }
+            Request::DeleteKeys(keys) => {
+                w.u8(10).u32(keys.len() as u32);
+                for k in keys {
+                    w.str(k);
+                }
+            }
+            Request::GetKey {
+                key,
+                consistency,
+                tokens,
+            } => {
+                w.u8(11).str(key);
+                enc_consistency(&mut w, consistency);
+                w.u32(tokens.len() as u32);
+                for t in tokens {
+                    enc_token(&mut w, t);
+                }
+            }
         }
         w.into_bytes()
     }
@@ -467,6 +518,42 @@ impl Request {
             },
             7 => Request::Forwarded(Box::new(Request::from_bytes(r.bytes()?)?)),
             8 => Request::SetMergesPaused(r.u8()? != 0),
+            9 => {
+                let n = r.u32()? as usize;
+                if n > 1 << 20 {
+                    return Err(Error::corruption("upsert too large"));
+                }
+                let mut docs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    docs.push(Document::decode(&mut r)?);
+                }
+                Request::UpsertKeyed(docs)
+            }
+            10 => {
+                let n = r.u32()? as usize;
+                if n > 1 << 24 {
+                    return Err(Error::corruption("delete too large"));
+                }
+                let mut keys = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    keys.push(r.str()?.to_owned());
+                }
+                Request::DeleteKeys(keys)
+            }
+            11 => {
+                let key = r.str()?.to_owned();
+                let consistency = dec_consistency(&mut r)?;
+                let n = r.u32()? as usize;
+                let mut tokens = Vec::with_capacity(n.min(1 << 12));
+                for _ in 0..n {
+                    tokens.push(dec_token(&mut r)?);
+                }
+                Request::GetKey {
+                    key,
+                    consistency,
+                    tokens,
+                }
+            }
             t => return Err(Error::corruption(format!("request tag {t}"))),
         };
         r.finish()?;
@@ -524,6 +611,10 @@ impl Response {
                     for (d, sc) in &l.hits {
                         w.u64(d.get()).f32(*sc);
                     }
+                    w.u32(l.keys.len() as u32);
+                    for (d, k) in &l.keys {
+                        w.u64(d.get()).str(k);
+                    }
                 }
             }
         }
@@ -579,9 +670,15 @@ impl Response {
                     for _ in 0..m {
                         hits.push((DocId(r.u64()?), r.f32()?));
                     }
+                    let nk = r.u32()? as usize;
+                    let mut keys = Vec::with_capacity(nk.min(1 << 16));
+                    for _ in 0..nk {
+                        keys.push((DocId(r.u64()?), r.str()?.to_owned()));
+                    }
                     lists.push(LegList {
                         hits,
                         higher_is_better,
+                        keys,
                     });
                 }
                 Response::Legs(lists)
@@ -607,7 +704,16 @@ impl Response {
 
 /// Shard of a document: a hash of its id modulo the shard count.
 pub fn shard_of(id: DocId, shards: u32) -> ShardId {
+    // The internal id of a text id carries its shard (ADR 0031).
+    if let Some(s) = id.keyed_shard() {
+        return ShardId(s % shards.max(1));
+    }
     ShardId((cairn_core::hash::xxh3_64(&id.get().to_le_bytes()) % u64::from(shards.max(1))) as u32)
+}
+
+/// Shard owning a text id (ADR 0031).
+pub fn shard_of_key(key: &str, shards: u32) -> ShardId {
+    ShardId((cairn_core::hash::xxh3_64(key.as_bytes()) % u64::from(shards.max(1))) as u32)
 }
 
 #[cfg(test)]
@@ -668,6 +774,13 @@ mod tests {
             Request::Forwarded(Box::new(Request::Delete(vec![DocId(3)]))),
             Request::SetMergesPaused(true),
             Request::SetMergesPaused(false),
+            Request::UpsertKeyed(vec![doc.clone()]),
+            Request::DeleteKeys(vec!["doc-1".into(), "é".into()]),
+            Request::GetKey {
+                key: "doc-2".into(),
+                consistency: Consistency::Linearizable,
+                tokens: vec![token],
+            },
         ];
         for r in reqs {
             assert_eq!(Request::from_bytes(&r.to_bytes()).unwrap(), r);
@@ -683,6 +796,7 @@ mod tests {
                 None,
             ],
             document: Some(doc),
+            key: Some("doc-5".into()),
         };
         let status = ReplicaStatus {
             id: NodeId(2),
@@ -706,6 +820,11 @@ mod tests {
             Response::Doc(None),
             Response::Hits(vec![hit]),
             Response::Status(vec![status]),
+            Response::Legs(vec![LegList {
+                hits: vec![(DocId(1), 0.5), (DocId::keyed(2, 3).unwrap(), 0.25)],
+                higher_is_better: true,
+                keys: vec![(DocId::keyed(2, 3).unwrap(), "doc-3".into())],
+            }]),
             Response::Error {
                 message: "nope".into(),
                 leader_hint: Some(NodeId(1)),
@@ -716,6 +835,14 @@ mod tests {
         }
         assert!(Request::from_bytes(&[9]).is_err());
         assert!((0..1000).all(|i| shard_of(DocId(i), 8).get() < 8));
+        // A text id's internal id routes to the shard that assigned it (ADR 0031).
+        for shard in 0..8 {
+            assert_eq!(
+                shard_of(DocId::keyed(shard, 42).unwrap(), 8),
+                ShardId(shard)
+            );
+        }
+        assert!((0..1000).all(|i| shard_of_key(&format!("k{i}"), 8).get() < 8));
         assert_eq!(shard_of(DocId(42), 1), ShardId(0));
     }
 }

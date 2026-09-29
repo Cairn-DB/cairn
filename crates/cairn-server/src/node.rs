@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use cairn_core::{DocId, Document, Error, HashMap, NodeId, Result, Runtime as _, Schema, ShardId};
-use cairn_proto::{Request, Response, shard_of};
+use cairn_proto::{Request, Response, shard_of, shard_of_key};
 use cairn_query::{
     Consistency, EngineConfig, Hit, LegList, Query, Replica, ReplicaConfig, ReplicaHandle,
     ReplicaStatus, Token, fuse,
@@ -83,7 +83,7 @@ enum CoreRequest {
     },
     Get {
         shard: ShardId,
-        id: DocId,
+        target: ReadTarget,
         consistency: Consistency,
         reply: CrossSender<Result<Option<Document>>>,
     },
@@ -97,6 +97,51 @@ enum CoreRequest {
         shard: ShardId,
         reply: CrossSender<Option<ReplicaStatus>>,
     },
+}
+
+/// What a point read targets: an internal id, or a text id resolved by the shard (ADR 0031).
+#[derive(Debug, Clone)]
+enum ReadTarget {
+    Id(DocId),
+    Key(String),
+}
+
+/// Checks documents before they are proposed (a document the log cannot apply is refused here,
+/// with a message, rather than skipped by every replica). A client may send only the fields of
+/// its own schema: the reserved ones (ADR 0031) are then appended, empty.
+fn prepare_docs(cfg: &NodeConfig, docs: Vec<Document>, keyed: bool) -> Result<Vec<Document>> {
+    let n = cfg.schema.fields.len();
+    let user = cfg
+        .schema
+        .fields
+        .iter()
+        .filter(|f| !cairn_core::schema::is_reserved(&f.name))
+        .count();
+    let key_field = cfg.schema.index_of(cairn_core::schema::KEY_FIELD);
+    docs.into_iter()
+        .map(|mut d| {
+            if d.values.len() == user && user < n {
+                d.values.resize(n, None);
+            }
+            if !keyed {
+                if d.id.is_keyed() {
+                    return Err(Error::InvalidRequest(format!(
+                        "document {}: integer ids are below 2^63",
+                        d.id
+                    )));
+                }
+                if key_field.is_some_and(|f| matches!(d.values.get(f), Some(Some(_)))) {
+                    return Err(Error::InvalidRequest(format!(
+                        "document {}: an integer-id document cannot set a text id",
+                        d.id
+                    )));
+                }
+            }
+            d.validate(&cfg.schema)
+                .map_err(|e| Error::InvalidRequest(e.to_string()))?;
+            Ok(d)
+        })
+        .collect()
 }
 
 type Runtime = PoolRuntime<TcpNetwork>;
@@ -288,6 +333,7 @@ impl Node {
                         max_segments: cfg.max_segments,
                         target_segment_rows: cfg.target_segment_rows,
                         log: LogConfig::default(),
+                        shard: s,
                         ..StoreConfig::default()
                     },
                     vector: cairn_index::VectorIndexParams {
@@ -377,11 +423,16 @@ impl Node {
                 rt.spawn(async move { reply.send(h.propose(cmd).await) })
             }
             CoreRequest::Get {
-                id,
+                target,
                 consistency,
                 reply,
                 ..
-            } => rt.spawn(async move { reply.send(h.get(id, consistency).await) }),
+            } => rt.spawn(async move {
+                reply.send(match target {
+                    ReadTarget::Id(id) => h.get(id, consistency).await,
+                    ReadTarget::Key(k) => h.get_key(k, consistency).await,
+                })
+            }),
             CoreRequest::QueryLegs {
                 query,
                 consistency,
@@ -565,6 +616,8 @@ impl Node {
                 let req = match cmd {
                     Command::Upsert(docs) => Request::Upsert(docs),
                     Command::Delete(ids) => Request::Delete(ids),
+                    Command::UpsertKeyed(docs) => Request::UpsertKeyed(docs),
+                    Command::DeleteKeys(keys) => Request::DeleteKeys(keys),
                     // Upkeep entries are proposed by replicas themselves, never forwarded.
                     Command::Noop
                     | Command::FlushBegin
@@ -594,14 +647,15 @@ impl Node {
         queues: &Queues,
         cfg: &NodeConfig,
         shard: ShardId,
-        id: DocId,
+        target: ReadTarget,
         consistency: Consistency,
         may_forward: bool,
     ) -> Response {
         let cores = cfg.cores.max(1);
+        let t2 = target.clone();
         match Self::send(queues, cores, shard, |reply| CoreRequest::Get {
             shard,
-            id,
+            target: t2,
             consistency,
             reply,
         })
@@ -612,18 +666,19 @@ impl Node {
                 leader_hint: Some(l),
                 ..
             })) if may_forward && l != cfg.id => {
-                Self::forward(
-                    rt,
-                    cfg,
-                    l,
-                    shard,
-                    Request::Get {
+                let req = match target {
+                    ReadTarget::Id(id) => Request::Get {
                         id,
                         consistency,
                         tokens: Vec::new(),
                     },
-                )
-                .await
+                    ReadTarget::Key(key) => Request::GetKey {
+                        key,
+                        consistency,
+                        tokens: Vec::new(),
+                    },
+                };
+                Self::forward(rt, cfg, l, shard, req).await
             }
             Some(Err(e)) => Response::from_error(&e),
             None => Response::Error {
@@ -670,6 +725,10 @@ impl Node {
                 },
             },
             Request::Upsert(docs) => {
+                let docs = match prepare_docs(cfg, docs, false) {
+                    Ok(d) => d,
+                    Err(e) => return Response::from_error(&e),
+                };
                 let mut groups: HashMap<ShardId, Vec<Document>> = HashMap::default();
                 for d in docs {
                     groups
@@ -720,6 +779,80 @@ impl Node {
                 tokens.sort();
                 Response::Ack(tokens)
             }
+            Request::UpsertKeyed(docs) => {
+                let docs = match prepare_docs(cfg, docs, true) {
+                    Ok(d) => d,
+                    Err(e) => return Response::from_error(&e),
+                };
+                let Some(field) = cfg.schema.index_of(cairn_core::schema::KEY_FIELD) else {
+                    return Response::from_error(&Error::InvalidRequest(
+                        "this collection has no text ids".into(),
+                    ));
+                };
+                let mut groups: HashMap<ShardId, Vec<Document>> = HashMap::default();
+                for d in docs {
+                    let key = match d.values.get(field) {
+                        Some(Some(cairn_core::Value::Blob(b))) => {
+                            std::str::from_utf8(b).ok().map(str::to_owned)
+                        }
+                        _ => None,
+                    };
+                    let Some(key) = key.filter(|k| !k.is_empty()) else {
+                        return Response::from_error(&Error::InvalidRequest(
+                            "a text id must be a non-empty UTF-8 string".into(),
+                        ));
+                    };
+                    groups
+                        .entry(shard_of_key(&key, cfg.shards))
+                        .or_default()
+                        .push(d);
+                }
+                let mut tokens = Vec::new();
+                for (shard, group) in groups {
+                    match Self::propose_routed(
+                        rt,
+                        queues,
+                        cfg,
+                        shard,
+                        Command::UpsertKeyed(group),
+                        may_forward,
+                    )
+                    .await
+                    {
+                        Ok(t) => tokens.extend(t),
+                        Err(e) => return Response::from_error(&e),
+                    }
+                }
+                tokens.sort();
+                Response::Ack(tokens)
+            }
+            Request::DeleteKeys(keys) => {
+                let mut groups: HashMap<ShardId, Vec<String>> = HashMap::default();
+                for k in keys {
+                    groups
+                        .entry(shard_of_key(&k, cfg.shards))
+                        .or_default()
+                        .push(k);
+                }
+                let mut tokens = Vec::new();
+                for (shard, group) in groups {
+                    match Self::propose_routed(
+                        rt,
+                        queues,
+                        cfg,
+                        shard,
+                        Command::DeleteKeys(group),
+                        may_forward,
+                    )
+                    .await
+                    {
+                        Ok(t) => tokens.extend(t),
+                        Err(e) => return Response::from_error(&e),
+                    }
+                }
+                tokens.sort();
+                Response::Ack(tokens)
+            }
             Request::Get {
                 id,
                 consistency,
@@ -727,7 +860,34 @@ impl Node {
             } => {
                 let shard = shard_of(id, cfg.shards);
                 let consistency = Self::per_shard(consistency, &tokens, shard);
-                Self::get_routed(rt, queues, cfg, shard, id, consistency, may_forward).await
+                Self::get_routed(
+                    rt,
+                    queues,
+                    cfg,
+                    shard,
+                    ReadTarget::Id(id),
+                    consistency,
+                    may_forward,
+                )
+                .await
+            }
+            Request::GetKey {
+                key,
+                consistency,
+                tokens,
+            } => {
+                let shard = shard_of_key(&key, cfg.shards);
+                let consistency = Self::per_shard(consistency, &tokens, shard);
+                Self::get_routed(
+                    rt,
+                    queues,
+                    cfg,
+                    shard,
+                    ReadTarget::Key(key),
+                    consistency,
+                    may_forward,
+                )
+                .await
             }
             Request::Query {
                 query,
@@ -807,6 +967,7 @@ impl Node {
                             } else {
                                 for (m, l) in merged.iter_mut().zip(lists) {
                                     m.hits.extend(l.hits);
+                                    m.keys.extend(l.keys);
                                 }
                             }
                         }
@@ -824,6 +985,10 @@ impl Node {
                     }
                     m.hits.truncate(per_leg);
                 }
+                let keys: HashMap<DocId, String> = merged
+                    .iter_mut()
+                    .flat_map(|m| std::mem::take(&mut m.keys))
+                    .collect();
                 let fused = if merged.is_empty() {
                     Vec::new()
                 } else if query.leg_count() == 0 {
@@ -845,7 +1010,16 @@ impl Node {
                     let document = if query.with_documents {
                         let shard = shard_of(doc_id, cfg.shards);
                         let c = Self::per_shard(consistency, &tokens, shard);
-                        match Self::get_routed(rt, queues, cfg, shard, doc_id, c, may_forward).await
+                        match Self::get_routed(
+                            rt,
+                            queues,
+                            cfg,
+                            shard,
+                            ReadTarget::Id(doc_id),
+                            c,
+                            may_forward,
+                        )
+                        .await
                         {
                             Response::Doc(d) => d,
                             _ => None,
@@ -858,6 +1032,7 @@ impl Node {
                         score,
                         legs,
                         document,
+                        key: keys.get(&doc_id).cloned(),
                     });
                 }
                 Response::Hits(hits)

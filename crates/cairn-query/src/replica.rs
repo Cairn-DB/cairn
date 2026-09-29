@@ -192,6 +192,12 @@ pub struct ReplicaStatus {
     pub merges_paused: bool,
 }
 
+/// What a point read targets: an internal id, or a text id (ADR 0031).
+enum DocRef {
+    Id(DocId),
+    Key(String),
+}
+
 enum Event {
     Tick,
     Net(NodeId, Bytes),
@@ -202,7 +208,7 @@ enum Event {
         Consistency,
         Sender<Result<Vec<crate::fusion::LegList>>>,
     ),
-    Get(DocId, Consistency, Sender<Result<Option<Document>>>),
+    Get(DocRef, Consistency, Sender<Result<Option<Document>>>),
     Status(Sender<ReplicaStatus>),
     /// A flushed segment was built and written outside the actor (ADR 0021).
     FlushWritten {
@@ -360,11 +366,20 @@ impl ReplicaHandle {
 
     /// Point read at the given consistency.
     pub async fn get(&self, id: DocId, consistency: Consistency) -> Result<Option<Document>> {
+        self.get_ref(DocRef::Id(id), consistency).await
+    }
+
+    /// Point read by text id (ADR 0031), resolved on the replica when the read is served.
+    pub async fn get_key(&self, key: String, consistency: Consistency) -> Result<Option<Document>> {
+        self.get_ref(DocRef::Key(key), consistency).await
+    }
+
+    async fn get_ref(&self, target: DocRef, consistency: Consistency) -> Result<Option<Document>> {
         if !self.alive.get() {
             return closed();
         }
         let (tx, rx) = oneshot();
-        self.inbox.push(Event::Get(id, consistency, tx));
+        self.inbox.push(Event::Get(target, consistency, tx));
         rx.await.unwrap_or_else(closed)
     }
 
@@ -1244,10 +1259,26 @@ impl<R: Runtime> Replica<R> {
                     Ok(job) => {
                         let rt = self.rt.clone();
                         let stats = self.search_stats.clone();
+                        let names = self.engine.store().key_names();
                         let prepare = (self.rt.now() - t0).as_micros() as u64;
                         self.rt.spawn(async move {
                             let t1 = rt.now();
-                            let r = rt.offload_search(move || job.run()).await;
+                            let mut r = rt.offload_search(move || job.run()).await;
+                            // Text ids of the keyed hits, for the coordinator (ADR 0031). A key
+                            // never changes while its id is live, so reading them now is safe.
+                            if let Ok(lists) = &mut r {
+                                let names = names.borrow();
+                                for l in lists.iter_mut() {
+                                    l.keys = l
+                                        .hits
+                                        .iter()
+                                        .filter(|(id, _)| id.is_keyed())
+                                        .filter_map(|(id, _)| {
+                                            names.get(id).map(|k| (*id, k.clone()))
+                                        })
+                                        .collect();
+                                }
+                            }
                             let (n, p, w) = stats.get();
                             stats.set((n + 1, p + prepare, w + (rt.now() - t1).as_micros() as u64));
                             done.send(r);
@@ -1256,8 +1287,15 @@ impl<R: Runtime> Replica<R> {
                     Err(e) => done.send(Err(e)),
                 }
             }
-            Event::Get(id, _, done) => {
-                let r = self.engine.get(id).await;
+            Event::Get(target, _, done) => {
+                let id = match target {
+                    DocRef::Id(id) => Some(id),
+                    DocRef::Key(k) => self.engine.store().key_to_id(&k),
+                };
+                let r = match id {
+                    Some(id) => self.engine.get(id).await,
+                    None => Ok(None),
+                };
                 done.send(r);
             }
             _ => {}

@@ -81,6 +81,16 @@ pub struct FieldDef {
     pub kind: FieldKind,
 }
 
+/// Reserved field holding a document's text id (ADR 0031).
+pub const KEY_FIELD: &str = "_key";
+/// Reserved field holding a document's tenant (ADR 0031).
+pub const TENANT_FIELD: &str = "_tenant";
+
+/// Whether `name` is reserved for Cairn's own fields.
+pub fn is_reserved(name: &str) -> bool {
+    name.starts_with('_')
+}
+
 /// A collection's schema. Field order is significant: documents store values by position.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Schema {
@@ -108,6 +118,29 @@ impl Schema {
             }
         }
         Ok(Schema { fields })
+    }
+
+    /// This schema with the reserved fields appended (ADR 0031): `_key`, the text id of
+    /// documents written with one (stored, not indexed), and `_tenant`, the tenant a document
+    /// belongs to (an enum, so it can be filtered). Names starting with `_` are reserved: a
+    /// user schema that uses one is refused.
+    pub fn with_reserved(&self) -> Result<Schema> {
+        if let Some(f) = self.fields.iter().find(|f| is_reserved(&f.name)) {
+            return Err(Error::Schema(format!(
+                "field {:?}: names starting with '_' are reserved",
+                f.name
+            )));
+        }
+        let mut fields = self.fields.clone();
+        fields.push(FieldDef {
+            name: KEY_FIELD.into(),
+            kind: FieldKind::Blob,
+        });
+        fields.push(FieldDef {
+            name: TENANT_FIELD.into(),
+            kind: FieldKind::Enum,
+        });
+        Schema::new(fields)
     }
 
     /// Position of the field named `name`.

@@ -202,6 +202,8 @@ fn main() -> anyhow::Result<()> {
     let schema: Schema =
         serde_json::from_slice(&std::fs::read(&cli.schema).context("reading schema")?)
             .context("parsing schema")?;
+    // Reserved fields for text ids and tenants (ADR 0031).
+    let schema = schema.with_reserved().context("checking the schema")?;
     let tls = match (&cli.tls_ca, &cli.tls_cert, &cli.tls_key) {
         (Some(ca), Some(cert), Some(key)) => Some(
             cairn_runtime::tls::NodeTls::from_pem_files(ca, cert, key, cli.tls_anonymous_clients)

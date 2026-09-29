@@ -8,8 +8,23 @@ wire protocol or the on-disk format; the notes say so.
 ## [Unreleased]
 
 ### Added
+- Text ids (ADR 0031): a document's `id` can be your own string. It is returned as written by
+  reads and searches, and takedowns accept it, alone or mixed with integer ids. Each shard maps
+  text ids to internal ids with a dictionary kept in step by the log.
 - Acceptance suite (`examples/acceptance/`): a realistic corpus and 56-72 checks against a
   running node or cluster, in Python with no dependency.
+
+### Fixed
+- A document the log could not apply (wrong field count or type, sent through the binary
+  protocol) stopped its replica, which replayed the same entry on every reopen: one bad write
+  blocked a shard. Nodes now validate documents before proposing them, and replicas skip an
+  invalid document instead of failing.
+
+### Changed
+- Every schema gets two reserved fields, `_key` and `_tenant`, and names starting with `_` are
+  refused in user schemas. Data written by 0.1 must be ingested again. Protocol version 6.
+  Binary-protocol clients read the reserved fields at the end of each document, and may send
+  documents with only their own fields.
 
 ## [0.1.0] - 2026-09-28
 

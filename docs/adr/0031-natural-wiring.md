@@ -39,12 +39,33 @@ Options:
   - The shard maps each text id to an internal `DocId`, assigned when the command is applied,
     from a counter kept in the shard's manifest. Replicas apply the same log, so they assign
     the same ids.
+  - **Every write of a text id takes a new internal id**, and the previous one is deleted. A
+    first version reused the id found in the dictionary. The chaos campaign showed replicas
+    diverging after restarts (seed 100): deletion files are persisted at publication and can
+    mask rows that a later entry replaced, so a restarted replica rebuilt its dictionary
+    without a text id that was still live, and gave it a new id where its peers reused the
+    old one. With the counter as the only input, a restarted replica replays exactly the same
+    ids.
   - Internal ids for text ids set the high bit, so they never meet client-chosen integers.
     Integer ids keep working as before.
-  - The text id is stored with the document (a reserved column) and returned by every read and
-    search. The dictionary is rebuilt from that column when segments load, plus the memtable.
-- Format: a new segment section (the id column) and a manifest field (the counter). Segment
-  format and protocol versions are bumped (ADR 0018).
+  - The text id is stored with the document, in the reserved `_key` field (stored, not
+    indexed), and returned by every read and search. The dictionary is rebuilt from that column
+    when segments load and after a snapshot install; log replay does the rest.
+  - The internal id carries its shard (bit 63 set, 23 bits of shard, a 40-bit counter). Every
+    path that routes by id (reads, deletions, fetching hit documents) therefore finds the shard
+    without a lookup.
+  - Search results carry text ids: each shard adds the text ids of its keyed hits to its leg
+    lists, from the dictionary, so no document read is needed.
+  - In the HTTP API, an id is an integer below 2^63 or a string of 1 to 1024 bytes. In a URL
+    path, digits mean an integer id (as in 0.1), and `?id_type=text` reaches a text id made of
+    digits. Names starting with `_` are reserved.
+- Format:
+  - two reserved fields added to every schema, `_key` and `_tenant`, so no new segment section;
+  - a trailing manifest field for the counter, which older manifests read as 0;
+  - protocol version 6.
+
+  Data written by 0.1 has a schema without the reserved fields and must be ingested again. The
+  server says so at startup.
 
 ### 2. Deletion by filter, resolved in the log
 

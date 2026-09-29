@@ -37,13 +37,60 @@ fn schema() -> Schema {
         },
     ])
     .unwrap()
+    .with_reserved()
+    .unwrap()
+}
+
+/// Model keys above this one are written and read through a text id (ADR 0031): half of the
+/// workload goes through the per-shard dictionary, checked by the same model.
+const KEYED_OFFSET: u64 = 1000;
+
+fn is_keyed(key: u64) -> bool {
+    key > KEYED_OFFSET
+}
+
+fn text_id(key: u64) -> String {
+    format!("k{}", key - KEYED_OFFSET)
 }
 
 fn doc(key: u64, version: i64) -> Document {
-    Document::new(DocId(key), 3)
+    let d = Document::new(DocId(if is_keyed(key) { 0 } else { key }), 5)
         .set(0, Value::Vector(vec![key as f32, version as f32]))
         .set(1, Value::I64(version))
-        .set(2, Value::Blob(Bytes::from(vec![1u8; 120])))
+        .set(2, Value::Blob(Bytes::from(vec![1u8; 120])));
+    if is_keyed(key) {
+        d.set(3, Value::Blob(Bytes::from(text_id(key).into_bytes())))
+    } else {
+        d
+    }
+}
+
+fn upsert_cmd(key: u64, version: i64) -> Command {
+    if is_keyed(key) {
+        Command::UpsertKeyed(vec![doc(key, version)])
+    } else {
+        Command::Upsert(vec![doc(key, version)])
+    }
+}
+
+fn delete_cmd(key: u64) -> Command {
+    if is_keyed(key) {
+        Command::DeleteKeys(vec![text_id(key)])
+    } else {
+        Command::Delete(vec![DocId(key)])
+    }
+}
+
+async fn get_any(
+    h: &ReplicaHandle,
+    key: u64,
+    c: Consistency,
+) -> cairn_core::Result<Option<Document>> {
+    if is_keyed(key) {
+        h.get_key(text_id(key), c).await
+    } else {
+        h.get(DocId(key), c).await
+    }
 }
 
 fn version_of(d: &Document) -> i64 {
@@ -73,6 +120,7 @@ fn config(node: NodeId) -> ReplicaConfig {
                 max_deleted_fraction: 0.3,
                 target_segment_rows: 0,
                 min_merge: 4,
+                shard: 0,
             },
             vector: VectorIndexParams {
                 hnsw: HnswParams {
@@ -151,7 +199,7 @@ async fn read_retrying(
 ) -> Option<Option<i64>> {
     let mut target = start;
     for _ in 0..40 {
-        match handles[target].get(DocId(key), c).await {
+        match get_any(&handles[target], key, c).await {
             Ok(d) => return Some(d.map(|d| version_of(&d))),
             Err(cairn_core::Error::NotLeader {
                 leader_hint: Some(l),
@@ -180,7 +228,7 @@ fn spawn_client(
     rt.spawn(async move {
         let mut last_token: Option<Token> = None;
         while !*stop.borrow() {
-            let key = 1 + rng.below(KEYS);
+            let key = 1 + rng.below(KEYS) + if rng.below(2) == 0 { KEYED_OFFSET } else { 0 };
             let start = rng.below(handles.len() as u64) as usize;
             let call = r.now();
             let roll = rng.below(10);
@@ -206,13 +254,7 @@ fn spawn_client(
                     });
                     h.len() - 1
                 };
-                let token = propose_retrying(
-                    &r,
-                    &handles,
-                    Command::Upsert(vec![doc(key, version)]),
-                    start,
-                )
-                .await;
+                let token = propose_retrying(&r, &handles, upsert_cmd(key, version), start).await;
                 if let Some(t) = token {
                     last_token = Some(last_token.map_or(t, |p| p.max(t)));
                 }
@@ -234,8 +276,7 @@ fn spawn_client(
                     });
                     h.len() - 1
                 };
-                let token =
-                    propose_retrying(&r, &handles, Command::Delete(vec![DocId(key)]), start).await;
+                let token = propose_retrying(&r, &handles, delete_cmd(key), start).await;
                 if let Some(t) = token {
                     last_token = Some(last_token.map_or(t, |p| p.max(t)));
                 }
@@ -552,9 +593,9 @@ fn run(seed: u64) -> (usize, usize, u64) {
             let mut all = Vec::new();
             for h in &hs {
                 let mut v = Vec::new();
-                for k in 1..=KEYS {
+                for k in (1..=KEYS).chain(KEYED_OFFSET + 1..=KEYED_OFFSET + KEYS) {
                     v.push(
-                        h.get(DocId(k), Consistency::Stale)
+                        get_any(h, k, Consistency::Stale)
                             .await
                             .unwrap()
                             .map(|d| version_of(&d)),

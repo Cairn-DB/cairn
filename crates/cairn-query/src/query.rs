@@ -92,4 +92,6 @@ pub struct Hit {
     pub legs: Vec<Option<LegHit>>,
     /// The document, when requested.
     pub document: Option<Document>,
+    /// The text id, for documents written with one (ADR 0031).
+    pub key: Option<String>,
 }

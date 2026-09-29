@@ -174,6 +174,37 @@ impl Client {
         self.expect_ack(r)
     }
 
+    /// Inserts or replaces documents identified by text ids (ADR 0031): each document holds
+    /// its text id in the reserved `_key` field.
+    pub fn upsert_keyed(&mut self, docs: Vec<Document>) -> Result<Vec<Token>> {
+        let r = self.call(&Request::UpsertKeyed(docs))?;
+        self.expect_ack(r)
+    }
+
+    /// Deletes documents by text id (takedown).
+    pub fn delete_keys(&mut self, keys: Vec<String>) -> Result<Vec<Token>> {
+        let r = self.call(&Request::DeleteKeys(keys))?;
+        self.expect_ack(r)
+    }
+
+    /// Point read by text id, with the same consistency rules as [`Client::get`].
+    pub fn get_key(&mut self, key: String, consistency: Consistency) -> Result<Option<Document>> {
+        let tokens = if consistency == self.read_your_writes() {
+            self.tokens()
+        } else {
+            Vec::new()
+        };
+        match self.call(&Request::GetKey {
+            key,
+            consistency,
+            tokens,
+        })? {
+            Response::Doc(d) => Ok(d),
+            Response::Error { message, .. } => Err(Error::Internal(message)),
+            other => Err(Error::Internal(format!("unexpected response {other:?}"))),
+        }
+    }
+
     /// Point read. `read_your_writes()` expands to every token this client has seen; an explicit
     /// `ReadYourWrites(token)` is sent as is.
     pub fn get(&mut self, id: DocId, consistency: Consistency) -> Result<Option<Document>> {

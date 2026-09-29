@@ -161,6 +161,101 @@ fn http_api_end_to_end() {
     let (st, _) = http(web[2], "GET", "/v1/documents/7", None); // linearizable by default
     assert_eq!(st, 200);
 
+    // Text ids (ADR 0031): written through node 1, read, searched and taken down through the
+    // others, by path and in bulk, mixed with integer ids.
+    let keyed: Vec<Value> = ["doc-a", "doc-b", "42", "é/ü x"]
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let mut d = doc(1000 + i as u64);
+            d["id"] = json!(k);
+            d["text"] = json!(format!("zephyrine keyed {k}"));
+            d["source"] = json!("web"); // kept out of the checks on tv and radio below
+            d
+        })
+        .collect();
+    let (st, ack) = http(
+        web[0],
+        "POST",
+        "/v1/documents",
+        Some(&json!({ "documents": keyed })),
+    );
+    assert_eq!(st, 200, "{ack}");
+    let kt = ack["consistency_token"].as_str().unwrap().to_owned();
+    let (st, d) = http(
+        web[1],
+        "GET",
+        &format!("/v1/documents/doc-a?after={kt}"),
+        None,
+    );
+    assert_eq!(
+        (st, d["id"].clone(), d["text"].clone()),
+        (200, json!("doc-a"), json!("zephyrine keyed doc-a"))
+    );
+    let (st, d) = http(
+        web[2],
+        "GET",
+        &format!("/v1/documents/42?id_type=text&after={kt}"),
+        None,
+    );
+    assert_eq!((st, d["id"].clone()), (200, json!("42")));
+    assert!(d.get("_key").is_none(), "reserved fields stay hidden: {d}");
+    let (st, d) = http(web[2], "GET", &format!("/v1/documents/42?after={kt}"), None);
+    assert_eq!(
+        (st, d["id"].clone()),
+        (200, json!(42)),
+        "digits address the integer id 42"
+    );
+    let (st, res) = http(
+        web[2],
+        "POST",
+        "/v1/search",
+        Some(
+            &json!({ "k": 10, "text": { "field": "text", "query": "zephyrine" },
+                      "with_documents": false, "after": kt }),
+        ),
+    );
+    assert_eq!(st, 200, "{res}");
+    let mut ids: Vec<String> = res["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap_or("NOT A STRING").to_owned())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["42", "doc-a", "doc-b", "é/ü x"]);
+    let (st, ack) = http(
+        web[1],
+        "DELETE",
+        &format!("/v1/documents/doc-a?after={kt}"),
+        None,
+    );
+    assert_eq!(st, 200, "{ack}");
+    let kt = ack["consistency_token"].as_str().unwrap().to_owned();
+    let (st, ack) = http(
+        web[2],
+        "POST",
+        "/v1/documents/delete",
+        Some(&json!({ "ids": ["é/ü x", 999_999], "after": kt })),
+    );
+    assert_eq!(st, 200, "{ack}");
+    let kt = ack["consistency_token"].as_str().unwrap().to_owned();
+    for w in &web {
+        for k in ["doc-a", "%C3%A9%2F%C3%BC%20x"] {
+            let (st, _) = http(*w, "GET", &format!("/v1/documents/{k}?after={kt}"), None);
+            assert_eq!(st, 404, "{k} taken down");
+        }
+        let (st, d) = http(*w, "GET", &format!("/v1/documents/doc-b?after={kt}"), None);
+        assert_eq!((st, d["id"].clone()), (200, json!("doc-b")));
+    }
+    let (st, e) = http(
+        web[0],
+        "POST",
+        "/v1/documents",
+        Some(&json!({ "documents": [{ "id": "x", "_key": "y" }] })),
+    );
+    assert_eq!(st, 400, "{e}");
+
     // Hybrid search through node 3: vector + text + filter.
     let search = |node: usize, after: &str| {
         http(

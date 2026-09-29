@@ -215,13 +215,13 @@ async fn authorize(
 
 /// Records a takedown: which key asked, for which documents, and the token that proves it
 /// (target `cairn_server::audit`, on by default).
-fn audit_takedown(key: Option<&KeyId>, ids: &[u64], resp: &Json<Json_>) {
-    let shown: Vec<u64> = ids.iter().copied().take(100).collect();
+fn audit_takedown(key: Option<&KeyId>, ids: &[ApiId], resp: &Json<Json_>) {
+    let shown: Vec<String> = ids.iter().take(100).map(ApiId::to_string).collect();
     tracing::info!(
         target: "cairn_server::audit",
         key = key.map_or("-", |k| k.0.as_str()),
         count = ids.len(),
-        ids = ?shown,
+        ids = %format!("[{}]", shown.join(", ")),
         token = resp.0["consistency_token"].as_str().unwrap_or(""),
         "takedown"
     );
@@ -271,8 +271,19 @@ async fn with_client<T: Send + 'static>(
     .map_err(ApiError::from)
 }
 
+/// The schema as the client wrote it: reserved fields (ADR 0031) are internal.
 async fn schema(State(s): State<Arc<Shared>>) -> Json<Json_> {
-    Json(serde_json::to_value(&s.cfg.schema).unwrap_or(Json_::Null))
+    let visible = Schema {
+        fields: s
+            .cfg
+            .schema
+            .fields
+            .iter()
+            .filter(|f| !cairn_core::schema::is_reserved(&f.name))
+            .cloned()
+            .collect(),
+    };
+    Json(serde_json::to_value(&visible).unwrap_or(Json_::Null))
 }
 
 async fn status(State(s): State<Arc<Shared>>) -> ApiResult<Json<Json_>> {
@@ -440,18 +451,87 @@ fn value_json(v: &Value) -> Json_ {
     }
 }
 
-fn doc_from_json(schema: &Schema, v: &Json_) -> ApiResult<Document> {
+/// A document id as the client writes it (ADR 0031): an unsigned integer below 2^63, or a text
+/// id (a non-empty string of at most 1024 bytes).
+#[derive(Debug, Clone, PartialEq)]
+enum ApiId {
+    Num(u64),
+    Key(String),
+}
+
+impl std::fmt::Display for ApiId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiId::Num(n) => write!(f, "{n}"),
+            ApiId::Key(k) => write!(f, "{k:?}"),
+        }
+    }
+}
+
+const MAX_KEY_BYTES: usize = 1024;
+
+fn api_key(k: &str) -> ApiResult<ApiId> {
+    if k.is_empty() || k.len() > MAX_KEY_BYTES {
+        return Err(ApiError::bad(format!(
+            "a text id has 1 to {MAX_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(ApiId::Key(k.to_owned()))
+}
+
+/// An id in a JSON body: a number, or a string (a text id).
+fn api_id(v: &Json_) -> ApiResult<ApiId> {
+    match v {
+        Json_::String(k) => api_key(k),
+        _ => match v.as_u64() {
+            Some(n) if n < DocId::KEYED_BIT => Ok(ApiId::Num(n)),
+            _ => Err(ApiError::bad(
+                "an id is an unsigned integer below 2^63 or a non-empty string",
+            )),
+        },
+    }
+}
+
+/// An id in a URL path: digits are an integer id (compatibility with 0.1), anything else a text
+/// id. A text id made only of digits is reached with `?id_type=text`.
+fn path_id(p: &str, id_type: Option<&str>) -> ApiResult<ApiId> {
+    match id_type {
+        Some("text") => api_key(p),
+        Some("int") | None => match p.parse::<u64>() {
+            Ok(n) if n < DocId::KEYED_BIT => Ok(ApiId::Num(n)),
+            Ok(_) => Err(ApiError::bad("integer ids are below 2^63")),
+            Err(_) if id_type.is_none() => api_key(p),
+            Err(_) => Err(ApiError::bad(format!("{p:?} is not an integer id"))),
+        },
+        Some(other) => Err(ApiError::bad(format!(
+            "id_type is text or int, not {other:?}"
+        ))),
+    }
+}
+
+fn doc_from_json(schema: &Schema, v: &Json_) -> ApiResult<(ApiId, Document)> {
     let obj = v
         .as_object()
         .ok_or_else(|| ApiError::bad("a document is a JSON object"))?;
-    let id = obj
-        .get("id")
-        .and_then(Json_::as_u64)
-        .ok_or_else(|| ApiError::bad("a document needs an unsigned integer \"id\""))?;
-    let mut d = Document::new(DocId(id), schema.fields.len());
+    let id = api_id(
+        obj.get("id")
+            .ok_or_else(|| ApiError::bad("a document needs an \"id\""))?,
+    )?;
+    let mut d = Document::new(
+        match id {
+            ApiId::Num(n) => DocId(n),
+            ApiId::Key(_) => DocId(0),
+        },
+        schema.fields.len(),
+    );
     for (k, v) in obj {
         if k == "id" {
             continue;
+        }
+        if cairn_core::schema::is_reserved(k) {
+            return Err(ApiError::bad(format!(
+                "field {k:?}: names starting with '_' are reserved"
+            )));
         }
         let i = schema
             .index_of(k)
@@ -460,13 +540,33 @@ fn doc_from_json(schema: &Schema, v: &Json_) -> ApiResult<Document> {
             d = d.set(i, val);
         }
     }
-    Ok(d)
+    if let ApiId::Key(k) = &id {
+        let i = schema
+            .index_of(cairn_core::schema::KEY_FIELD)
+            .ok_or_else(|| ApiError::bad("this collection has no text ids: use integer ids"))?;
+        d = d.set(i, Value::Blob(bytes::Bytes::from(k.clone().into_bytes())));
+    }
+    Ok((id, d))
+}
+
+/// The id a client sees: the text id when the document has one, else the integer.
+fn id_json(schema: &Schema, d: &Document) -> Json_ {
+    if let Some(i) = schema.index_of(cairn_core::schema::KEY_FIELD)
+        && let Some(Some(Value::Blob(b))) = d.values.get(i)
+        && let Ok(k) = std::str::from_utf8(b)
+    {
+        return json!(k);
+    }
+    json!(d.id.get())
 }
 
 fn doc_json(schema: &Schema, d: &Document) -> Json_ {
     let mut m = Map::new();
-    m.insert("id".into(), json!(d.id.get()));
+    m.insert("id".into(), id_json(schema, d));
     for (f, v) in schema.fields.iter().zip(&d.values) {
+        if cairn_core::schema::is_reserved(&f.name) {
+            continue;
+        }
         if let Some(v) = v {
             m.insert(f.name.clone(), value_json(v));
         }
@@ -597,13 +697,28 @@ async fn upsert(
         return Err(ApiError::bad("no documents"));
     }
     let n = docs.len();
-    let tokens = with_client(&s, move |c| c.upsert(docs)).await?;
+    let (keyed, plain): (Vec<_>, Vec<_>) = docs
+        .into_iter()
+        .partition(|(id, _)| matches!(id, ApiId::Key(_)));
+    let keyed: Vec<Document> = keyed.into_iter().map(|x| x.1).collect();
+    let plain: Vec<Document> = plain.into_iter().map(|x| x.1).collect();
+    let tokens = with_client(&s, move |c| {
+        let mut t = Vec::new();
+        if !plain.is_empty() {
+            t.extend(c.upsert(plain)?);
+        }
+        if !keyed.is_empty() {
+            t.extend(c.upsert_keyed(keyed)?);
+        }
+        Ok(t)
+    })
+    .await?;
     ack(n, &tokens, body.after.as_deref())
 }
 
 #[derive(Deserialize)]
 struct DeleteBody {
-    ids: Vec<u64>,
+    ids: Vec<Json_>,
     #[serde(default)]
     after: Option<String>,
 }
@@ -616,27 +731,53 @@ async fn delete_many(
     if body.ids.is_empty() {
         return Err(ApiError::bad("no ids"));
     }
-    let ids: Vec<DocId> = body.ids.iter().copied().map(DocId).collect();
+    let ids = body.ids.iter().map(api_id).collect::<ApiResult<Vec<_>>>()?;
     let n = ids.len();
-    let tokens = with_client(&s, move |c| c.delete(ids)).await?;
+    let tokens = delete_ids(&s, ids.clone()).await?;
     let resp = ack(n, &tokens, body.after.as_deref())?;
-    audit_takedown(key.as_deref(), &body.ids, &resp);
+    audit_takedown(key.as_deref(), &ids, &resp);
     Ok(resp)
+}
+
+/// Takes down integer and text ids.
+async fn delete_ids(s: &Arc<Shared>, ids: Vec<ApiId>) -> ApiResult<Vec<Token>> {
+    let mut nums = Vec::new();
+    let mut keys = Vec::new();
+    for id in ids {
+        match id {
+            ApiId::Num(n) => nums.push(DocId(n)),
+            ApiId::Key(k) => keys.push(k),
+        }
+    }
+    with_client(s, move |c| {
+        let mut t = Vec::new();
+        if !nums.is_empty() {
+            t.extend(c.delete(nums)?);
+        }
+        if !keys.is_empty() {
+            t.extend(c.delete_keys(keys)?);
+        }
+        Ok(t)
+    })
+    .await
 }
 
 #[derive(Deserialize)]
 struct ReadParams {
     consistency: Option<String>,
     after: Option<String>,
+    /// `text` or `int`: how to read the id in the path (default: digits are an integer).
+    id_type: Option<String>,
 }
 
 async fn delete_one(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
-    Path(id): Path<u64>,
+    Path(id): Path<String>,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Json<Json_>> {
-    let tokens = with_client(&s, move |c| c.delete(vec![DocId(id)])).await?;
+    let id = path_id(&id, p.id_type.as_deref())?;
+    let tokens = delete_ids(&s, vec![id.clone()]).await?;
     let resp = ack(1, &tokens, p.after.as_deref())?;
     audit_takedown(key.as_deref(), &[id], &resp);
     Ok(resp)
@@ -644,16 +785,26 @@ async fn delete_one(
 
 async fn get_doc(
     State(s): State<Arc<Shared>>,
-    Path(id): Path<u64>,
+    Path(id): Path<String>,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Response> {
+    let id = path_id(&id, p.id_type.as_deref())?;
     let (consistency, tokens) = consistency(p.consistency.as_deref(), p.after.as_deref())?;
+    let req_id = id.clone();
     let doc = with_client(&s, move |c| {
-        match c.call(&Request::Get {
-            id: DocId(id),
-            consistency,
-            tokens,
-        })? {
+        let req = match req_id {
+            ApiId::Num(n) => Request::Get {
+                id: DocId(n),
+                consistency,
+                tokens,
+            },
+            ApiId::Key(key) => Request::GetKey {
+                key,
+                consistency,
+                tokens,
+            },
+        };
+        match c.call(&req)? {
             Wire::Doc(d) => Ok(d),
             Wire::Error { message, .. } => Err(cairn_core::Error::Internal(message)),
             other => Err(cairn_core::Error::Internal(format!(
@@ -725,7 +876,12 @@ fn yes() -> bool {
 
 fn hit_json(schema: &Schema, h: &Hit) -> Json_ {
     let mut m = Map::new();
-    m.insert("id".into(), json!(h.doc_id.get()));
+    let id = match (&h.key, &h.document) {
+        (Some(k), _) => json!(k),
+        (None, Some(d)) => id_json(schema, d),
+        (None, None) => json!(h.doc_id.get()),
+    };
+    m.insert("id".into(), id);
     m.insert("score".into(), json!(h.score));
     m.insert(
         "legs".into(),
@@ -862,9 +1018,30 @@ mod tests {
     fn documents_round_trip_through_json() {
         let s = schema();
         let j = json!({ "id": 7, "v": [1.0, 2.5], "tags": ["a", "b"], "n": -3, "b": "AAEC" });
-        let d = doc_from_json(&s, &j).unwrap();
+        let (id, d) = doc_from_json(&s, &j).unwrap();
+        assert_eq!(id, ApiId::Num(7));
         assert_eq!(d.values[3], Some(Value::Blob(vec![0u8, 1, 2].into())));
         assert_eq!(doc_json(&s, &d), j);
+        // Text ids (ADR 0031): held in `_key`, returned as the id, reserved names refused.
+        let sk = s.with_reserved().unwrap();
+        let j = json!({ "id": "doc-7", "n": 2 });
+        let (id, d) = doc_from_json(&sk, &j).unwrap();
+        assert_eq!(id, ApiId::Key("doc-7".into()));
+        assert_eq!(doc_json(&sk, &d), j);
+        assert!(
+            doc_from_json(&s, &j).is_err(),
+            "no text ids without the reserved fields"
+        );
+        assert!(doc_from_json(&sk, &json!({ "id": "a", "_tenant": "x" })).is_err());
+        assert!(doc_from_json(&sk, &json!({ "id": "" })).is_err());
+        assert!(doc_from_json(&sk, &json!({ "id": 1u64 << 63 })).is_err());
+        assert_eq!(path_id("42", None).unwrap(), ApiId::Num(42));
+        assert_eq!(
+            path_id("42", Some("text")).unwrap(),
+            ApiId::Key("42".into())
+        );
+        assert_eq!(path_id("doc-1", None).unwrap(), ApiId::Key("doc-1".into()));
+        assert!(path_id("doc-1", Some("int")).is_err());
         assert!(doc_from_json(&s, &json!({ "id": 1, "v": [1.0] })).is_err());
         assert!(doc_from_json(&s, &json!({ "id": 1, "nope": 1 })).is_err());
         assert!(doc_from_json(&s, &json!({ "v": [1.0, 2.0] })).is_err());

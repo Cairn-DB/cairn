@@ -67,6 +67,7 @@ fn config(node: NodeId, memtable_max_bytes: usize) -> ReplicaConfig {
                 max_deleted_fraction: 0.3,
                 target_segment_rows: 0,
                 min_merge: 4,
+                shard: 0,
             },
             vector: VectorIndexParams {
                 hnsw: HnswParams {
@@ -908,5 +909,170 @@ fn merges_pause_and_resume() {
             "{st:#?}"
         );
         check_all_docs(&hs, 150, &[]).await;
+    });
+}
+
+/// A document written with a text id (ADR 0031), on the schema with reserved fields.
+fn kdoc(key: &str, i: u64) -> Document {
+    Document::new(DocId(0), 5)
+        .set(0, Value::Vector(vec![i as f32, 0.0, 1.0, -(i as f32)]))
+        .set(1, Value::Enum(if i % 2 == 0 { "eu" } else { "us" }.into()))
+        .set(3, Value::Blob(key.as_bytes().to_vec().into()))
+}
+
+/// Text ids through replication (ADR 0031): segments shipped to followers, a leader crash, a
+/// restart that catches up through a snapshot. Every replica resolves every text id to the same
+/// document and the same internal id; deleted text ids resolve to nothing; a rewritten one has a
+/// new internal id.
+#[test]
+fn text_ids_agree_across_replicas_through_crash_and_snapshot() {
+    init_tracing();
+    let (sim, mut ex) = Simulation::new(31, SimConfig::default());
+    let memtable = 4000;
+    let sch = schema().with_reserved().unwrap();
+    let spawn = |ex: &mut cairn_runtime::Executor<cairn_sim::SimReactor>, n: u32| {
+        let (sim, hh, sch) = (sim.clone(), ex.handle(), sch.clone());
+        ex.block_on(async move {
+            Replica::spawn(
+                sim.runtime(NodeId(n), &hh),
+                config(NodeId(n), memtable),
+                sch,
+            )
+            .await
+            .unwrap()
+        })
+    };
+    let mut handles: Vec<ReplicaHandle> = (1..=3u32).map(|n| spawn(&mut ex, n)).collect();
+    let rt = sim.runtime(NodeId(9), &ex.handle());
+    let li = ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move {
+            let li = wait_leader(&rt, &hs).await;
+            for i in 1..=60u64 {
+                propose(
+                    &rt,
+                    &hs,
+                    Command::UpsertKeyed(vec![kdoc(&format!("doc-{i}"), i)]),
+                )
+                .await;
+            }
+            wait_converged(&rt, &hs, 60).await;
+            li
+        }
+    });
+    let crashed = NodeId(li as u32 + 1);
+    sim.crash(crashed, &mut ex);
+    let survivors: Vec<ReplicaHandle> = handles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != li)
+        .map(|(_, h)| h.clone())
+        .collect();
+    let first_doc5 = ex.block_on({
+        let (rt, hs) = (rt.clone(), survivors.clone());
+        async move {
+            wait_leader(&rt, &hs).await;
+            for i in 61..=200u64 {
+                propose(
+                    &rt,
+                    &hs,
+                    Command::UpsertKeyed(vec![kdoc(&format!("doc-{i}"), i)]),
+                )
+                .await;
+            }
+            let t = propose(&rt, &hs, Command::UpsertKeyed(vec![kdoc("doc-7", 700)])).await;
+            let first = hs[0]
+                .get_key("doc-5".into(), Consistency::ReadYourWrites(t))
+                .await
+                .unwrap()
+                .unwrap()
+                .id;
+            propose(
+                &rt,
+                &hs,
+                Command::DeleteKeys(vec!["doc-5".into(), "doc-100".into()]),
+            )
+            .await;
+            propose(&rt, &hs, Command::UpsertKeyed(vec![kdoc("doc-5", 5)])).await;
+            wait_converged(&rt, &hs, 199).await;
+            first
+        }
+    });
+    // Restart the survivors: their in-memory logs restart at their last publication, so the
+    // node that was down must catch up through a snapshot (segments shipped, text ids rebuilt
+    // from their `_key` column).
+    for (i, h) in handles.clone().iter().enumerate() {
+        if i != li {
+            let n = h.id();
+            sim.crash(n, &mut ex);
+            handles[i] = spawn(&mut ex, n.get());
+        }
+    }
+    ex.block_on({
+        let (rt, hs) = (
+            rt.clone(),
+            handles
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != li)
+                .map(|(_, h)| h.clone())
+                .collect::<Vec<_>>(),
+        );
+        async move {
+            wait_leader(&rt, &hs).await;
+            for i in 201..=260u64 {
+                propose(
+                    &rt,
+                    &hs,
+                    Command::UpsertKeyed(vec![kdoc(&format!("doc-{i}"), i)]),
+                )
+                .await;
+            }
+            wait_converged(&rt, &hs, 259).await;
+        }
+    });
+    handles[li] = spawn(&mut ex, crashed.get());
+    ex.block_on({
+        let (rt, hs) = (rt.clone(), handles.clone());
+        async move {
+            wait_converged(&rt, &hs, 259).await;
+            let s = hs[0].status().await.unwrap();
+            assert!(s.segments.len() >= 2, "segments: {:?}", s.segments);
+            for i in 1..=260u64 {
+                let key = format!("doc-{i}");
+                let mut seen = None;
+                for h in &hs {
+                    let got = h.get_key(key.clone(), Consistency::Stale).await.unwrap();
+                    if i == 100 {
+                        assert_eq!(got, None, "node {}: {key} was deleted", h.id());
+                        continue;
+                    }
+                    let d = got.unwrap_or_else(|| panic!("node {}: {key} missing", h.id()));
+                    assert!(d.id.is_keyed(), "{:?}", d.id);
+                    assert_eq!(
+                        d.values[3],
+                        Some(Value::Blob(key.as_bytes().to_vec().into()))
+                    );
+                    let want = if i == 7 { 700 } else { i };
+                    assert_eq!(
+                        d.values[0],
+                        kdoc(&key, want).values[0],
+                        "node {} {key}",
+                        h.id()
+                    );
+                    match seen {
+                        None => seen = Some(d.id),
+                        Some(id) => assert_eq!(id, d.id, "replicas disagree on {key}"),
+                    }
+                }
+                if i == 5 {
+                    assert_ne!(
+                        seen,
+                        Some(first_doc5),
+                        "a rewritten text id kept its old id"
+                    );
+                }
+            }
+        }
     });
 }

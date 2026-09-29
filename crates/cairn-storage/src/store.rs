@@ -36,6 +36,8 @@ pub struct StoreConfig {
     pub target_segment_rows: u32,
     /// Shortest run the tiered policy merges (below `max_segments`).
     pub min_merge: usize,
+    /// This store's shard, embedded in the internal ids it assigns to text ids (ADR 0031).
+    pub shard: u32,
 }
 
 impl Default for StoreConfig {
@@ -47,6 +49,7 @@ impl Default for StoreConfig {
             max_deleted_fraction: 0.3,
             target_segment_rows: 0,
             min_merge: 4,
+            shard: 0,
         }
     }
 }
@@ -88,6 +91,9 @@ pub struct ShardManifest {
     /// skips commits up to it: they were decided against the list as it stood then, and the
     /// segments and pending list here may already reflect later merges (chaos seed 11892).
     pub compacted_through: LogIndex,
+    /// Counter of the internal ids assigned to text ids (ADR 0031), as of `applied_index`:
+    /// replay after a restart assigns the next ones exactly as the first application did.
+    pub next_key: u64,
 }
 
 /// A committed compaction waiting to be installed (ADR 0021).
@@ -134,6 +140,7 @@ impl Manifest for ShardManifest {
             }
         }
         w.u64(self.compacted_through.get());
+        w.u64(self.next_key);
     }
 
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
@@ -180,6 +187,7 @@ impl Manifest for ShardManifest {
             }
         }
         let compacted_through = LogIndex(if r.remaining() > 0 { r.u64()? } else { 0 });
+        let next_key = if r.remaining() > 0 { r.u64()? } else { 0 };
         Ok(ShardManifest {
             schema,
             applied_index,
@@ -188,8 +196,47 @@ impl Manifest for ShardManifest {
             applied_term,
             compactions,
             compacted_through,
+            next_key,
         })
     }
+}
+
+/// Internal id to text id of live documents, shared on one core (ADR 0031).
+pub type KeyNames = std::rc::Rc<std::cell::RefCell<cairn_core::HashMap<DocId, String>>>;
+
+/// The text ids of the live rows of `segments`, both ways (ADR 0031).
+#[allow(clippy::type_complexity)]
+async fn scan_keys<R: Runtime>(
+    segments: &[OpenSegment<R>],
+    field: Option<usize>,
+) -> Result<(
+    cairn_core::HashMap<String, DocId>,
+    cairn_core::HashMap<DocId, String>,
+)> {
+    let mut keys = cairn_core::HashMap::default();
+    let mut key_of = cairn_core::HashMap::default();
+    let Some(field) = field else {
+        return Ok((keys, key_of));
+    };
+    for s in segments {
+        if s.docs.schema().index_of(cairn_core::schema::KEY_FIELD) != Some(field) {
+            continue;
+        }
+        let col = s.docs.read_column(&s.reader, field).await?;
+        for (row, v) in col.into_iter().enumerate() {
+            if s.deletions.contains(row as u32) {
+                continue;
+            }
+            if let Some(cairn_core::Value::Blob(b)) = v {
+                let key = String::from_utf8(b.to_vec())
+                    .map_err(|_| Error::corruption("text id is not UTF-8"))?;
+                let id = DocId(s.docs.docids()[row]);
+                keys.insert(key.clone(), id);
+                key_of.insert(id, key);
+            }
+        }
+    }
+    Ok((keys, key_of))
 }
 
 /// Builds the index sections of a segment from its documents (rows in the given order).
@@ -236,6 +283,8 @@ struct PendingFlush {
     commit_from: Option<NodeId>,
     /// `(len, hash)` of the segment file present locally (built here or fetched).
     file: Option<(u64, u64)>,
+    /// The text-id counter at the freeze: the manifest records it when it publishes the freeze.
+    next_key: u64,
 }
 
 /// What the replica must do for one frozen memtable.
@@ -341,6 +390,15 @@ pub struct Store<R: Runtime> {
     generation: u64,
     /// Bumped whenever the memtable changes.
     memtable_version: u64,
+    /// Text ids of live documents and their internal ids, both ways (ADR 0031). A function of
+    /// the log: rebuilt from the segments' `_key` column at open and after a snapshot install,
+    /// then maintained by applied commands.
+    keys: cairn_core::HashMap<String, DocId>,
+    key_of: KeyNames,
+    /// Next counter for a new text id's internal id.
+    next_key: u64,
+    /// Position of the reserved `_key` field, if the schema has it.
+    key_field: Option<usize>,
     /// Bumped whenever the segment list changes.
     segments_version: u64,
 }
@@ -496,9 +554,14 @@ impl<R: Runtime> Store<R> {
         let manifest = match manifest_store.load::<ShardManifest>().await? {
             Some(m) => {
                 if m.schema != schema {
-                    return Err(Error::Schema(
-                        "stored schema differs from the requested schema".into(),
-                    ));
+                    let upgraded = m.schema.with_reserved().is_ok_and(|r| r == schema);
+                    return Err(Error::Schema(if upgraded {
+                        "this data was written before text ids and tenants (Cairn 0.1): 0.2 \
+                         needs a fresh data directory and a new ingest"
+                            .into()
+                    } else {
+                        "stored schema differs from the requested schema".into()
+                    }));
                 }
                 m
             }
@@ -511,6 +574,7 @@ impl<R: Runtime> Store<R> {
                     applied_term: Term(0),
                     compactions: Vec::new(),
                     compacted_through: LogIndex(0),
+                    next_key: 0,
                 };
                 manifest_store.store(&m).await?;
                 m
@@ -598,6 +662,7 @@ impl<R: Runtime> Store<R> {
             });
         }
         let log = Log::open(rt.clone(), &format!("{dir}/log"), cfg.log.clone()).await?;
+        let key_field = manifest.schema.index_of(cairn_core::schema::KEY_FIELD);
         let mut store = Store {
             rt,
             dir: dir.to_owned(),
@@ -621,9 +686,14 @@ impl<R: Runtime> Store<R> {
             generation: 0,
             memtable_version: 0,
             segments_version: 0,
+            keys: cairn_core::HashMap::default(),
+            key_of: KeyNames::default(),
+            next_key: 0,
+            key_field,
         };
         store.applied = store.manifest.applied_index;
         store.rebuild_logical();
+        store.rebuild_keys().await?;
         // Replay the log after the manifest's applied index.
         if let Some(mut last) = store.log.last_index()
             && last > store.applied
@@ -855,21 +925,113 @@ impl<R: Runtime> Store<R> {
             Command::Upsert(docs) => {
                 for d in docs {
                     let mut d = d.clone();
-                    d.validate(&self.manifest.schema)?;
+                    // An invalid document in the log is skipped, on every replica alike. Failing
+                    // the entry instead stopped the replica, which then replayed the same entry
+                    // on every reopen: one bad write from a client blocked the shard. Nodes
+                    // validate before proposing, so this is a last line of defence.
+                    if let Err(e) = d.validate(&self.manifest.schema) {
+                        tracing::warn!(%index, id = %d.id, "skipping an invalid document: {e}");
+                        continue;
+                    }
                     self.mask_in_segments(d.id);
                     self.memtable.upsert(d, index);
                 }
             }
             Command::Delete(ids) => {
                 for id in ids {
+                    self.forget_key(*id);
                     self.mask_in_segments(*id);
                     self.memtable.delete(*id, index);
+                }
+            }
+            Command::UpsertKeyed(docs) => {
+                for d in docs {
+                    // Invalid documents are skipped on every replica alike (see `Upsert`).
+                    let key = self.key_field.and_then(|field| match d.values.get(field) {
+                        Some(Some(cairn_core::Value::Blob(b))) => std::str::from_utf8(b)
+                            .ok()
+                            .filter(|k| !k.is_empty())
+                            .map(str::to_owned),
+                        _ => None,
+                    });
+                    let Some(key) = key else {
+                        tracing::warn!(%index, "skipping a document without a valid text id");
+                        continue;
+                    };
+                    let mut checked = d.clone();
+                    if let Err(e) = checked.validate(&self.manifest.schema) {
+                        tracing::warn!(%index, key, "skipping an invalid document: {e}");
+                        continue;
+                    }
+                    // Every write of a text id takes a new internal id from the counter, and the
+                    // previous one is deleted. The counter is the only input: a replica that
+                    // restarted replays the same ids, even when its deletion files already mask
+                    // rows that a later entry replaced (they are persisted at publication, past
+                    // the manifest's applied index), which a lookup would have taken for a
+                    // missing text id (chaos seed 100).
+                    let Some(id) = DocId::keyed(self.cfg.shard, self.next_key) else {
+                        tracing::warn!(%index, key, "text id space exhausted: document skipped");
+                        continue;
+                    };
+                    self.next_key += 1;
+                    let mut d = checked;
+                    d.id = id;
+                    if let Some(old) = self.keys.insert(key.clone(), id) {
+                        self.key_of.borrow_mut().remove(&old);
+                        self.mask_in_segments(old);
+                        self.memtable.delete(old, index);
+                    }
+                    self.key_of.borrow_mut().insert(id, key);
+                    self.memtable.upsert(d, index);
+                }
+            }
+            Command::DeleteKeys(keys) => {
+                for k in keys {
+                    if let Some(id) = self.keys.remove(k) {
+                        self.key_of.borrow_mut().remove(&id);
+                        self.mask_in_segments(id);
+                        self.memtable.delete(id, index);
+                    }
                 }
             }
         }
         self.applied = index;
         self.memtable_version += 1;
         Ok(())
+    }
+
+    /// Drops the text id of a deleted document, if it had one.
+    fn forget_key(&mut self, id: DocId) {
+        let removed = self.key_of.borrow_mut().remove(&id);
+        if let Some(k) = removed {
+            self.keys.remove(&k);
+        }
+    }
+
+    /// Rebuilds the text-id maps from the live rows of the segments (the memtable and freezes
+    /// are empty here: open and snapshot install), and the counter from the manifest.
+    async fn rebuild_keys(&mut self) -> Result<()> {
+        let (keys, key_of) = scan_keys(&self.segments, self.key_field).await?;
+        self.keys = keys;
+        *self.key_of.borrow_mut() = key_of;
+        self.next_key = self.manifest.next_key;
+        Ok(())
+    }
+
+    /// The internal id of a live document's text id.
+    pub fn key_to_id(&self, key: &str) -> Option<DocId> {
+        self.keys.get(key).copied()
+    }
+
+    /// The text id of a live document, if it was written with one.
+    pub fn id_to_key(&self, id: DocId) -> Option<String> {
+        self.key_of.borrow().get(&id).cloned()
+    }
+
+    /// A shared view of the text ids of live documents, for tasks on this core that resolve
+    /// search results after the actor moved on (a key never changes while its id is live).
+    pub fn key_names(&self) -> KeyNames {
+        self.key_of.clone()
     }
 
     fn mask_in_segments(&mut self, id: DocId) {
@@ -980,6 +1142,7 @@ impl<R: Runtime> Store<R> {
             commit: None,
             commit_from: None,
             file: None,
+            next_key: self.next_key,
         });
         self.memtable_version += 1;
     }
@@ -1209,6 +1372,7 @@ impl<R: Runtime> Store<R> {
             }
             if p.last > new_manifest.applied_index {
                 new_manifest.applied_index = p.last;
+                new_manifest.next_key = p.next_key;
                 // The entry is still in the log: it is truncated only after this manifest.
                 new_manifest.applied_term = self.log.read(p.last).await?.term;
             }
@@ -1744,6 +1908,7 @@ impl<R: Runtime> Store<R> {
             }
         }
         let last = popped.last().expect("popped").last;
+        let last_key = popped.last().expect("popped").next_key;
         let path = seg_path(&self.dir, target.id);
         let reader = SegmentReader::open(self.rt.clone(), &path).await?;
         let docstore = DocStore::open(&reader).await?;
@@ -1792,6 +1957,9 @@ impl<R: Runtime> Store<R> {
             .map(|c| c.id)
             .collect();
         new_manifest.compactions.drain(..=j);
+        if last > new_manifest.applied_index {
+            new_manifest.next_key = last_key;
+        }
         new_manifest.applied_index = last.max(new_manifest.applied_index);
         new_manifest.applied_term = self.log.read(last).await?.term;
         self.ensure_renames_synced(&[target.id]).await?;
@@ -2366,6 +2534,10 @@ impl<R: Runtime> Store<R> {
         self.generation += 1;
         self.masked_during_build.clear();
         self.applied = self.manifest.applied_index;
+        let (keys, key_of) = scan_keys(&self.segments, self.key_field).await?;
+        self.keys = keys;
+        *self.key_of.borrow_mut() = key_of;
+        self.next_key = self.manifest.next_key;
         if self.log.first_index() != self.applied.next()
             || self.log.last_index().is_some_and(|l| l <= self.applied)
         {
@@ -2484,6 +2656,7 @@ mod tests {
             max_deleted_fraction: 0.3,
             target_segment_rows: 0,
             min_merge: 4,
+            shard: 0,
         }
     }
 
@@ -2580,6 +2753,121 @@ mod tests {
         });
     }
 
+    /// A document written with the text id `key` (ADR 0031), on the schema with reserved fields.
+    fn kdoc(key: &str, salt: u64) -> Document {
+        let base = doc(salt, salt);
+        let mut values = base.values;
+        values.push(Some(Value::Blob(Bytes::from(key.as_bytes().to_vec()))));
+        values.push(None);
+        Document {
+            id: DocId(0),
+            values,
+        }
+    }
+
+    /// Every write of a text id takes a new internal id from the counter; the ids survive
+    /// flushes and restarts, and two stores fed the same commands (one restarted midway) end
+    /// with the same maps: the dictionary is a function of the log (ADR 0031).
+    #[test]
+    fn text_ids_are_a_function_of_the_log() {
+        let (sim, mut ex) = Simulation::new(31, SimConfig::default());
+        let rt = sim.runtime(NodeId(1), &ex.handle());
+        ex.block_on(async move {
+            let sch = schema().with_reserved().unwrap();
+            let cfg = StoreConfig {
+                shard: 5,
+                ..small_cfg()
+            };
+            let mut cmds = Vec::new();
+            for i in 0..60u64 {
+                cmds.push(Command::UpsertKeyed(vec![kdoc(&format!("doc-{i}"), i)]));
+            }
+            cmds.push(Command::UpsertKeyed(vec![kdoc("doc-7", 99)])); // replace: a new id
+            cmds.push(Command::DeleteKeys(vec![
+                "doc-3".into(),
+                "doc-40".into(),
+                "nope".into(),
+            ]));
+            cmds.push(Command::UpsertKeyed(vec![kdoc("doc-3", 5)])); // rewritten: a new id
+            let mut a = Store::open(rt.clone(), "a", sch.clone(), cfg.clone())
+                .await
+                .unwrap();
+            let mut b = Store::open(rt.clone(), "b", sch.clone(), cfg.clone())
+                .await
+                .unwrap();
+            let mut first_doc3 = None;
+            for (i, c) in cmds.iter().enumerate() {
+                a.write(c).await.unwrap();
+                b.write(c).await.unwrap();
+                if i == 10 {
+                    first_doc3 = a.key_to_id("doc-3");
+                }
+                if i == 30 {
+                    drop(b);
+                    b = Store::open(rt.clone(), "b", sch.clone(), cfg.clone())
+                        .await
+                        .unwrap();
+                }
+            }
+            let check = |st: &Store<_>| {
+                let mut ids = Vec::new();
+                for i in 0..60u64 {
+                    let k = format!("doc-{i}");
+                    let id = st.key_to_id(&k);
+                    if i == 40 {
+                        assert_eq!(id, None);
+                        continue;
+                    }
+                    let id = id.expect("live text id");
+                    assert!(id.is_keyed() && id.keyed_shard() == Some(5), "{id:?}");
+                    assert_eq!(st.id_to_key(id), Some(k.clone()));
+                    ids.push(id);
+                }
+                ids
+            };
+            let ids_a = check(&a);
+            assert_eq!(ids_a, check(&b), "replicas disagree");
+            assert_ne!(
+                a.key_to_id("doc-3"),
+                first_doc3,
+                "a rewritten text id reuses its old id"
+            );
+            let got = a.get(a.key_to_id("doc-7").unwrap()).await.unwrap().unwrap();
+            assert_eq!(got.values[..6], kdoc("doc-7", 99).values[..6]);
+            // A restart rebuilds the same maps from the segments and the log.
+            assert!(
+                a.segments().count() >= 2,
+                "the test must flush text ids into segments"
+            );
+            let applied = a.applied_index();
+            drop(a);
+            let a = Store::open(rt.clone(), "a", sch.clone(), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(a.applied_index(), applied);
+            assert_eq!(check(&a), ids_a);
+            assert!(a.get(DocId::keyed(5, 3).unwrap()).await.unwrap().is_none());
+            // Without the reserved field, a text id is skipped when applied, not fatal.
+            let mut plain = Store::open(rt.clone(), "c", schema(), cfg).await.unwrap();
+            plain
+                .write(&Command::UpsertKeyed(vec![kdoc("x", 1)]))
+                .await
+                .unwrap();
+            assert_eq!(plain.key_to_id("x"), None);
+            // Invalid documents in the log are skipped, and the store keeps working.
+            plain
+                .write(&Command::Upsert(vec![Document::new(DocId(9), 1)]))
+                .await
+                .unwrap();
+            assert_eq!(plain.get(DocId(9)).await.unwrap(), None);
+            plain
+                .write(&Command::Upsert(vec![doc(10, 1)]))
+                .await
+                .unwrap();
+            assert_eq!(plain.get(DocId(10)).await.unwrap(), Some(doc(10, 1)));
+        });
+    }
+
     /// Model: the sequence of commands issued; `acked` = count of commands whose write completed.
     /// After each crash and reopen, the store must equal the model replayed to some prefix that
     /// is at least `acked`.
@@ -2617,10 +2905,13 @@ mod tests {
                 let mut model: HashMap<DocId, Option<Document>> = HashMap::default();
                 for c in &cmds[..applied] {
                     match c {
+                        // This workload issues no text-id commands.
                         Command::Noop
                         | Command::FlushBegin
                         | Command::FlushCommit { .. }
-                        | Command::CompactCommit { .. } => {}
+                        | Command::CompactCommit { .. }
+                        | Command::UpsertKeyed(_)
+                        | Command::DeleteKeys(_) => {}
                         Command::Upsert(ds) => {
                             for d in ds {
                                 model.insert(d.id, Some(d.clone()));

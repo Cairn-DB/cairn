@@ -25,12 +25,15 @@ impl Default for Fusion {
 }
 
 /// A leg's ranked list: `(doc, score)` best first; `higher_is_better` says how to read `score`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LegList {
     /// Ranked hits.
     pub hits: Vec<(DocId, f32)>,
     /// Whether larger scores are better (text) or smaller (vector distances).
     pub higher_is_better: bool,
+    /// Text ids of the hits written with one (ADR 0031), so the coordinator can return them
+    /// without reading the documents.
+    pub keys: Vec<(DocId, String)>,
 }
 
 /// Fuses legs into the top `k` documents (fused score descending, then doc id).
@@ -86,10 +89,12 @@ mod tests {
         let a = LegList {
             hits: vec![(DocId(1), 0.1), (DocId(2), 0.2), (DocId(3), 0.3)],
             higher_is_better: false,
+            keys: Vec::new(),
         };
         let b = LegList {
             hits: vec![(DocId(3), 9.0), (DocId(2), 5.0), (DocId(9), 1.0)],
             higher_is_better: true,
+            keys: Vec::new(),
         };
         let f = fuse(&Fusion::default(), &[a, b], 3);
         let ids: Vec<u64> = f.iter().map(|x| x.0.get()).collect();
@@ -103,10 +108,12 @@ mod tests {
         let a = LegList {
             hits: vec![(DocId(1), 0.0), (DocId(2), 10.0)],
             higher_is_better: false,
+            keys: Vec::new(),
         };
         let b = LegList {
             hits: vec![(DocId(2), 1.0), (DocId(1), 0.0)],
             higher_is_better: true,
+            keys: Vec::new(),
         };
         let f = fuse(
             &Fusion::Weighted {
@@ -126,10 +133,12 @@ mod tests {
                 LegList {
                     hits: vec![(DocId(1), 0.0), (DocId(2), 10.0)],
                     higher_is_better: false,
+                    keys: Vec::new(),
                 },
                 LegList {
                     hits: vec![(DocId(2), 1.0), (DocId(1), 0.0)],
                     higher_is_better: true,
+                    keys: Vec::new(),
                 },
             ],
             2,

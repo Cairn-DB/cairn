@@ -45,6 +45,14 @@ fn schema() -> Schema {
     .unwrap()
 }
 
+/// A document as read back, without the reserved fields the server appends (ADR 0031).
+fn user_fields(d: Option<Document>) -> Option<Document> {
+    d.map(|mut d| {
+        d.values.truncate(4);
+        d
+    })
+}
+
 fn doc(i: u64) -> Document {
     let words = ["nuclear", "energy", "minister", "weather", "football"];
     Document::new(DocId(i), 4)
@@ -268,7 +276,7 @@ fn three_process_cluster_with(tls: bool) {
     // Read-your-writes point reads and a hybrid query.
     for i in [1u64, 150, 300] {
         assert_eq!(
-            client.get(DocId(i), client.read_your_writes()).unwrap(),
+            user_fields(client.get(DocId(i), client.read_your_writes()).unwrap()),
             Some(doc(i))
         );
     }
@@ -336,7 +344,7 @@ fn three_process_cluster_with(tls: bool) {
     wait_ready(&mut c2);
     wait_applied_equal(&mut clients, 4);
     assert_eq!(
-        c2.get(DocId(400), Consistency::Stale).unwrap(),
+        user_fields(c2.get(DocId(400), Consistency::Stale).unwrap()),
         Some(doc(400))
     );
     assert_eq!(c2.get(DocId(5), Consistency::Stale).unwrap(), None);
@@ -394,7 +402,7 @@ fn placement_with_fewer_replicas_than_nodes() {
         let mut c = single(i);
         for id in [1u64, 77, 150, 299] {
             assert_eq!(
-                c.get(DocId(id), Consistency::Linearizable).unwrap(),
+                user_fields(c.get(DocId(id), Consistency::Linearizable).unwrap()),
                 Some(doc(id)),
                 "node {i} doc {id}"
             );
@@ -437,7 +445,7 @@ fn placement_with_fewer_replicas_than_nodes() {
     }
     for id in [1u64, 150, 320, 340] {
         assert_eq!(
-            c.get(DocId(id), Consistency::Linearizable).unwrap(),
+            user_fields(c.get(DocId(id), Consistency::Linearizable).unwrap()),
             Some(doc(id))
         );
     }

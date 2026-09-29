@@ -12,6 +12,11 @@ pub enum Command {
     Upsert(Vec<Document>),
     /// Remove documents by id (a takedown).
     Delete(Vec<DocId>),
+    /// Insert or replace documents identified by a text id (ADR 0031), held in their `_key`
+    /// field. The shard maps each text id to an internal id when it applies the command.
+    UpsertKeyed(Vec<Document>),
+    /// Remove documents by text id (a takedown).
+    DeleteKeys(Vec<String>),
     /// Freeze the memtable for a flush (ADR 0016). The segment id is the entry's log index,
     /// so every replica cuts the same rows under the same id.
     FlushBegin,
@@ -64,6 +69,18 @@ impl Command {
             }
             Command::FlushBegin => {
                 w.u8(3);
+            }
+            Command::UpsertKeyed(docs) => {
+                w.u8(6).u32(docs.len() as u32);
+                for d in docs {
+                    d.encode(w);
+                }
+            }
+            Command::DeleteKeys(keys) => {
+                w.u8(7).u32(keys.len() as u32);
+                for k in keys {
+                    w.str(k);
+                }
             }
             Command::FlushCommit {
                 id,
@@ -125,6 +142,28 @@ impl Command {
                 Ok(Command::Delete(ids))
             }
             3 => Ok(Command::FlushBegin),
+            6 => {
+                let n = r.u32()? as usize;
+                if n > 1 << 20 {
+                    return Err(Error::corruption("upsert batch too large"));
+                }
+                let mut docs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    docs.push(Document::decode(r)?);
+                }
+                Ok(Command::UpsertKeyed(docs))
+            }
+            7 => {
+                let n = r.u32()? as usize;
+                if n > 1 << 24 {
+                    return Err(Error::corruption("delete batch too large"));
+                }
+                let mut keys = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    keys.push(r.str()?.to_owned());
+                }
+                Ok(Command::DeleteKeys(keys))
+            }
             5 => {
                 let id = SegmentId(r.u64()?);
                 let n = r.u32()? as usize;
@@ -178,6 +217,8 @@ mod tests {
                 from: NodeId(2),
             },
             Command::Delete(vec![DocId(7), DocId(9)]),
+            Command::DeleteKeys(vec!["doc-1".into(), "é/ü".into(), String::new()]),
+            Command::UpsertKeyed(vec![Document::new(DocId(0), 2)]),
             Command::CompactCommit {
                 id: SegmentId((1 << 62) | 3),
                 inputs: vec![SegmentId(10), SegmentId(20)],

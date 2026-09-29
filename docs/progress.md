@@ -476,6 +476,19 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   pre-release). Everything is still private. Pending: contact@cairn-db.com reception (an OVH
   alias to create), DKIM/DMARC, then going public with the owner's go.
 
+- 0.2 step 1, text ids (2026-09-29, owner: "go pour la 0.2, dans l'ordre"): ADR 0031.
+  - Reserved `_key`/`_tenant` fields in every schema; per-shard dictionary rebuilt from `_key`
+    at open and snapshot install; internal ids carry the shard (bit 63, 23-bit shard, 40-bit
+    counter); counter recorded at freeze and written to the manifest at publication.
+  - Chaos (default seeds) caught a divergence: reusing the dictionary's id on rewrite broke
+    after restarts, because deletion files are persisted past the manifest point. Fixed: every
+    keyed write takes a new id from the counter. Chaos workload now half keyed.
+  - Found and fixed a pre-existing poison pill: an invalid document from a binary client
+    stopped its replica in a replay loop. Nodes validate and pad before proposing; replicas skip
+    invalid documents.
+  - 131 tests; campaign 3,000 seeds zero violations; acceptance 75/75 on 3 nodes; positive
+    control on the snapshot rebuild path.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

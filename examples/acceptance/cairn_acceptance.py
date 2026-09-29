@@ -34,6 +34,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DIMS = 384
@@ -332,6 +333,59 @@ def run(api, n, rep):
                           "with_documents": False}, node=node)
         ok &= st == 200 and [h["id"] for h in res["hits"]] == live
     rep.check("after the bulk takedown every node lists exactly the live documents", ok, f"{len(live)} live")
+
+    # --- text ids (0.2): the application's own ids, strings of any shape
+    keyed = []
+    for i in range(200):
+        d = public(rng.choice(docs))
+        d["id"] = f"article/{i:04d}-{hashlib.sha1(str(i).encode()).hexdigest()[:8]}"
+        d["text"] = f"quetzal archive {d['id']} " + d["text"]
+        d["embedding"] = embed(d["text"])
+        keyed.append(d)
+    keyed[0]["id"] = "é ü/ spaces & symbols?"
+    keyed[1]["id"] = "12345"  # a text id made of digits
+    st, ack = api.call("POST", "/v1/documents", {"documents": keyed, "after": token}, node=0)
+    rep.check("text ids: write 200 documents with string ids", st == 200 and ack["count"] == 200,
+              f"status {st} {str(ack)[:80]}")
+    token = ack["consistency_token"] if st == 200 else token
+    ok = True
+    for i, d in enumerate(keyed[:20]):
+        q = urllib.parse.quote(d["id"], safe="")
+        suffix = "&id_type=text" if d["id"].isdigit() else ""
+        st, got = api.call("GET", f"/v1/documents/{q}?after={token}{suffix}", node=i % len(api.urls))
+        ok &= st == 200 and got.get("id") == d["id"] and got.get("text") == d["text"]
+    rep.check("text ids: read back by path through every node (encoded, digits)", ok)
+    st, res = api.call("POST", "/v1/search", {"k": 10, "text": {"field": "text", "query": "quetzal"},
+                                              "with_documents": False, "after": token})
+    ids = [h["id"] for h in res.get("hits", [])] if st == 200 else []
+    rep.check("text ids: search hits carry the string ids, without reading documents",
+              len(ids) == 10 and all(isinstance(i, str) and i in {d["id"] for d in keyed} for i in ids), str(ids[:3]))
+    upd = dict(keyed[2], text="quetzal replaced text", embedding=embed("quetzal replaced text"))
+    st, ack = api.call("POST", "/v1/documents", {"documents": [upd], "after": token}, node=len(api.urls) - 1)
+    token = ack["consistency_token"] if st == 200 else token
+    q = urllib.parse.quote(upd["id"], safe="")
+    st, got = api.call("GET", f"/v1/documents/{q}?after={token}")
+    rep.check("text ids: a second write replaces the document", st == 200 and got.get("text") == "quetzal replaced text")
+    gone = [keyed[0]["id"], keyed[1]["id"], keyed[3]["id"]]
+    st, ack = api.call("DELETE", f"/v1/documents/{urllib.parse.quote(gone[0], safe='')}?after={token}", node=0)
+    token = ack["consistency_token"] if st == 200 else token
+    st, ack = api.call("POST", "/v1/documents/delete", {"ids": gone[1:] + [987654321], "after": token}, node=1 % len(api.urls))
+    rep.check("text ids: takedown by path and in bulk (mixed with an integer id)", st == 200 and ack["count"] == 3,
+              f"status {st} {str(ack)[:80]}")
+    token = ack["consistency_token"] if st == 200 else token
+    ok = True
+    for node in nodes:
+        for k in gone:
+            suffix = "&id_type=text" if k.isdigit() else ""
+            st, _ = api.call("GET", f"/v1/documents/{urllib.parse.quote(k, safe='')}?after={token}{suffix}", node=node)
+            ok &= st == 404
+        _, res = api.call("POST", "/v1/search", {"k": 300, "text": {"field": "text", "query": "quetzal"},
+                                                 "with_documents": False, "after": token}, node=node)
+        ids = {h["id"] for h in res.get("hits", [])}
+        ok &= not (ids & set(gone)) and len(ids) == 197
+    rep.check("text ids: taken-down ids are gone on every node, the others remain", ok)
+    st, res = api.call("POST", "/v1/documents", {"documents": [{"id": "x", "_tenant": "acme"}]})
+    rep.check("text ids: reserved field names are refused -> 400", st == 400, f"status {st}")
 
     # --- consistency levels
     st, _ = api.call("POST", "/v1/search", {"k": 3, "text": {"field": "text", "query": "museum"},
