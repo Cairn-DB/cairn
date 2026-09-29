@@ -586,6 +586,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Audit before going public: no secrets or personal data in tree or history (one journal line
     reworded; the old diff keeps a script name).
   - publish-packages.yml (PyPI trusted publishing, npm token): needs the owner's accounts.
+  - PUBLIC since 2026-09-29: v0.3.0 released (image + GitHub pre-release, workflow 36625235609),
+    repo public, Discussions, private vulnerability reporting, topics, main protected (no
+    force-push/deletion), 13 labels, issues #1-#11, org profile repo Cairn-DB/.github, org
+    description. Left to the owner: GHCR package visibility (UI only; anonymous pull 401 until
+    then), npm/PyPI accounts + publish-packages run, announcement.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 

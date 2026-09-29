@@ -1,7 +1,7 @@
-# Publication checklist (for the owner's review)
+# Publication checklist
 
-Prepared locally on 2026-09-28. **Nothing has been published.** Each step below needs the
-owner's explicit go.
+Prepared on 2026-09-28. **Published on 2026-09-29 with 0.3.0**, at the owner's go ("ok lance
+la v 0.3 publique"). What was done, and what is left to the owner, is at the end.
 
 ## Audit done
 
@@ -62,3 +62,25 @@ gh label create deletion-guarantee --color b60205 --description "A takedown not 
   first push. Check them and that the image appears at `ghcr.io/cairn-db/cairn`.
 - The issue templates point to Discussions and to private vulnerability reporting: both must
   be enabled.
+
+## Done on 2026-09-29 (0.3.0)
+
+- Audit again before publication: tree and full history, for keys, tokens, personal details
+  and unrelated project names. Nothing found except the name of a history-rewrite script in
+  an old diff of the journal.
+- Release v0.3.0: signed multi-arch image, GitHub pre-release.
+- Repository `Cairn-DB/cairn` public:
+  - description, topics, Discussions, private vulnerability reporting;
+  - `main` protected against force-pushes and deletion.
+- 13 labels (`labels.md`) and 11 first issues (`first-issues.md`, updated for 0.3).
+- Organization profile (`Cairn-DB/.github`, `profile/README.md`) and organization
+  description.
+
+## Left to the owner
+
+- **GHCR package visibility**: github.com/orgs/Cairn-DB/packages → `cairn` → Package
+  settings → Change visibility → Public. Until then, `docker run ghcr.io/cairn-db/cairn:0.3`
+  needs a login.
+- **npm and PyPI**: accounts and publishers (`docs/releasing.md`, "Packages"), then the
+  `publish-packages` workflow with `v0.3.0`.
+- **Announcement**: where and when (a draft is in the journal of 2026-09-29).
