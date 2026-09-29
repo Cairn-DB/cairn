@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cairn-db"
+version = "0.2.0.dev0"
+description = "Client for Cairn, the hybrid search database where a deletion is final"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.24"]
+classifiers = ["Typing :: Typed", "Programming Language :: Python :: 3"]
+
+[project.urls]
+Repository = "https://github.com/cairn-db/cairn"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cairn_db"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

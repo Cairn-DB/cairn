@@ -21,6 +21,12 @@ wire protocol or the on-disk format; the notes say so.
   an unscoped key can act for one with the `Cairn-Tenant` header. Within a tenant, ids belong
   to the tenant, and every read, search and deletion stays inside it, enforced by the server.
   `DELETE /v1/tenants/{tenant}` erases a tenant.
+- TypeScript client `@cairn-db/client` (`clients/typescript`: `fetch`, no runtime dependency,
+  ESM and CommonJS) and Python client `cairn-db` (`clients/python`: sync and async, `httpx`).
+  They track consistency tokens so that a client reads its own writes and never reads back
+  its takedowns. Both offer deletion by parent, tenants, typed errors and retries.
+  `clients/test-live.sh` tests both against a local node, and CI runs it. Neither is published
+  to npm or PyPI yet.
 - Acceptance suite (`examples/acceptance/`): a realistic corpus and 91-95 checks against a
   running node or cluster, in Python with no dependency.
 

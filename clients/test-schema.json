@@ -1,0 +1,7 @@
+{"fields": [
+  {"name": "embedding", "kind": {"Vector": {"dims": 4, "metric": "Cosine"}}},
+  {"name": "text", "kind": "Text"},
+  {"name": "parent", "kind": "Enum"},
+  {"name": "n", "kind": "I64"},
+  {"name": "tags", "kind": "Set"}
+]}

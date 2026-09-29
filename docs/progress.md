@@ -523,7 +523,20 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     running node; positive control: without the tenant filter it fails), acceptance section
     through the header. 135 tests, clippy clean, acceptance 95/95 on 3 nodes
     (data/acceptance-03.log).
-  - Next: step 4, TypeScript and Python clients.
+
+- 0.2 step 4, clients (2026-09-29, owner: "go pour l'étape 4"): ADR 0031 section 6, notes there.
+  - `clients/typescript` (`@cairn-db/client`, TypeScript is the only dev dependency, built to
+    ESM + CJS with tsc) and `clients/python` (`cairn-db`, `Client` + `AsyncClient`, httpx).
+  - `clients/test-live.sh`: builds cairn-server, starts a node with an unscoped key, a key
+    scoped to "acme" and a read key, runs both suites. Local run: TypeScript 6/6 (5 unit + 1
+    live), Python 6/6 (4 unit + 2 live, sync and async). CI job `clients` on Node 18 +
+    Python 3.9 and Node 22 + Python 3.13.
+  - Not run locally: Python 3.9 and Node 18 (uv Python downloads are set to manual on this
+    machine; not changed). The CI matrix is the check, and it has not run yet (nothing
+    pushed since).
+  - Not published to npm/PyPI (public release, owner's go).
+  - Next: acceptance/CI wrap-up of 0.2 step A, then the 0.2 release decision (owner), then
+    step B (collections).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

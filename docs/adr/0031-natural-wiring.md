@@ -213,6 +213,22 @@ Both clients share one design and live in this repository, tested in CI against 
     takedowns by default, and `client.token` can hand them to another service;
   - retries on 503 with a leader hint;
   - typed errors: authentication, forbidden, not found, invalid input.
+- **As implemented (step 4, 2026-09-29):** `clients/typescript` and `clients/python`, with
+  the shared behaviour above.
+  - Not yet: `client.collection(name)`, since collections come in step B. The methods act on
+    today's single collection and will stay as the `default` collection's.
+  - Deviation: the TypeScript types are written by hand, not generated from the OpenAPI
+    description. The API is small, and a generator would have added a tool to the build. The
+    live contract tests catch drift.
+  - `delete({ parent })` is a deletion by filter on a configurable parent field (`parent` by
+    default). `withTenant(t)` / `with_tenant(t)` gives a view acting for a tenant through the
+    `Cairn-Tenant` header, sharing the client's token. `forgetTenant` erases a tenant.
+  - Tests:
+    - unit tests on a fake `fetch` and on `httpx.MockTransport`;
+    - live tests, one scenario for both clients, run against a fresh node by
+      `clients/test-live.sh`;
+    - in CI on Node 18 with Python 3.9, and Node 22 with Python 3.13.
+  - Not published to npm or PyPI: that is a public release, which needs the owner's go.
 - **Integrations**:
   - LangChain (`langchain-cairn` in Python, `@cairn-db/langchain` in JavaScript) and LlamaIndex
     (Python), as vector-store adapters;
