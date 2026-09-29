@@ -489,6 +489,27 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - 131 tests; campaign 3,000 seeds zero violations; acceptance 75/75 on 3 nodes; positive
     control on the snapshot rebuild path.
 
+- 0.2 step 2, deletion by filter (2026-09-29): ADR 0031 section 2, implementation notes there.
+  - `Command::DeleteWhere { scope: All | Ids | Keys, filter }`, resolved by the store when it
+    applies the entry (`Store::apply` is now async): segments through their filter indexes
+    (only the filtered fields decoded; a column-read fallback without the index crate),
+    frozen memtables minus rows replaced since, the memtable. Proto: request 12, response
+    `Deleted` (7); protocol stays 6 (not released yet).
+  - Leader returns the count with the token (`ReplicaHandle::propose_applied`); the node fans
+    out one command per shard and sums. HTTP `POST /v1/documents/delete` with `filter`
+    (optionally `ids`); match-everything filters and reserved fields refused; audited.
+  - Chaos: a "delete versions <= X" operation in the workload, folded into the model in log
+    order; read-your-takedown checked for it. A retried deletion by filter can commit twice
+    (ambiguous failure), and the earlier copy can remove versions the acknowledged one no
+    longer sees: the checker explains an absent result by any such deletion called before the
+    read returned. Positive control: a store that resolves nothing fails the signature test.
+  - Tests: store crash workload with filter deletions (fallback path), engine reference test
+    over segments/updates/memtable/reopen (index path), HTTP end to end (forwarding, scoped,
+    400s), acceptance 87/87 on 3 nodes (data/acceptance-02.log). Campaign seeds 0..3000:
+    zero violations, 494,400 reads checked. 132 tests, clippy clean.
+  - Open: cost at scale not measured (reads the filtered index sections of every segment on
+    the replica actor).
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

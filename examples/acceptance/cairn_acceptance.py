@@ -9,6 +9,7 @@ of the Docker image: embedding[384], text, source, tags, created, payload), then
 - every filter operator against a locally computed ground truth, and filtered recall;
 - updates;
 - takedowns, never read again through any node;
+- text ids and deletion by filter (0.2);
 - input errors;
 - administration.
 
@@ -386,6 +387,66 @@ def run(api, n, rep):
     rep.check("text ids: taken-down ids are gone on every node, the others remain", ok)
     st, res = api.call("POST", "/v1/documents", {"documents": [{"id": "x", "_tenant": "acme"}]})
     rep.check("text ids: reserved field names are refused -> 400", st == 400, f"status {st}")
+
+    # --- deletion by filter (0.2): a document and its chunks, and deletion by criterion.
+    # This schema has no parent field, so chunks carry their parent in a tag.
+    chunks = []
+    for r in range(3):
+        for c in range(8):
+            text = f"zanzibar report {r} chunk {c} " + rng.choice(docs)["text"]
+            chunks.append({"id": f"report-{r}#{c}", "text": text, "embedding": embed(text),
+                           "source": "tv" if c % 2 == 0 else "radio",
+                           "tags": [f"parent:report-{r}", "chunk"], "created": 20000 + c})
+    st, ack = api.call("POST", "/v1/documents", {"documents": chunks, "after": token}, node=0)
+    token = ack["consistency_token"] if st == 200 else token
+    st, ack = api.call("POST", "/v1/documents/delete",
+                       {"filter": {"field": "tags", "eq": "parent:report-1"}, "after": token},
+                       node=len(api.urls) - 1)
+    rep.check("filter: delete a document and its 8 chunks by parent", st == 200 and ack.get("deleted") == 8,
+              f"status {st} {str(ack)[:80]}")
+    token = ack["consistency_token"] if st == 200 else token
+    ok = True
+    for node in nodes:
+        _, res = api.call("POST", "/v1/search", {"k": 100, "text": {"field": "text", "query": "zanzibar"},
+                                                 "with_documents": False, "after": token}, node=node)
+        ids = sorted(h["id"] for h in res.get("hits", []))
+        ok &= ids == sorted(c["id"] for c in chunks if not c["id"].startswith("report-1#"))
+        st, _ = api.call("GET", f"/v1/documents/{urllib.parse.quote('report-1#0', safe='')}?after={token}", node=node)
+        ok &= st == 404
+    rep.check("filter: the chunks are gone on every node, the other reports remain", ok)
+    st, ack = api.call("POST", "/v1/documents/delete",
+                       {"ids": ["report-2#0", "report-2#1"], "filter": {"field": "source", "eq": "tv"},
+                        "after": token})
+    rep.check("filter: with ids, only the listed documents that match", st == 200 and ack.get("deleted") == 1,
+              f"status {st} {str(ack)[:80]}")
+    token = ack["consistency_token"] if st == 200 else token
+    st0, _ = api.call("GET", f"/v1/documents/{urllib.parse.quote('report-2#0', safe='')}?after={token}")
+    st1, _ = api.call("GET", f"/v1/documents/{urllib.parse.quote('report-2#1', safe='')}?after={token}")
+    rep.check("filter: the matching one is gone, the other one stays", (st0, st1) == (404, 200), f"{st0} {st1}")
+    crit = {"and": [{"field": "source", "eq": "web"}, {"field": "created", "lt": 19300}]}
+    everything = {"or": [{"field": "source", "in": SOURCES}, {"field": "source", "is_null": True}]}
+    _, res = api.call("POST", "/v1/search", {"k": 10000, "filter": crit, "with_documents": False, "after": token})
+    want = {h["id"] for h in res.get("hits", [])}
+    _, res = api.call("POST", "/v1/search", {"k": 10000, "filter": everything, "with_documents": False,
+                                             "after": token})
+    before = {h["id"] for h in res.get("hits", [])}
+    st, ack = api.call("POST", "/v1/documents/delete", {"filter": crit, "after": token}, node=0)
+    rep.check("filter: delete by criterion (web, created before 19300)",
+              st == 200 and ack.get("deleted") == len(want) and len(want) > 0,
+              f"status {st} deleted {ack.get('deleted') if isinstance(ack, dict) else ack}, {len(want)} matched")
+    token = ack["consistency_token"] if st == 200 else token
+    ok = True
+    for node in nodes:
+        _, res = api.call("POST", "/v1/search", {"k": 10000, "filter": crit, "with_documents": False,
+                                                 "after": token}, node=node)
+        ok &= res.get("hits") == []
+        _, res = api.call("POST", "/v1/search", {"k": 10000, "filter": everything, "with_documents": False,
+                                                 "after": token}, node=node)
+        ok &= {h["id"] for h in res.get("hits", [])} == before - want
+    rep.check("filter: every node holds exactly the documents that did not match", ok)
+    for body in [{"filter": {}}, {"filter": {"and": []}}]:
+        st, _ = api.call("POST", "/v1/documents/delete", body)
+        rep.check(f"filter: {json.dumps(body)} would delete everything -> 400", st == 400, f"status {st}")
 
     # --- consistency levels
     st, _ = api.call("POST", "/v1/search", {"k": 3, "text": {"field": "text", "query": "museum"},

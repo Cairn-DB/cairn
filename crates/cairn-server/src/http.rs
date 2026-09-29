@@ -16,7 +16,7 @@ use cairn_client::Client;
 use cairn_core::{
     DocId, Document, FieldKind, HashMap, LogIndex, NodeId, Predicate, Schema, ShardId, Value,
 };
-use cairn_proto::{Request, Response as Wire};
+use cairn_proto::{DeleteScope, Request, Response as Wire};
 use cairn_query::{Consistency, Fusion, Hit, Query, ReplicaStatus, TextLeg, Token, VectorLeg};
 use cairn_runtime::tls::ClientTls;
 use serde::Deserialize;
@@ -607,6 +607,7 @@ fn filter(schema: &Schema, v: &Json_) -> ApiResult<Predicate> {
         .ok_or_else(|| ApiError::bad("a filter needs \"and\", \"or\", \"not\" or \"field\""))?;
     let field = schema
         .index_of(name)
+        .filter(|_| !cairn_core::schema::is_reserved(name))
         .ok_or_else(|| ApiError::bad(format!("unknown field {name:?}")))?;
     let kind = &schema.fields[field].kind;
     // A `Set` field compares against single values.
@@ -718,7 +719,11 @@ async fn upsert(
 
 #[derive(Deserialize)]
 struct DeleteBody {
-    ids: Vec<Json_>,
+    #[serde(default)]
+    ids: Option<Vec<Json_>>,
+    /// Deletion by filter (ADR 0031); with `ids`, only those ids that match it.
+    #[serde(default)]
+    filter: Option<Json_>,
     #[serde(default)]
     after: Option<String>,
 }
@@ -728,14 +733,81 @@ async fn delete_many(
     key: Option<axum::Extension<KeyId>>,
     Json(body): Json<DeleteBody>,
 ) -> ApiResult<Json<Json_>> {
-    if body.ids.is_empty() {
-        return Err(ApiError::bad("no ids"));
+    let ids = body
+        .ids
+        .as_ref()
+        .map(|v| v.iter().map(api_id).collect::<ApiResult<Vec<_>>>())
+        .transpose()?;
+    let Some(f) = &body.filter else {
+        let ids = ids.ok_or_else(|| ApiError::bad("give \"ids\", \"filter\", or both"))?;
+        if ids.is_empty() {
+            return Err(ApiError::bad("no ids"));
+        }
+        let n = ids.len();
+        let tokens = delete_ids(&s, ids.clone()).await?;
+        let resp = ack(n, &tokens, body.after.as_deref())?;
+        audit_takedown(key.as_deref(), &ids, &resp);
+        return Ok(resp);
+    };
+    let pred = filter(&s.cfg.schema, f)?;
+    if matches!(&pred, Predicate::True) || matches!(&pred, Predicate::And(v) if v.is_empty()) {
+        return Err(ApiError::bad(
+            "a filter that matches every document is refused: give a condition",
+        ));
     }
-    let ids = body.ids.iter().map(api_id).collect::<ApiResult<Vec<_>>>()?;
-    let n = ids.len();
-    let tokens = delete_ids(&s, ids.clone()).await?;
-    let resp = ack(n, &tokens, body.after.as_deref())?;
-    audit_takedown(key.as_deref(), &ids, &resp);
+    pred.validate(&s.cfg.schema)
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    let scopes = match &ids {
+        None => vec![DeleteScope::All],
+        Some(ids) if ids.is_empty() => return Err(ApiError::bad("no ids")),
+        Some(ids) => {
+            let (mut nums, mut keys) = (Vec::new(), Vec::new());
+            for id in ids {
+                match id {
+                    ApiId::Num(n) => nums.push(DocId(*n)),
+                    ApiId::Key(k) => keys.push(k.clone()),
+                }
+            }
+            let mut v = Vec::new();
+            if !nums.is_empty() {
+                v.push(DeleteScope::Ids(nums));
+            }
+            if !keys.is_empty() {
+                v.push(DeleteScope::Keys(keys));
+            }
+            v
+        }
+    };
+    let p2 = pred.clone();
+    let (count, tokens) = with_client(&s, move |c| {
+        let (mut count, mut tokens) = (0, Vec::new());
+        for scope in scopes {
+            let (n, t) = c.delete_where(scope, p2.clone())?;
+            count += n;
+            tokens.extend(t);
+        }
+        Ok((count, tokens))
+    })
+    .await?;
+    let prior = body
+        .after
+        .as_deref()
+        .map(parse_tokens)
+        .transpose()?
+        .unwrap_or_default();
+    let resp = Json(json!({
+        "deleted": count,
+        "consistency_token": merge_tokens(&prior, &tokens),
+    }));
+    tracing::info!(
+        target: "cairn_server::audit",
+        key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        filter = %f,
+        ids = ids.as_ref().map_or(0, Vec::len),
+        count,
+        token = resp.0["consistency_token"].as_str().unwrap_or(""),
+        "takedown by filter"
+    );
     Ok(resp)
 }
 

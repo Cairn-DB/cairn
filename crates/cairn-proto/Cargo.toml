@@ -14,6 +14,7 @@ workspace = true
 cairn-core = { path = "../cairn-core" }
 cairn-query = { path = "../cairn-query" }
 cairn-raft = { path = "../cairn-raft" }
+cairn-storage = { path = "../cairn-storage" }
 bytes.workspace = true
 
 [dev-dependencies]

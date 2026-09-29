@@ -83,7 +83,7 @@ Consistency levels (`consistency`, on reads and searches):
 | `POST /v1/documents` | write | `{"documents":[...], "after"?}` | `{"count", "consistency_token"}` |
 | `GET /v1/documents/{id}` | read | `?consistency=&after=` | the document, or 404 |
 | `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
-| `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}` | `{"count", "consistency_token"}` |
+| `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}`, or `{"filter":{...}, "ids"?, "after"?}` | `{"count", "consistency_token"}`; with a filter, `{"deleted", "consistency_token"}` |
 | `POST /v1/search` | read | see below | `{"hits":[...]}` |
 | `GET /v1/admin/merges` | admin | | `{"paused"}` for the node answering |
 | `POST /v1/admin/merges` | admin | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |
@@ -92,6 +92,32 @@ Merge pause (ADR 0028): a paused node starts no new merge. Merges already runnin
 committed in a shard's log, still complete; `merges_running` and `merges_pending` in
 `/v1/status` show when none is left. The call applies to one node: call it on every node to
 pause the cluster. It is an administrative endpoint with no authentication (see Security).
+
+## Deletion by filter
+
+`POST /v1/documents/delete` with a `filter` removes every document that matches it (ADR 0031),
+with the filter syntax of searches:
+
+```bash
+# Delete a document and all its chunks, stored with the parent's id in a "parent" field.
+curl -s -H "Authorization: Bearer $KEY" localhost:7200/v1/documents/delete \
+  -H content-type:application/json -d '{"filter": {"field": "parent", "eq": "report-9"}}'
+# {"deleted": 14, "consistency_token": "0.212,1.198"}
+```
+
+- It removes the documents that match **when each shard applies the deletion**, in its log
+  order. It is not a standing rule: a document written afterwards is not affected.
+- With `ids`, only those of the listed documents that match are removed. Step 3 of ADR 0031
+  (tenants) uses this for deletions by id under a tenant-scoped key.
+- The answer counts the removed documents, and its token is a takedown token like any other:
+  a read or a search that passes it never returns a removed document, on any node.
+- A filter that matches every document (`{}`, `{"and": []}`) is refused. Reserved fields
+  (names starting with `_`) cannot be filtered on.
+- It needs the `takedown` role, and the audit log records the key, the filter, the count and
+  the token (`takedown by filter`).
+- Each shard runs its part as one log entry. If a shard fails (no leader after retries), the
+  call answers 503 and the other shards may already have deleted their part. Deletion is
+  idempotent, so the call can simply be repeated.
 
 ## Search
 

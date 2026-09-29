@@ -246,10 +246,41 @@ impl StructuredIndex {
 
     /// Decodes from a mapped segment, on any thread (ADR 0026).
     pub fn decode(reader: &MappedSegment, schema: &Schema) -> Result<Self> {
+        Self::decode_fields(reader, schema, |_| true)
+    }
+
+    /// The rows of a segment matching `p`, deleted ones included, decoding only the fields
+    /// `p` reads. The store uses it for deletions by filter
+    /// ([`cairn_storage::store::SegmentFilter`]).
+    pub fn matching_rows(
+        reader: &MappedSegment,
+        schema: &Schema,
+        p: &Predicate,
+    ) -> Result<Vec<u32>> {
+        let mut used = Vec::new();
+        p.fields(&mut used);
+        // With no field read, the row count still comes from the first column.
+        if used.is_empty() && !schema.fields.is_empty() {
+            used.push(0);
+        }
+        let idx = Self::decode_fields(reader, schema, |i| used.contains(&i))?;
+        Ok(idx.evaluate(p).iter().collect())
+    }
+
+    fn decode_fields(
+        reader: &MappedSegment,
+        schema: &Schema,
+        wanted: impl Fn(usize) -> bool,
+    ) -> Result<Self> {
         let mut fields = Vec::with_capacity(schema.fields.len());
         let mut present = Vec::with_capacity(schema.fields.len());
         let mut rows = None;
         for (i, f) in schema.fields.iter().enumerate() {
+            if !wanted(i) {
+                fields.push(None);
+                present.push(Bitmap::empty(0));
+                continue;
+            }
             let nulls = reader.read_section(&format!("nulls.{i}"))?;
             let n = nulls.len() as u32;
             if *rows.get_or_insert(n) != n {

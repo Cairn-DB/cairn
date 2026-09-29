@@ -45,6 +45,13 @@ The exit status is 0 when every check passes.
 - Updates replace the whole document.
 - Takedowns, single and bulk: with the takedown's token, no read, vector search, text search or
   listing returns the document, on any node.
+- Text ids (0.2): string ids of any shape (encoded in paths, made of digits), read back through
+  every node, carried by search hits, replaced by a second write, taken down alone or mixed
+  with integer ids; reserved field names refused.
+- Deletion by filter (0.2): a document and its chunks (by a parent tag), only the listed ids
+  that match, and a criterion over the corpus. The count must equal what a search found, and
+  afterwards every node holds exactly the documents that did not match. Filters that match
+  everything are refused.
 - Consistency levels, ten invalid inputs rejected with 400 and a message, 404 on a missing
   document.
 - Administration: status and merge pause.

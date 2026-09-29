@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cairn HTTP API
-  version: "0.1"
+  version: "0.2-dev"
   description: >
     Hybrid search (vectors, BM25, filters) with a deletion guarantee: a takedown is final for
     any read that passes its consistency token as `after`. See docs/api/http.md, ADR 0023 and,
@@ -67,23 +67,44 @@ paths:
         "503": { $ref: "#/components/responses/Error" }
   /v1/documents/delete:
     post:
-      summary: Take documents down
+      summary: Take documents down, by id or by filter
+      description: >
+        With `ids` only, removes those documents. With a `filter`, removes the documents that
+        match it when each shard applies the deletion (ADR 0031), restricted to `ids` when
+        given, and answers with the number removed. A filter matching every document is
+        refused.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [ids]
               properties:
-                ids: { type: array, minItems: 1, items: { type: integer, minimum: 0 } }
+                ids: { type: array, minItems: 1, items: { $ref: "#/components/schemas/Id" } }
+                filter: { $ref: "#/components/schemas/Filter" }
                 after: { $ref: "#/components/schemas/Token" }
       responses:
-        "200": { $ref: "#/components/responses/Ack" }
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer, description: Ids given (deletion by id) }
+                  deleted: { type: integer, description: Documents removed (deletion by filter) }
+                  consistency_token: { $ref: "#/components/schemas/Token" }
         "400": { $ref: "#/components/responses/Error" }
   /v1/documents/{id}:
     parameters:
-      - { name: id, in: path, required: true, schema: { type: integer, minimum: 0 } }
+      - name: id
+        in: path
+        required: true
+        description: Digits are an integer id unless `id_type=text`.
+        schema: { type: string }
+      - name: id_type
+        in: query
+        schema: { type: string, enum: [text, int] }
     get:
       summary: Read one document
       parameters:
@@ -157,11 +178,16 @@ components:
     Consistency:
       type: string
       enum: [linearizable, read_your_writes, stale]
+    Id:
+      description: An integer below 2^63, or your own text id of 1 to 1024 bytes (ADR 0031).
+      oneOf:
+        - { type: integer, minimum: 0, maximum: 9223372036854775807 }
+        - { type: string, minLength: 1, maxLength: 1024 }
     Document:
       type: object
       required: [id]
       properties:
-        id: { type: integer, minimum: 0 }
+        id: { $ref: "#/components/schemas/Id" }
       additionalProperties: true
       description: Fields keyed by schema name; see docs/api/http.md for the JSON type of each kind.
     Filter:
@@ -201,7 +227,7 @@ components:
     Hit:
       type: object
       properties:
-        id: { type: integer }
+        id: { $ref: "#/components/schemas/Id" }
         score: { type: number }
         legs:
           type: array

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use cairn_core::{DocId, Document, Error, HashMap, NodeId, Result, Runtime as _, Schema, ShardId};
 use cairn_proto::{Request, Response, shard_of, shard_of_key};
 use cairn_query::{
-    Consistency, EngineConfig, Hit, LegList, Query, Replica, ReplicaConfig, ReplicaHandle,
+    Applied, Consistency, EngineConfig, Hit, LegList, Query, Replica, ReplicaConfig, ReplicaHandle,
     ReplicaStatus, Token, fuse,
 };
 use cairn_runtime::pool::{PoolDisk, PoolRuntime, ThreadReactor, offload};
@@ -12,7 +12,7 @@ use cairn_runtime::tcp::ClientConn;
 use cairn_runtime::{
     CrossQueue, CrossReceiver, CrossSender, Executor, TcpNetwork, TcpNetworkConfig, cross_oneshot,
 };
-use cairn_storage::{Command, LogConfig, StoreConfig};
+use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -79,7 +79,7 @@ enum CoreRequest {
     Propose {
         shard: ShardId,
         cmd: Command,
-        reply: CrossSender<Result<Token>>,
+        reply: CrossSender<Result<Applied>>,
     },
     Get {
         shard: ShardId,
@@ -420,7 +420,7 @@ impl Node {
         match req {
             CoreRequest::Net { from, bytes, .. } => h.deliver(from, bytes),
             CoreRequest::Propose { cmd, reply, .. } => {
-                rt.spawn(async move { reply.send(h.propose(cmd).await) })
+                rt.spawn(async move { reply.send(h.propose_applied(cmd).await) })
             }
             CoreRequest::Get {
                 target,
@@ -598,7 +598,7 @@ impl Node {
         shard: ShardId,
         cmd: Command,
         may_forward: bool,
-    ) -> Result<Vec<Token>> {
+    ) -> Result<(Vec<Token>, u64)> {
         let cores = cfg.cores.max(1);
         let cmd2 = cmd.clone();
         match Self::send(queues, cores, shard, |reply| CoreRequest::Propose {
@@ -608,7 +608,7 @@ impl Node {
         })
         .await
         {
-            Some(Ok(t)) => Ok(vec![t]),
+            Some(Ok(a)) => Ok((vec![a.token], a.deleted)),
             Some(Err(Error::NotLeader {
                 leader_hint: Some(l),
                 ..
@@ -618,16 +618,22 @@ impl Node {
                     Command::Delete(ids) => Request::Delete(ids),
                     Command::UpsertKeyed(docs) => Request::UpsertKeyed(docs),
                     Command::DeleteKeys(keys) => Request::DeleteKeys(keys),
+                    Command::DeleteWhere { scope, filter } => Request::DeleteWhere {
+                        shard: Some(shard),
+                        scope,
+                        filter,
+                    },
                     // Upkeep entries are proposed by replicas themselves, never forwarded.
                     Command::Noop
                     | Command::FlushBegin
                     | Command::FlushCommit { .. }
                     | Command::CompactCommit { .. } => {
-                        return Ok(Vec::new());
+                        return Ok((Vec::new(), 0));
                     }
                 };
                 match Self::forward(rt, cfg, l, shard, req).await {
-                    Response::Ack(tokens) => Ok(tokens),
+                    Response::Ack(tokens) => Ok((tokens, 0)),
+                    Response::Deleted { count, tokens } => Ok((tokens, count)),
                     Response::Error {
                         message,
                         leader_hint,
@@ -748,7 +754,7 @@ impl Node {
                     )
                     .await
                     {
-                        Ok(t) => tokens.extend(t),
+                        Ok((t, _)) => tokens.extend(t),
                         Err(e) => return Response::from_error(&e),
                     }
                 }
@@ -772,7 +778,7 @@ impl Node {
                     )
                     .await
                     {
-                        Ok(t) => tokens.extend(t),
+                        Ok((t, _)) => tokens.extend(t),
                         Err(e) => return Response::from_error(&e),
                     }
                 }
@@ -819,7 +825,7 @@ impl Node {
                     )
                     .await
                     {
-                        Ok(t) => tokens.extend(t),
+                        Ok((t, _)) => tokens.extend(t),
                         Err(e) => return Response::from_error(&e),
                     }
                 }
@@ -846,12 +852,73 @@ impl Node {
                     )
                     .await
                     {
-                        Ok(t) => tokens.extend(t),
+                        Ok((t, _)) => tokens.extend(t),
                         Err(e) => return Response::from_error(&e),
                     }
                 }
                 tokens.sort();
                 Response::Ack(tokens)
+            }
+            Request::DeleteWhere {
+                shard,
+                scope,
+                filter,
+            } => {
+                if let Err(e) = filter.validate(&cfg.schema) {
+                    return Response::from_error(&Error::InvalidRequest(e.to_string()));
+                }
+                // One command per shard the scope reaches, each resolved by that shard's log.
+                let parts: Vec<(ShardId, DeleteScope)> = match (shard, scope) {
+                    (Some(s), _) if s.get() >= cfg.shards => {
+                        return Response::from_error(&Error::InvalidRequest(format!(
+                            "no shard {s}"
+                        )));
+                    }
+                    (Some(s), scope) => vec![(s, scope)],
+                    (None, DeleteScope::All) => (0..cfg.shards)
+                        .map(|s| (ShardId(s), DeleteScope::All))
+                        .collect(),
+                    (None, DeleteScope::Ids(ids)) => {
+                        let mut groups: HashMap<ShardId, Vec<DocId>> = HashMap::default();
+                        for id in ids {
+                            groups.entry(shard_of(id, cfg.shards)).or_default().push(id);
+                        }
+                        groups
+                            .into_iter()
+                            .map(|(s, g)| (s, DeleteScope::Ids(g)))
+                            .collect()
+                    }
+                    (None, DeleteScope::Keys(keys)) => {
+                        let mut groups: HashMap<ShardId, Vec<String>> = HashMap::default();
+                        for k in keys {
+                            groups
+                                .entry(shard_of_key(&k, cfg.shards))
+                                .or_default()
+                                .push(k);
+                        }
+                        groups
+                            .into_iter()
+                            .map(|(s, g)| (s, DeleteScope::Keys(g)))
+                            .collect()
+                    }
+                };
+                let mut tokens = Vec::new();
+                let mut count = 0;
+                for (shard, scope) in parts {
+                    let cmd = Command::DeleteWhere {
+                        scope,
+                        filter: filter.clone(),
+                    };
+                    match Self::propose_routed(rt, queues, cfg, shard, cmd, may_forward).await {
+                        Ok((t, n)) => {
+                            tokens.extend(t);
+                            count += n;
+                        }
+                        Err(e) => return Response::from_error(&e),
+                    }
+                }
+                tokens.sort();
+                Response::Deleted { count, tokens }
             }
             Request::Get {
                 id,

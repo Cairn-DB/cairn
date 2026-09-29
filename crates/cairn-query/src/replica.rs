@@ -41,6 +41,15 @@ pub struct Token {
     pub index: LogIndex,
 }
 
+/// A command committed and applied by the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// Its consistency token.
+    pub token: Token,
+    /// Documents a deletion by filter removed (0 for other commands).
+    pub deleted: u64,
+}
+
 /// Bounds how many compaction jobs run at once across the replicas that share it (one node).
 /// A compaction holds all live rows of its input segments in memory while it rebuilds their
 /// indexes, so an unbounded number of concurrent jobs can exhaust a node's RAM.
@@ -201,7 +210,7 @@ enum DocRef {
 enum Event {
     Tick,
     Net(NodeId, Bytes),
-    Propose(Command, Sender<Result<Token>>),
+    Propose(Command, Sender<Result<Applied>>),
     Query(Query, Consistency, Sender<Result<Vec<Hit>>>),
     QueryLegs(
         Query,
@@ -325,6 +334,11 @@ impl ReplicaHandle {
 
     /// Proposes a command; resolves once applied here, or with `NotLeader`.
     pub async fn propose(&self, cmd: Command) -> Result<Token> {
+        self.propose_applied(cmd).await.map(|a| a.token)
+    }
+
+    /// Like [`ReplicaHandle::propose`], with what applying the command did.
+    pub async fn propose_applied(&self, cmd: Command) -> Result<Applied> {
         if !self.alive.get() {
             return closed();
         }
@@ -569,7 +583,7 @@ pub struct Replica<R: Runtime> {
     state_store: ManifestStore<R>,
     state: RaftState,
     inbox: LocalQueue<Event>,
-    waiting_commit: HashMap<LogIndex, (Term, Sender<Result<Token>>)>,
+    waiting_commit: HashMap<LogIndex, (Term, Sender<Result<Applied>>)>,
     waiting_reads: HashMap<u64, Event>,
     waiting_applied: Vec<(LogIndex, Event)>,
     next_read: u64,
@@ -585,7 +599,7 @@ pub struct Replica<R: Runtime> {
     flush_slot: bool,
     merge_slot: bool,
     /// Proposals held back while the memtable is over its hard limit (write backpressure).
-    deferred: std::collections::VecDeque<(Command, Sender<Result<Token>>)>,
+    deferred: std::collections::VecDeque<(Command, Sender<Result<Applied>>)>,
     /// Flush state (ADR 0016), reset when the replica reopens.
     flush: FlushState,
     persist: Persistence,
@@ -1666,8 +1680,9 @@ impl<R: Runtime> Replica<R> {
                     _ => None,
                 };
                 let store = self.engine.store_mut();
+                let mut deleted = 0;
                 if e.index > store.applied_index() {
-                    store.apply(e.index, &cmd)?;
+                    deleted = store.apply(e.index, &cmd).await?;
                 }
                 if let Some(id) = compact_id
                     && self.flush.own_compaction.is_some_and(|o| o.0 == id)
@@ -1679,9 +1694,12 @@ impl<R: Runtime> Replica<R> {
                 }
                 if let Some((term, done)) = self.waiting_commit.remove(&e.index) {
                     if term == e.term {
-                        done.send(Ok(Token {
-                            shard: self.cfg.shard,
-                            index: e.index,
+                        done.send(Ok(Applied {
+                            token: Token {
+                                shard: self.cfg.shard,
+                                index: e.index,
+                            },
+                            deleted,
                         }));
                     } else {
                         done.send(Err(Error::NotLeader {
@@ -2214,7 +2232,7 @@ impl<R: Runtime> Replica<R> {
 
     /// After a segment was published: reload indexes, compact the Raft log to the manifest,
     /// and start a compaction if the policy asks for one.
-    fn propose(&mut self, cmd: Command, done: Sender<Result<Token>>) {
+    fn propose(&mut self, cmd: Command, done: Sender<Result<Applied>>) {
         match self.raft.propose(cmd.to_bytes()) {
             Ok(index) => {
                 self.waiting_commit.insert(index, (self.raft.term(), done));

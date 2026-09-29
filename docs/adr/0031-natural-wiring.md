@@ -82,6 +82,30 @@ Options:
 - **Parent documents and chunks** need nothing more. A chunk carries its parent's id in an
   ordinary field, and "delete this document" is `DeleteWhere { parent == "doc-42" }`. The
   clients name that operation.
+- **As implemented (step 2, 2026-09-29):**
+  - `Command::DeleteWhere { scope, filter }`, where `scope` is every document, a list of ids
+    or a list of text ids. The id lists are for step 3: a deletion by id under a tenant-scoped
+    key is `DeleteWhere { Ids(..), _tenant == t }`.
+  - `Store::apply` became asynchronous: before a `DeleteWhere` changes anything, the store
+    resolves it against the rows of that log position.
+    - Segments: through their filter indexes, decoding only the fields the filter reads from
+      the mapped file. The index crate provides that function to the store; without it, the
+      store reads the filtered columns and evaluates each row, with the same result.
+    - Frozen memtables: their rows not replaced since the freeze.
+    - The memtable.
+    - Rows found are then deleted exactly like `Delete`, text ids included.
+  - Replay after a restart may find fewer rows than the first application: deletion files
+    persisted past the manifest point already mask rows that a later entry replaced or
+    deleted. That later entry removes them again, so the final state is the same. Only the
+    count differs, and nobody reads it on replay.
+  - The leader returns the count with the token. The node sends one command per shard the
+    scope reaches (every shard for a filter alone) and sums the counts. The shards are not
+    atomic together: if one fails, the call fails, and repeating it is safe.
+  - HTTP: `POST /v1/documents/delete` takes `filter`, alone or with `ids`, and answers
+    `{"deleted", "consistency_token"}`. Filters that match everything and filters on reserved
+    fields are refused. The audit event is `takedown by filter`.
+  - Cost, not measured at scale yet: every `DeleteWhere` reads the filtered fields' index
+    sections of all the shard's segments, on the replica's actor.
 
 ### 3. Tenants enforced by the API key
 

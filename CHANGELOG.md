@@ -11,7 +11,13 @@ wire protocol or the on-disk format; the notes say so.
 - Text ids (ADR 0031): a document's `id` can be your own string. It is returned as written by
   reads and searches, and takedowns accept it, alone or mixed with integer ids. Each shard maps
   text ids to internal ids with a dictionary kept in step by the log.
-- Acceptance suite (`examples/acceptance/`): a realistic corpus and 56-72 checks against a
+- Deletion by filter (ADR 0031): `POST /v1/documents/delete` with a `filter` removes every
+  document that matches it, for example a document and all its chunks, or everything from
+  one source before a date. With `ids`, it removes only the listed documents that match. The
+  answer gives the number removed and a takedown token. Each shard resolves the filter when it
+  applies the deletion, so every replica removes the same documents. Rust client:
+  `Client::delete_where`.
+- Acceptance suite (`examples/acceptance/`): a realistic corpus and 83-87 checks against a
   running node or cluster, in Python with no dependency.
 
 ### Fixed
@@ -25,6 +31,7 @@ wire protocol or the on-disk format; the notes say so.
   refused in user schemas. Data written by 0.1 must be ingested again. Protocol version 6.
   Binary-protocol clients read the reserved fields at the end of each document, and may send
   documents with only their own fields.
+- The OpenAPI description now shows text ids and deletion by filter.
 
 ## [0.1.0] - 2026-09-28
 

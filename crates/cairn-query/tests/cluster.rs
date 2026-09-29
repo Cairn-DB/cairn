@@ -59,6 +59,7 @@ fn config(node: NodeId, memtable_max_bytes: usize) -> ReplicaConfig {
         heartbeat_ticks: 2,
         engine: EngineConfig {
             store: StoreConfig {
+                segment_filter: None,
                 memtable_max_bytes,
                 log: LogConfig {
                     max_file_bytes: 1 << 16,

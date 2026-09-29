@@ -9,6 +9,7 @@ use cairn_query::{
     Consistency, Fusion, Hit, LegList, Query, ReplicaStatus, TextLeg, Token, VectorLeg,
 };
 use cairn_raft::Role;
+pub use cairn_storage::DeleteScope;
 
 /// A client request.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +68,16 @@ pub enum Request {
         /// Per-shard read-your-writes tokens.
         tokens: Vec<Token>,
     },
+    /// Delete the documents of `scope` that match `filter` (ADR 0031), on one shard or, with
+    /// `shard: None`, on every shard the scope reaches. Answered with `Deleted`.
+    DeleteWhere {
+        /// One shard only (a forwarded part), or all of them.
+        shard: Option<ShardId>,
+        /// Candidates.
+        scope: DeleteScope,
+        /// Condition.
+        filter: Predicate,
+    },
 }
 
 /// A response.
@@ -82,6 +93,13 @@ pub enum Response {
     Status(Vec<ReplicaStatus>),
     /// Internal: per-leg lists of one shard.
     Legs(Vec<LegList>),
+    /// Deletion by filter acknowledged: documents removed, and one token per shard touched.
+    Deleted {
+        /// Documents removed.
+        count: u64,
+        /// Tokens.
+        tokens: Vec<Token>,
+    },
     /// Failure.
     Error {
         /// Message.
@@ -440,6 +458,15 @@ impl Request {
                     w.str(k);
                 }
             }
+            Request::DeleteWhere {
+                shard,
+                scope,
+                filter,
+            } => {
+                w.u8(12).u32(shard.map_or(u32::MAX, |s| s.get()));
+                scope.encode(&mut w);
+                filter.encode(&mut w);
+            }
             Request::GetKey {
                 key,
                 consistency,
@@ -554,6 +581,14 @@ impl Request {
                     tokens,
                 }
             }
+            12 => Request::DeleteWhere {
+                shard: match r.u32()? {
+                    u32::MAX => None,
+                    s => Some(ShardId(s)),
+                },
+                scope: DeleteScope::decode(&mut r)?,
+                filter: Predicate::decode(&mut r)?,
+            },
             t => return Err(Error::corruption(format!("request tag {t}"))),
         };
         r.finish()?;
@@ -615,6 +650,12 @@ impl Response {
                     for (d, k) in &l.keys {
                         w.u64(d.get()).str(k);
                     }
+                }
+            }
+            Response::Deleted { count, tokens } => {
+                w.u8(7).u64(*count).u32(tokens.len() as u32);
+                for t in tokens {
+                    enc_token(&mut w, t);
                 }
             }
         }
@@ -682,6 +723,15 @@ impl Response {
                     });
                 }
                 Response::Legs(lists)
+            }
+            7 => {
+                let count = r.u64()?;
+                let n = r.u32()? as usize;
+                let mut tokens = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    tokens.push(dec_token(&mut r)?);
+                }
+                Response::Deleted { count, tokens }
             }
             t => return Err(Error::corruption(format!("response tag {t}"))),
         };
@@ -776,6 +826,16 @@ mod tests {
             Request::SetMergesPaused(false),
             Request::UpsertKeyed(vec![doc.clone()]),
             Request::DeleteKeys(vec!["doc-1".into(), "é".into()]),
+            Request::DeleteWhere {
+                shard: None,
+                scope: DeleteScope::All,
+                filter: Predicate::IsNull { field: 2 },
+            },
+            Request::DeleteWhere {
+                shard: Some(ShardId(3)),
+                scope: DeleteScope::Keys(vec!["k".into()]),
+                filter: Predicate::True,
+            },
             Request::GetKey {
                 key: "doc-2".into(),
                 consistency: Consistency::Linearizable,
@@ -817,6 +877,10 @@ mod tests {
         };
         let resps = vec![
             Response::Ack(vec![token]),
+            Response::Deleted {
+                count: 7,
+                tokens: vec![token],
+            },
             Response::Doc(None),
             Response::Hits(vec![hit]),
             Response::Status(vec![status]),

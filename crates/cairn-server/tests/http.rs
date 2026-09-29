@@ -359,6 +359,99 @@ fn http_api_end_to_end() {
     );
     assert_eq!(st, 200);
 
+    // Deletion by filter (ADR 0031): text and integer ids alike, through a node that forwards
+    // to the shard leaders; gone everywhere for a client holding the token.
+    let mut archive: Vec<Value> = (0..10)
+        .map(|i| {
+            let mut d = doc(400 + i);
+            d["id"] = json!(format!("report-9#{i}"));
+            d["source"] = json!("archive");
+            d
+        })
+        .collect();
+    archive.extend((0..6).map(|i| {
+        let mut d = doc(300 + i);
+        d["source"] = json!("archive");
+        d
+    }));
+    let (st, ack) = http(
+        web[0],
+        "POST",
+        "/v1/documents",
+        Some(&json!({ "documents": archive })),
+    );
+    assert_eq!(st, 200, "{ack}");
+    let (st, ack) = http(
+        web[2],
+        "POST",
+        "/v1/documents/delete",
+        Some(&json!({ "filter": { "field": "source", "eq": "archive" } })),
+    );
+    assert_eq!(st, 200, "{ack}");
+    assert_eq!(ack["deleted"], 16, "{ack}");
+    let t = ack["consistency_token"].as_str().unwrap().to_owned();
+    for w in &web {
+        let (st, res) = http(
+            *w,
+            "POST",
+            "/v1/search",
+            Some(&json!({ "k": 50, "filter": { "field": "source", "eq": "archive" }, "after": t })),
+        );
+        assert_eq!(st, 200);
+        assert_eq!(res["hits"], json!([]), "deleted by filter, still found");
+        for id in ["report-9%230", "301"] {
+            let (st, _) = http(*w, "GET", &format!("/v1/documents/{id}?after={t}"), None);
+            assert_eq!(st, 404, "{id} deleted by filter, still read");
+        }
+    }
+    // With ids: only those of them that match.
+    let mut a = doc(500);
+    a["id"] = json!("scoped-a");
+    let mut b = doc(501);
+    b["id"] = json!("scoped-b");
+    let (st, _) = http(
+        web[0],
+        "POST",
+        "/v1/documents",
+        Some(&json!({ "documents": [a, b] })),
+    );
+    assert_eq!(st, 200);
+    let (st, ack) = http(
+        web[1],
+        "POST",
+        "/v1/documents/delete",
+        Some(
+            &json!({ "ids": ["scoped-a", "scoped-b", 999_999], "filter": { "field": "source", "eq": "tv" } }),
+        ),
+    );
+    assert_eq!((st, &ack["deleted"]), (200, &json!(1)), "{ack}");
+    let t = ack["consistency_token"].as_str().unwrap().to_owned();
+    let (st, _) = http(
+        web[2],
+        "GET",
+        &format!("/v1/documents/scoped-a?after={t}"),
+        None,
+    );
+    assert_eq!(st, 404);
+    let (st, _) = http(
+        web[2],
+        "GET",
+        &format!("/v1/documents/scoped-b?after={t}"),
+        None,
+    );
+    assert_eq!(st, 200);
+    for body in [
+        json!({ "filter": {} }),
+        json!({ "filter": { "and": [] } }),
+        json!({ "filter": null }),
+        json!({}),
+        json!({ "filter": { "field": "_tenant", "eq": "x" } }),
+        json!({ "filter": { "field": "text", "eq": "x" } }),
+    ] {
+        let (st, e) = http(web[0], "POST", "/v1/documents/delete", Some(&body));
+        assert_eq!(st, 400, "{body}: {e}");
+    }
+
     // Input errors are 400 with a message; a missing document is 404.
     for body in [
         json!({ "documents": [{ "id": 1, "nope": 1 }] }),

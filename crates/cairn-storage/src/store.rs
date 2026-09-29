@@ -7,16 +7,22 @@
 //! at any point is repaired by replaying the log from that index.
 
 use crate::columns::{DocStore, write_columns};
-use crate::command::Command;
+use crate::command::{Command, DeleteScope};
 use crate::deletion::DeletionSet;
 use crate::log::{Log, LogConfig, LogEntry};
 use crate::manifest::{Manifest, ManifestStore};
 use crate::memtable::Memtable;
-use crate::segment::{SegmentReader, SegmentWriter};
+use crate::segment::{MappedSegment, SegmentReader, SegmentWriter};
 use cairn_core::codec::{Reader, Writer};
 use cairn_core::{
-    Disk, DocId, Document, Error, LogIndex, NodeId, Result, Runtime, Schema, SegmentId, Term,
+    Disk, DocId, Document, Error, LogIndex, NodeId, Predicate, Result, Runtime, Schema, SegmentId,
+    Term,
 };
+
+/// Evaluates a filter over one segment from its filter indexes: the matching rows, deleted
+/// ones included, in any order. The index crate provides it; without one, the store reads the
+/// filtered columns instead (same result, slower).
+pub type SegmentFilter = fn(&MappedSegment, &Schema, &Predicate) -> Result<Vec<u32>>;
 
 /// Tuning.
 #[derive(Debug, Clone)]
@@ -38,6 +44,8 @@ pub struct StoreConfig {
     pub min_merge: usize,
     /// This store's shard, embedded in the internal ids it assigns to text ids (ADR 0031).
     pub shard: u32,
+    /// Filter evaluation over segments, for deletions by filter (ADR 0031).
+    pub segment_filter: Option<SegmentFilter>,
 }
 
 impl Default for StoreConfig {
@@ -50,6 +58,7 @@ impl Default for StoreConfig {
             target_segment_rows: 0,
             min_merge: 4,
             shard: 0,
+            segment_filter: None,
         }
     }
 }
@@ -712,7 +721,7 @@ impl<R: Runtime> Store<R> {
             };
             for e in entries {
                 let cmd = Command::from_bytes(&e.payload)?;
-                store.apply(e.index, &cmd)?;
+                store.apply(e.index, &cmd).await?;
             }
         }
         store.adopt_merge_files().await?;
@@ -854,15 +863,33 @@ impl<R: Runtime> Store<R> {
         self.memtable.bytes()
     }
 
-    /// Applies a committed command at `index` to the in-memory state.
-    pub fn apply(&mut self, index: LogIndex, cmd: &Command) -> Result<()> {
+    /// Applies a committed command at `index` to the in-memory state. Returns the number of
+    /// documents a [`Command::DeleteWhere`] removed, 0 for other commands.
+    pub async fn apply(&mut self, index: LogIndex, cmd: &Command) -> Result<u64> {
         if index != self.applied.next() && !(self.applied == LogIndex(0) && index >= LogIndex(1)) {
             return Err(Error::Internal(format!(
                 "apply {index} after {}",
                 self.applied
             )));
         }
+        // A deletion by filter is resolved against the rows of this log position, before the
+        // entry changes anything: every replica holds the same logical rows here.
+        let resolved = match cmd {
+            Command::DeleteWhere { scope, filter } => Some(self.resolve(scope, filter).await?),
+            _ => None,
+        };
+        let mut removed = 0;
         match cmd {
+            Command::DeleteWhere { .. } => {
+                let ids = resolved.unwrap_or_default();
+                removed = ids.len() as u64;
+                for id in ids {
+                    self.forget_key(id);
+                    self.mask_in_segments(id);
+                    self.memtable.delete(id, index);
+                }
+                self.memtable.note_index(index);
+            }
             Command::Noop => self.memtable.note_index(index),
             Command::FlushBegin => {
                 self.memtable.note_index(index);
@@ -997,7 +1024,94 @@ impl<R: Runtime> Store<R> {
         }
         self.applied = index;
         self.memtable_version += 1;
-        Ok(())
+        Ok(removed)
+    }
+
+    /// The live documents of `scope` that match `filter`, sorted by id. An invalid filter
+    /// matches nothing, on every replica alike (nodes validate before proposing).
+    async fn resolve(&self, scope: &DeleteScope, filter: &Predicate) -> Result<Vec<DocId>> {
+        if let Err(e) = filter.validate(&self.manifest.schema) {
+            tracing::warn!("deletion by filter skipped, invalid filter: {e}");
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let candidates: Vec<DocId> = match scope {
+            DeleteScope::All => return self.matching(filter).await,
+            DeleteScope::Ids(ids) => ids.clone(),
+            DeleteScope::Keys(keys) => keys.iter().filter_map(|k| self.key_to_id(k)).collect(),
+        };
+        for id in candidates {
+            if let Some(d) = self.get(id).await?
+                && filter.matches(&d)
+            {
+                out.push(id);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Every live document matching `filter`, sorted by id: live rows of the segments, rows of
+    /// the frozen memtables not replaced since, and the memtable.
+    pub async fn matching(&self, filter: &Predicate) -> Result<Vec<DocId>> {
+        let mut out = Vec::new();
+        let mut fields = Vec::new();
+        filter.fields(&mut fields);
+        for s in &self.segments {
+            let rows = match self.cfg.segment_filter {
+                Some(eval) => eval(&s.reader.mapped().await?, &self.manifest.schema, filter)?,
+                None => {
+                    // Reads the filtered columns and evaluates each live row on a document
+                    // holding only those fields: the predicate reads nothing else.
+                    let n = s.docs.doc_count() as usize;
+                    let mut docs: Vec<Document> = s
+                        .docs
+                        .docids()
+                        .iter()
+                        .map(|&id| Document::new(DocId(id), self.manifest.schema.fields.len()))
+                        .collect();
+                    for &f in &fields {
+                        let col = s.docs.read_column(&s.reader, f).await?;
+                        if col.len() != n {
+                            return Err(Error::corruption("column length"));
+                        }
+                        for (d, v) in docs.iter_mut().zip(col) {
+                            d.values[f] = v;
+                        }
+                    }
+                    (0..n as u32)
+                        .filter(|&r| filter.matches(&docs[r as usize]))
+                        .collect()
+                }
+            };
+            let ids = s.docs.docids();
+            for row in rows {
+                if !s.deletions.contains(row) {
+                    let id = ids
+                        .get(row as usize)
+                        .ok_or_else(|| Error::corruption("filter row out of range"))?;
+                    out.push(DocId(*id));
+                }
+            }
+        }
+        for p in &self.pending {
+            out.extend(
+                p.mem
+                    .docs()
+                    .filter(|d| !p.masked.contains(&d.id) && filter.matches(d))
+                    .map(|d| d.id),
+            );
+        }
+        out.extend(
+            self.memtable
+                .docs()
+                .filter(|d| filter.matches(d))
+                .map(|d| d.id),
+        );
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// Drops the text id of a deleted document, if it had one.
@@ -1064,7 +1178,7 @@ impl<R: Runtime> Store<R> {
         };
         self.log.append(std::slice::from_ref(&entry)).await?;
         self.log.sync().await?;
-        self.apply(index, cmd)?;
+        self.apply(index, cmd).await?;
         if self.memtable.bytes() >= self.cfg.memtable_max_bytes {
             self.flush().await?;
         }
@@ -2657,6 +2771,7 @@ mod tests {
             target_segment_rows: 0,
             min_merge: 4,
             shard: 0,
+            segment_filter: None,
         }
     }
 
@@ -2922,6 +3037,14 @@ mod tests {
                                 model.insert(*id, None);
                             }
                         }
+                        Command::DeleteWhere { scope, filter } => {
+                            assert_eq!(*scope, DeleteScope::All);
+                            for d in model.values_mut() {
+                                if d.as_ref().is_some_and(|d| filter.matches(d)) {
+                                    *d = None;
+                                }
+                            }
+                        }
                     }
                 }
                 for id in 1..=30u64 {
@@ -2933,7 +3056,12 @@ mod tests {
                 iss.borrow_mut().truncate(applied);
                 let mut r = SeededRng::from_seed(round_seed);
                 for k in 0..30 {
-                    let cmd = if r.chance(0.25) {
+                    let cmd = if r.chance(0.08) {
+                        Command::DeleteWhere {
+                            scope: DeleteScope::All,
+                            filter: random_filter(&mut r),
+                        }
+                    } else if r.chance(0.25) {
                         Command::Delete(vec![DocId(1 + r.below(30))])
                     } else {
                         let n = 1 + r.below(3);
@@ -2955,6 +3083,52 @@ mod tests {
             let h = ex.handle();
             ex.block_on(h.sleep(delay));
             sim.crash(node, &mut ex);
+        }
+    }
+
+    /// A filter over the test schema, matching a few documents of `doc`'s range.
+    fn random_filter(r: &mut SeededRng) -> Predicate {
+        let year = |r: &mut SeededRng| Value::I64(r.below(90) as i64 - 5);
+        match r.below(6) {
+            0 => Predicate::Range {
+                field: 2,
+                lo: Some(year(r)),
+                hi: Some(year(r)),
+                lo_inclusive: r.chance(0.5),
+                hi_inclusive: r.chance(0.5),
+            },
+            1 => Predicate::Eq {
+                field: 3,
+                value: Value::Enum(format!("t{}", r.below(3))),
+            },
+            2 => Predicate::And(vec![
+                Predicate::Eq {
+                    field: 4,
+                    value: Value::Bool(r.chance(0.5)),
+                },
+                Predicate::Eq {
+                    field: 3,
+                    value: Value::Enum(format!("s{}", r.below(2))),
+                },
+            ]),
+            3 => Predicate::IsNull { field: 1 },
+            4 => Predicate::Not(Box::new(Predicate::Or(vec![
+                Predicate::Eq {
+                    field: 3,
+                    value: Value::Enum("t0".into()),
+                },
+                Predicate::Range {
+                    field: 2,
+                    lo: None,
+                    hi: Some(year(r)),
+                    lo_inclusive: true,
+                    hi_inclusive: false,
+                },
+            ]))),
+            _ => Predicate::In {
+                field: 3,
+                values: vec![Value::Enum("t2".into()), Value::Enum("s1".into())],
+            },
         }
     }
 

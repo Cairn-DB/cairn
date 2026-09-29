@@ -2,17 +2,19 @@
 //! injects partitions, message drops, crashes and restarts. Afterwards every read is checked
 //! against a per-key model with real-time bounds, read-your-writes tokens are honoured, no
 //! read that promises read-your-takedown returns a removed document, and the replicas converge.
+//! Deletions by filter (ADR 0031) take part: "every document whose version is at most X",
+//! resolved by each replica when it applies the entry.
 
 use bytes::Bytes;
 use cairn_core::Runtime;
 use cairn_core::{
-    DocId, Document, Duration, FieldDef, FieldKind, HashMap, Instant, LogIndex, NodeId, Schema,
-    SeededRng, ShardId, Value,
+    DocId, Document, Duration, FieldDef, FieldKind, HashMap, Instant, LogIndex, NodeId, Predicate,
+    Schema, SeededRng, ShardId, Value,
 };
 use cairn_index::{HnswParams, VectorIndexParams};
 use cairn_query::{Consistency, EngineConfig, Replica, ReplicaConfig, ReplicaHandle, Token};
 use cairn_sim::{SimConfig, SimRuntime, Simulation};
-use cairn_storage::{Command, LogConfig, StoreConfig};
+use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -81,6 +83,20 @@ fn delete_cmd(key: u64) -> Command {
     }
 }
 
+/// Deletes every document whose version is at most `bound`.
+fn delete_below_cmd(bound: i64) -> Command {
+    Command::DeleteWhere {
+        scope: DeleteScope::All,
+        filter: Predicate::Range {
+            field: 1,
+            lo: None,
+            hi: Some(Value::I64(bound)),
+            lo_inclusive: false,
+            hi_inclusive: true,
+        },
+    }
+}
+
 async fn get_any(
     h: &ReplicaHandle,
     key: u64,
@@ -110,6 +126,7 @@ fn config(node: NodeId) -> ReplicaConfig {
         heartbeat_ticks: 2,
         engine: EngineConfig {
             store: StoreConfig {
+                segment_filter: None,
                 // About four documents: every run flushes, ships, compacts and snapshots (at
                 // 3000 bytes the 12 keys never filled a memtable, so no flush ever ran).
                 memtable_max_bytes: 800,
@@ -152,6 +169,8 @@ enum Op {
     },
     /// Delete; `token` once acknowledged.
     Delete { key: u64, token: Option<Token> },
+    /// Deletion by filter of every document with a version at most `bound`.
+    DeleteBelow { bound: i64, token: Option<Token> },
     /// Read: `Some(Some(v))` found version v, `Some(None)` absent, `None` failed.
     Read {
         key: u64,
@@ -231,8 +250,8 @@ fn spawn_client(
             let key = 1 + rng.below(KEYS) + if rng.below(2) == 0 { KEYED_OFFSET } else { 0 };
             let start = rng.below(handles.len() as u64) as usize;
             let call = r.now();
-            let roll = rng.below(10);
-            if roll < 4 {
+            let roll = rng.below(20);
+            if roll < 8 {
                 let version = {
                     let mut v = versions.borrow_mut();
                     *v += 1;
@@ -265,7 +284,7 @@ fn spawn_client(
                     version,
                     token,
                 };
-            } else if roll < 5 {
+            } else if roll < 10 {
                 let pos = {
                     let mut h = history.borrow_mut();
                     h.push(Record {
@@ -283,6 +302,26 @@ fn spawn_client(
                 let mut h = history.borrow_mut();
                 h[pos].ret = r.now();
                 h[pos].op = Op::Delete { key, token };
+            } else if roll < 11 {
+                // Old versions only: recent writes survive, so the model keeps live keys.
+                let bound = *versions.borrow() - rng.below(12) as i64;
+                let pos = {
+                    let mut h = history.borrow_mut();
+                    h.push(Record {
+                        client,
+                        call,
+                        ret: Instant::from_nanos(u64::MAX),
+                        op: Op::DeleteBelow { bound, token: None },
+                    });
+                    h.len() - 1
+                };
+                let token = propose_retrying(&r, &handles, delete_below_cmd(bound), start).await;
+                if let Some(t) = token {
+                    last_token = Some(last_token.map_or(t, |p| p.max(t)));
+                }
+                let mut h = history.borrow_mut();
+                h[pos].ret = r.now();
+                h[pos].op = Op::DeleteBelow { bound, token };
             } else {
                 let consistency = match rng.below(3) {
                     0 => Consistency::Linearizable,
@@ -314,26 +353,45 @@ struct Model {
 
 impl Model {
     fn build(history: &[Record]) -> Self {
+        // Acknowledged operations in log order: a deletion by filter removes the keys whose
+        // current version is within its bound, which depends on everything before it.
+        let mut ops: Vec<(LogIndex, &Op)> = history
+            .iter()
+            .filter_map(|r| match &r.op {
+                Op::Write { token: Some(t), .. }
+                | Op::Delete { token: Some(t), .. }
+                | Op::DeleteBelow { token: Some(t), .. } => Some((t.index, &r.op)),
+                _ => None,
+            })
+            .collect();
+        ops.sort_by_key(|(i, _)| *i);
         let mut writes: HashMap<u64, Vec<(LogIndex, Option<i64>)>> = HashMap::default();
-        for r in history {
-            match &r.op {
-                Op::Write {
-                    key,
-                    version,
-                    token: Some(t),
-                } => {
+        let mut current: HashMap<u64, i64> = HashMap::default();
+        for (index, op) in ops {
+            match op {
+                Op::Write { key, version, .. } => {
                     writes
                         .entry(*key)
                         .or_default()
-                        .push((t.index, Some(*version)));
+                        .push((index, Some(*version)));
+                    current.insert(*key, *version);
                 }
-                Op::Delete {
-                    key,
-                    token: Some(t),
-                } => {
-                    writes.entry(*key).or_default().push((t.index, None));
+                Op::Delete { key, .. } => {
+                    writes.entry(*key).or_default().push((index, None));
+                    current.remove(key);
                 }
-                _ => {}
+                Op::DeleteBelow { bound, .. } => {
+                    let gone: Vec<u64> = current
+                        .iter()
+                        .filter(|(_, v)| **v <= *bound)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    for k in gone {
+                        writes.entry(k).or_default().push((index, None));
+                        current.remove(&k);
+                    }
+                }
+                Op::Read { .. } => {}
             }
         }
         for v in writes.values_mut() {
@@ -391,6 +449,7 @@ fn check(history: &[Record]) -> (usize, usize) {
                             key: k,
                             token: Some(t),
                         } if k == key && w.ret <= r.call => Some(t.index),
+                        Op::DeleteBelow { token: Some(t), .. } if w.ret <= r.call => Some(t.index),
                         _ => None,
                     })
                     .max()
@@ -409,10 +468,22 @@ fn check(history: &[Record]) -> (usize, usize) {
                 Op::Delete { key: k, .. } if k == key && w.call <= r.ret && w.ret >= r.call => {
                     Some(None)
                 }
+                Op::DeleteBelow { .. } if w.call <= r.ret && w.ret >= r.call => Some(None),
                 _ => None,
             })
             .collect();
-        let ok = model.plausible(*key, lower, *result) || in_flight.contains(result);
+        // A deletion by filter retried after an ambiguous failure may also have committed
+        // earlier than its acknowledged entry, where it removed versions the acknowledged one
+        // no longer sees: an absent result is then explained by any such deletion called
+        // before the read returned whose bound covers the version the model expects.
+        let filtered_away = result.is_none()
+            && model.value_at(*key, lower).is_some_and(|v| {
+                history.iter().any(|w| {
+                    matches!(&w.op, Op::DeleteBelow { bound, .. } if *bound >= v) && w.call <= r.ret
+                })
+            });
+        let ok =
+            model.plausible(*key, lower, *result) || in_flight.contains(result) || filtered_away;
         assert!(
             ok,
             "client {} read key {key} at {:?}..{:?} with {consistency:?} got {result:?}; model lower bound {lower:?}: {:?}",
@@ -445,6 +516,34 @@ fn check(history: &[Record]) -> (usize, usize) {
                     assert!(
                         after || inflight,
                         "read-your-takedown violated: client {} read key {key} = {v} after delete at {:?}",
+                        r.client,
+                        t.index
+                    );
+                }
+            }
+        }
+        // The same for deletions by filter: a promise-bearing read after one never returns a
+        // version within its bound, unless that version was written again afterwards.
+        if !matches!(consistency, Consistency::Stale)
+            && let Some(v) = result
+        {
+            for w in history {
+                if let Op::DeleteBelow {
+                    bound,
+                    token: Some(t),
+                } = &w.op
+                    && *v <= *bound
+                    && ((matches!(consistency, Consistency::Linearizable) && w.ret <= r.call)
+                        || matches!(consistency, Consistency::ReadYourWrites(rt) if rt.index >= t.index))
+                {
+                    let after = model.writes.get(key).is_some_and(|ws| {
+                        ws.iter()
+                            .any(|(idx, val)| *idx > t.index && *val == Some(*v))
+                    });
+                    let inflight = in_flight.contains(&Some(*v));
+                    assert!(
+                        after || inflight,
+                        "read-your-takedown by filter violated: client {} read key {key} = {v} after deleting versions <= {bound} at {:?}",
                         r.client,
                         t.index
                     );
@@ -650,7 +749,9 @@ fn run(seed: u64) -> (usize, usize, u64) {
         .filter(|r| {
             matches!(
                 r.op,
-                Op::Write { token: Some(_), .. } | Op::Delete { token: Some(_), .. }
+                Op::Write { token: Some(_), .. }
+                    | Op::Delete { token: Some(_), .. }
+                    | Op::DeleteBelow { token: Some(_), .. }
             )
         })
         .count();

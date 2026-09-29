@@ -281,6 +281,7 @@ dependencies = [
  "cairn-core",
  "cairn-query",
  "cairn-raft",
+ "cairn-storage",
  "proptest",
 ]
 

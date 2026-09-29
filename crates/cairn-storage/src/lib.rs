@@ -14,13 +14,13 @@ pub mod store;
 
 pub use cairn_core::codec;
 pub use columns::DocStore;
-pub use command::Command;
+pub use command::{Command, DeleteScope};
 pub use deletion::DeletionSet;
 pub use log::{Log, LogConfig, LogEntry, SyncPlan};
 pub use manifest::{Manifest, ManifestStore};
 pub use memtable::Memtable;
 pub use segment::{MappedSegment, SectionMeta, SegmentReader, SegmentWriter};
 pub use store::{
-    CompactJob, FlushJob, KeyNames, NoIndexer, SegmentIndexer, SegmentMeta, SegmentView,
-    ShardManifest, Store, StoreConfig,
+    CompactJob, FlushJob, KeyNames, NoIndexer, SegmentFilter, SegmentIndexer, SegmentMeta,
+    SegmentView, ShardManifest, Store, StoreConfig,
 };

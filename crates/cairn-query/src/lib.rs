@@ -15,5 +15,5 @@ pub use engine::{EngineConfig, IndexJob, LegsJob, PreparedIndexes, ShardEngine};
 pub use fusion::{Fusion, LegList, fuse};
 pub use query::{Hit, LegHit, Query, TextLeg, VectorLeg};
 pub use replica::{
-    Consistency, JobSlots, Replica, ReplicaConfig, ReplicaHandle, ReplicaStatus, Token,
+    Applied, Consistency, JobSlots, Replica, ReplicaConfig, ReplicaHandle, ReplicaStatus, Token,
 };

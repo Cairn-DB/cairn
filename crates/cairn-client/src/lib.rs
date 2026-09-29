@@ -3,8 +3,8 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use cairn_core::error::IoErrorKind;
-use cairn_core::{DocId, Document, Error, HashMap, NodeId, Result};
-use cairn_proto::{Request, Response};
+use cairn_core::{DocId, Document, Error, HashMap, NodeId, Predicate, Result};
+use cairn_proto::{DeleteScope, Request, Response};
 use cairn_query::{Consistency, Hit, Query, ReplicaStatus, Token};
 use cairn_runtime::tcp::ClientConn;
 use cairn_runtime::tls::ClientTls;
@@ -185,6 +185,28 @@ impl Client {
     pub fn delete_keys(&mut self, keys: Vec<String>) -> Result<Vec<Token>> {
         let r = self.call(&Request::DeleteKeys(keys))?;
         self.expect_ack(r)
+    }
+
+    /// Deletes the documents of `scope` that match `filter`, on every shard the scope reaches
+    /// (ADR 0031): the documents live when each shard applies the command, not a standing
+    /// rule. Returns how many were removed, and the tokens.
+    pub fn delete_where(
+        &mut self,
+        scope: DeleteScope,
+        filter: Predicate,
+    ) -> Result<(u64, Vec<Token>)> {
+        let r = self.call(&Request::DeleteWhere {
+            shard: None,
+            scope,
+            filter,
+        })?;
+        match r {
+            Response::Deleted { count, tokens } => {
+                let tokens = self.expect_ack(Response::Ack(tokens))?;
+                Ok((count, tokens))
+            }
+            other => self.expect_ack(other).map(|t| (0, t)),
+        }
     }
 
     /// Point read by text id, with the same consistency rules as [`Client::get`].

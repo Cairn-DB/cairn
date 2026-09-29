@@ -227,6 +227,9 @@ impl<R: Runtime> ShardEngine<R> {
         cfg: EngineConfig,
         replay_limit: Option<LogIndex>,
     ) -> Result<Self> {
+        let mut cfg = cfg;
+        // Deletions by filter read the segments' filter indexes (ADR 0031).
+        cfg.store.segment_filter = Some(StructuredIndex::matching_rows);
         let mut store =
             Store::open_with_limit(rt, dir, schema, cfg.store.clone(), replay_limit).await?;
         store.set_indexer(Box::new(DefaultIndexer {

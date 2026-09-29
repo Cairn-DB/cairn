@@ -7,7 +7,7 @@ use cairn_core::{
 use cairn_index::{HnswParams, VectorIndexParams};
 use cairn_query::{EngineConfig, Fusion, Query, ShardEngine, TextLeg, VectorLeg};
 use cairn_sim::{SimConfig, Simulation};
-use cairn_storage::{Command, LogConfig, StoreConfig};
+use cairn_storage::{Command, DeleteScope, LogConfig, StoreConfig};
 
 const WORDS: [&str; 12] = [
     "minister", "nuclear", "energy", "weather", "football", "election", "archive", "clip",
@@ -84,6 +84,7 @@ fn disk_cfg(memtable_max_bytes: usize) -> EngineConfig {
 fn cfg(memtable_max_bytes: usize) -> EngineConfig {
     EngineConfig {
         store: StoreConfig {
+            segment_filter: None,
             memtable_max_bytes,
             log: LogConfig {
                 max_file_bytes: 1 << 20,
@@ -322,6 +323,96 @@ fn multi_segment_with_memtable_and_takedowns() {
             .await
             .unwrap();
         check(&mut engine, &model, &deleted_set, &mut r).await;
+    });
+}
+
+/// Deletion by filter (ADR 0031) over segments (read through their filter indexes), updated and
+/// deleted rows, and the memtable: it removes exactly the live documents a direct evaluation
+/// finds, and a reopen, which replays the log, ends with the same documents.
+#[test]
+fn deletion_by_filter_matches_reference() {
+    let (sim, mut ex) = Simulation::new(5, SimConfig::default());
+    let rt = sim.runtime(NodeId(1), &ex.handle());
+    ex.block_on(async move {
+        let mut r = SeededRng::from_seed(21);
+        let mut model: Vec<Document> = Vec::new();
+        let mut engine = ShardEngine::open(rt.clone(), "shard", schema(), cfg(6000))
+            .await
+            .unwrap();
+        let mut next = 1u64;
+        for round in 0..12 {
+            for _ in 0..80 {
+                // Some ids come back: updates of live and of deleted documents.
+                let id = if next > 20 && r.chance(0.2) {
+                    1 + r.below(next - 1)
+                } else {
+                    next += 1;
+                    next - 1
+                };
+                let d = doc(&mut r, id);
+                model.retain(|m| m.id != d.id);
+                model.push(d.clone());
+                engine.write(&Command::Upsert(vec![d])).await.unwrap();
+            }
+            let f = match r.below(3) {
+                0 => filter(&mut r),
+                1 => Predicate::Not(Box::new(filter(&mut r))),
+                _ => Predicate::Or(vec![
+                    Predicate::IsNull { field: 1 },
+                    Predicate::Range {
+                        field: 3,
+                        lo: None,
+                        hi: Some(Value::I64(1990 + r.below(20) as i64)),
+                        lo_inclusive: true,
+                        hi_inclusive: false,
+                    },
+                ]),
+            };
+            let f = if matches!(f, Predicate::True) {
+                Predicate::IsNull { field: 1 }
+            } else {
+                f
+            };
+            let mut want: Vec<DocId> = model
+                .iter()
+                .filter(|d| f.matches(d))
+                .map(|d| d.id)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(
+                engine.store().matching(&f).await.unwrap(),
+                want,
+                "round {round}: {f:?}"
+            );
+            engine
+                .write(&Command::DeleteWhere {
+                    scope: DeleteScope::All,
+                    filter: f.clone(),
+                })
+                .await
+                .unwrap();
+            model.retain(|d| !f.matches(d));
+            assert!(engine.store().matching(&f).await.unwrap().is_empty());
+            if round % 4 == 3 {
+                engine.flush().await.unwrap();
+            }
+        }
+        assert!(engine.store().segments().count() >= 2);
+        let all = Predicate::True;
+        let mut live: Vec<DocId> = model.iter().map(|d| d.id).collect();
+        live.sort_unstable();
+        assert_eq!(engine.store().matching(&all).await.unwrap(), live);
+        for d in &model {
+            assert_eq!(engine.get(d.id).await.unwrap().as_ref(), Some(d));
+        }
+        drop(engine);
+        let engine = ShardEngine::open(rt.clone(), "shard", schema(), cfg(6000))
+            .await
+            .unwrap();
+        assert_eq!(engine.store().matching(&all).await.unwrap(), live);
+        for d in &model {
+            assert_eq!(engine.get(d.id).await.unwrap().as_ref(), Some(d));
+        }
     });
 }
 

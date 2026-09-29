@@ -1,7 +1,7 @@
 //! Commands carried by log entries.
 
 use cairn_core::codec::{Reader, Writer};
-use cairn_core::{DocId, Document, Error, NodeId, Result, SegmentId};
+use cairn_core::{DocId, Document, Error, NodeId, Predicate, Result, SegmentId};
 
 /// One replicated command (a log entry payload).
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +17,15 @@ pub enum Command {
     UpsertKeyed(Vec<Document>),
     /// Remove documents by text id (a takedown).
     DeleteKeys(Vec<String>),
+    /// Remove the documents of `scope` that match `filter` (ADR 0031). Each replica resolves
+    /// the filter when it applies the entry, against the rows of that log position, so all of
+    /// them remove the same documents. Documents written afterwards are not affected.
+    DeleteWhere {
+        /// Candidate documents.
+        scope: DeleteScope,
+        /// Condition a candidate must meet to be removed.
+        filter: Predicate,
+    },
     /// Freeze the memtable for a flush (ADR 0016). The segment id is the entry's log index,
     /// so every replica cuts the same rows under the same id.
     FlushBegin,
@@ -50,6 +59,67 @@ pub enum Command {
     },
 }
 
+/// The candidates of a [`Command::DeleteWhere`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteScope {
+    /// Every live document of the shard.
+    All,
+    /// These ids only.
+    Ids(Vec<DocId>),
+    /// These text ids only.
+    Keys(Vec<String>),
+}
+
+impl DeleteScope {
+    /// Encodes the scope.
+    pub fn encode(&self, w: &mut Writer) {
+        match self {
+            DeleteScope::All => {
+                w.u8(0);
+            }
+            DeleteScope::Ids(ids) => {
+                w.u8(1).u32(ids.len() as u32);
+                for id in ids {
+                    w.u64(id.get());
+                }
+            }
+            DeleteScope::Keys(keys) => {
+                w.u8(2).u32(keys.len() as u32);
+                for k in keys {
+                    w.str(k);
+                }
+            }
+        }
+    }
+
+    /// Decodes a scope.
+    pub fn decode(r: &mut Reader<'_>) -> Result<DeleteScope> {
+        match r.u8()? {
+            0 => Ok(DeleteScope::All),
+            t @ (1 | 2) => {
+                let n = r.u32()? as usize;
+                if n > 1 << 24 {
+                    return Err(Error::corruption("delete batch too large"));
+                }
+                if t == 1 {
+                    let mut ids = Vec::with_capacity(n.min(1 << 16));
+                    for _ in 0..n {
+                        ids.push(DocId(r.u64()?));
+                    }
+                    Ok(DeleteScope::Ids(ids))
+                } else {
+                    let mut keys = Vec::with_capacity(n.min(1 << 16));
+                    for _ in 0..n {
+                        keys.push(r.str()?.to_owned());
+                    }
+                    Ok(DeleteScope::Keys(keys))
+                }
+            }
+            t => Err(Error::corruption(format!("unknown delete scope {t}"))),
+        }
+    }
+}
+
 impl Command {
     /// Encodes the command.
     pub fn encode(&self, w: &mut Writer) {
@@ -81,6 +151,11 @@ impl Command {
                 for k in keys {
                     w.str(k);
                 }
+            }
+            Command::DeleteWhere { scope, filter } => {
+                w.u8(8);
+                scope.encode(w);
+                filter.encode(w);
             }
             Command::FlushCommit {
                 id,
@@ -164,6 +239,13 @@ impl Command {
                 }
                 Ok(Command::DeleteKeys(keys))
             }
+            8 => {
+                let scope = DeleteScope::decode(r)?;
+                Ok(Command::DeleteWhere {
+                    scope,
+                    filter: Predicate::decode(r)?,
+                })
+            }
             5 => {
                 let id = SegmentId(r.u64()?);
                 let n = r.u32()? as usize;
@@ -219,6 +301,21 @@ mod tests {
             Command::Delete(vec![DocId(7), DocId(9)]),
             Command::DeleteKeys(vec!["doc-1".into(), "é/ü".into(), String::new()]),
             Command::UpsertKeyed(vec![Document::new(DocId(0), 2)]),
+            Command::DeleteWhere {
+                scope: DeleteScope::All,
+                filter: Predicate::Eq {
+                    field: 1,
+                    value: cairn_core::Value::Enum("acme".into()),
+                },
+            },
+            Command::DeleteWhere {
+                scope: DeleteScope::Ids(vec![DocId(3), DocId(u64::MAX)]),
+                filter: Predicate::True,
+            },
+            Command::DeleteWhere {
+                scope: DeleteScope::Keys(vec!["a".into(), String::new()]),
+                filter: Predicate::Not(Box::new(Predicate::IsNull { field: 0 })),
+            },
             Command::CompactCommit {
                 id: SegmentId((1 << 62) | 3),
                 inputs: vec![SegmentId(10), SegmentId(20)],
