@@ -52,6 +52,9 @@ The exit status is 0 when every check passes.
   that match, and a criterion over the corpus. The count must equal what a search found, and
   afterwards every node holds exactly the documents that did not match. Filters that match
   everything are refused.
+- Tenants (0.2), through the `Cairn-Tenant` header: the same ids in two tenants read back
+  separately on every node, searches return only the tenant's documents, a takedown in one
+  tenant leaves the other's document, and erasing a tenant removes all of it everywhere.
 - Consistency levels, ten invalid inputs rejected with 400 and a message, 404 on a missing
   document.
 - Administration: status and merge pause.

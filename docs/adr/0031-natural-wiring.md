@@ -121,6 +121,38 @@ Options:
   `DELETE /v1/collections/{c}/tenants/{t}`, which is a `DeleteWhere { _tenant == t }`.
 - This is how per-user agent memory ("forget me") and per-customer SaaS data are wired, with
   isolation that does not depend on the application remembering a filter.
+- **As implemented (step 3, 2026-09-29).** Two additions to the design above, decided while
+  implementing it:
+  - **Ids belong to their tenant.** With client-chosen ids shared by all tenants, `globex`
+    writing `doc-1` would have replaced `acme`'s `doc-1`: a scoped key could overwrite a
+    neighbour's document. Under a tenant, every id is therefore stored as a text id
+    `<tenant>U+001F#<digits>` (integer) or `<tenant>U+001F$<text>`. Client text ids cannot
+    contain U+001F, so a tenant's ids never meet another tenant's, nor ids written without a
+    tenant. Answers show the id as written.
+    - Other options were rejected. Checking the owner of an id before each write costs a read
+      per write and races with concurrent writes. Refusing integer ids under a tenant would
+      break the clients' uniform id handling.
+  - **An unscoped key can act for a tenant** through a `Cairn-Tenant` header. One backend
+    serving many customers needs that without holding one key per customer. A scoped key
+    with a header naming another tenant gets 403.
+  - Everything else is as designed:
+    - `_tenant` is set on every write;
+    - `_tenant == t` is added to every read, search and deletion (by id: `DeleteWhere` over
+      the tenant's stored ids with `_tenant == t`; by filter: the filter and `_tenant == t`);
+    - a document read by id is checked against the tenant again.
+  - The erase route is `DELETE /v1/tenants/{t}` until collections exist (step B moves it
+    under `/v1/collections/{c}`). It is a `DeleteWhere { All, _tenant == t }` and needs the
+    `takedown` role on an unscoped key.
+  - Keys: `"tenant"` in the keys-file entry, `keygen ... --tenant t`. A scoped key cannot hold
+    `admin`, whose routes (status, merges) are not tenant-aware.
+  - Enforcement is in the HTTP API only. The binary protocol serves nodes and trusted clients
+    under mutual TLS, and is not tenant-aware. No storage or protocol change: tenants use text
+    ids, `DeleteWhere` and filters from steps 1 and 2, which the simulation campaign already
+    covers.
+  - Validation: `crates/cairn-server/tests/http_tenants.rs` runs a node with two scoped keys
+    and one unscoped key. It checks shared ids, guessed ids, hostile filters, switching
+    tenants through the header, deletions by id and by filter, and erasure. Positive control:
+    without the added tenant filter, the test fails.
 
 ### 4. Collections created through the API
 

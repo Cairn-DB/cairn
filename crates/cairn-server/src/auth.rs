@@ -62,6 +62,30 @@ pub struct ApiKey {
     pub id: String,
     hash: [u8; 32],
     roles: u8,
+    /// The only tenant this key reaches (ADR 0031), `None` for every tenant.
+    pub tenant: Option<String>,
+}
+
+/// Checks a tenant name: 1 to 128 bytes of ASCII letters, digits, `_`, `.` and `-`.
+pub fn valid_tenant(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 128
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn check_tenant(id: &str, tenant: Option<&str>, roles: u8) -> anyhow::Result<()> {
+    if let Some(t) = tenant {
+        if !valid_tenant(t) {
+            anyhow::bail!(
+                "key {id:?}: tenant {t:?} must be 1 to 128 letters, digits, '_', '.' or '-'"
+            );
+        }
+        if roles & Role::Admin.bit() != 0 {
+            anyhow::bail!("key {id:?}: a tenant-scoped key cannot hold the admin role");
+        }
+    }
+    Ok(())
 }
 
 impl ApiKey {
@@ -80,6 +104,7 @@ impl ApiKey {
                 .filter(|r| self.roles & r.bit() != 0)
                 .map(|r| r.name().to_owned())
                 .collect(),
+            tenant: self.tenant.clone(),
         }
     }
 }
@@ -93,6 +118,9 @@ pub struct KeyEntry {
     pub sha256: String,
     /// Role names.
     pub roles: Vec<String>,
+    /// The only tenant the key reaches (ADR 0031); absent for every tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,10 +180,12 @@ impl ApiKeys {
             if roles.is_empty() {
                 anyhow::bail!("key {:?} has no role", e.id);
             }
+            check_tenant(&e.id, e.tenant.as_deref(), roles_mask(&roles))?;
             keys.push(ApiKey {
                 id: e.id,
                 hash,
                 roles: roles_mask(&roles),
+                tenant: e.tenant,
             })?;
         }
         Ok(keys)
@@ -185,6 +215,7 @@ impl ApiKeys {
             id: id.to_owned(),
             hash: sha256(secret),
             roles: roles_mask(roles),
+            tenant: None,
         })
     }
 
@@ -222,8 +253,13 @@ impl ApiKeys {
 }
 
 /// A new random secret (`cairn_` then 32 random bytes, URL-safe base64) and its key.
-pub fn generate(id: &str, roles: &[Role]) -> anyhow::Result<(String, ApiKey)> {
+pub fn generate(
+    id: &str,
+    roles: &[Role],
+    tenant: Option<&str>,
+) -> anyhow::Result<(String, ApiKey)> {
     use base64::Engine as _;
+    check_tenant(id, tenant, roles_mask(roles))?;
     let mut raw = [0u8; 32];
     SystemRandom::new()
         .fill(&mut raw)
@@ -236,6 +272,7 @@ pub fn generate(id: &str, roles: &[Role]) -> anyhow::Result<(String, ApiKey)> {
         id: id.to_owned(),
         hash: sha256(&secret),
         roles: roles_mask(roles),
+        tenant: tenant.map(str::to_owned),
     };
     Ok((secret, key))
 }
@@ -251,6 +288,7 @@ pub fn required_role(method: &str, path: &str) -> Option<Role> {
         ("POST", "/v1/documents/delete") => Some(Role::Takedown),
         ("GET", p) if p.starts_with("/v1/documents/") => Some(Role::Read),
         ("DELETE", p) if p.starts_with("/v1/documents/") => Some(Role::Takedown),
+        ("DELETE", p) if p.starts_with("/v1/tenants/") => Some(Role::Takedown),
         _ => Some(Role::Admin),
     }
 }
@@ -261,7 +299,7 @@ mod tests {
 
     #[test]
     fn keys_authenticate_by_secret_and_check_roles() {
-        let (secret, key) = generate("ingest", &[Role::Write, Role::Read]).unwrap();
+        let (secret, key) = generate("ingest", &[Role::Write, Role::Read], None).unwrap();
         assert!(secret.starts_with("cairn_") && secret.len() > 40);
         let mut keys = ApiKeys::from_json(
             format!(
@@ -316,6 +354,39 @@ mod tests {
                 .add_plain("x", "short", &[Role::Read])
                 .is_err()
         );
+        let zeros = "0".repeat(64);
+        for bad in [
+            format!(r#"{{"keys":[{{"id":"a","sha256":"{zeros}","roles":["read"],"tenant":""}}]}}"#),
+            format!(
+                r#"{{"keys":[{{"id":"a","sha256":"{zeros}","roles":["read"],"tenant":"a b"}}]}}"#
+            ),
+            format!(
+                r#"{{"keys":[{{"id":"a","sha256":"{zeros}","roles":["admin"],"tenant":"acme"}}]}}"#
+            ),
+        ] {
+            assert!(ApiKeys::from_json(bad.as_bytes()).is_err(), "{bad}");
+        }
+        assert!(generate("t", &[Role::Admin], Some("acme")).is_err());
+        assert!(generate("t", &[Role::Read], Some("acme/x")).is_err());
+    }
+
+    #[test]
+    fn tenant_scoped_keys_round_trip() {
+        let (secret, key) = generate("acme-app", &[Role::Read, Role::Write], Some("acme")).unwrap();
+        let entry = serde_json::to_string(&key.entry()).unwrap();
+        assert!(entry.contains(r#""tenant":"acme""#));
+        let keys = ApiKeys::from_json(format!(r#"{{"keys":[{entry}]}}"#).as_bytes()).unwrap();
+        let k = keys
+            .authenticate(Some(&format!("Bearer {secret}")))
+            .unwrap();
+        assert_eq!(k.tenant.as_deref(), Some("acme"));
+        // Unscoped entries carry no tenant field at all.
+        let (_, open) = generate("ops", &[Role::Read], None).unwrap();
+        assert!(
+            !serde_json::to_string(&open.entry())
+                .unwrap()
+                .contains("tenant")
+        );
     }
 
     #[test]
@@ -331,6 +402,10 @@ mod tests {
         );
         assert_eq!(
             required_role("POST", "/v1/documents/delete"),
+            Some(Role::Takedown)
+        );
+        assert_eq!(
+            required_role("DELETE", "/v1/tenants/acme"),
             Some(Role::Takedown)
         );
         assert_eq!(required_role("GET", "/v1/status"), Some(Role::Admin));

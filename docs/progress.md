@@ -510,6 +510,21 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   - Open: cost at scale not measured (reads the filtered index sections of every segment on
     the replica actor).
 
+- 0.2 step 3, tenants (2026-09-29, owner: "go pour l'étape 3"): ADR 0031 section 3, notes there.
+  - HTTP layer only; no storage or protocol change. Scope per request: key's tenant, or an
+    unscoped key's `Cairn-Tenant` header (scoped key + other tenant: 403).
+  - Found while implementing: shared client ids would let one tenant overwrite another's
+    document. Ids under a tenant are stored as text ids `<tenant>U+001F#<int>` /
+    `<tenant>U+001F$<text>`; U+001F refused in client text ids.
+  - `_tenant == t` added to every search and deletion; reads rechecked; `DELETE
+    /v1/tenants/{t}` (takedown, unscoped); keys file `"tenant"`, `keygen --tenant`; scoped keys
+    cannot be admin. Audit lines carry the tenant.
+  - Tests: unit (namespacing, filters, key files), `tests/http_tenants.rs` (isolation against a
+    running node; positive control: without the tenant filter it fails), acceptance section
+    through the header. 135 tests, clippy clean, acceptance 95/95 on 3 nodes
+    (data/acceptance-03.log).
+  - Next: step 4, TypeScript and Python clients.
+
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with
 end-to-end read-your-takedown (source offsets in the log, per-shard watermarks, Kafka-offset

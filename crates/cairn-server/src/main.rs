@@ -128,18 +128,22 @@ struct Cli {
     drop_prob: f64,
 }
 
-/// `cairn-server keygen <id> <roles>`: prints a new API key and its keys-file entry.
+/// `cairn-server keygen <id> <roles> [--tenant <name>]`: prints a new API key and its
+/// keys-file entry. With `--tenant`, the key reaches that tenant only (ADR 0031).
 fn keygen(args: &[String]) -> anyhow::Result<()> {
-    let [id, roles] = args else {
-        anyhow::bail!(
-            "usage: cairn-server keygen <id> <roles, comma-separated: read,write,takedown,admin>"
-        );
+    let (id, roles, tenant) = match args {
+        [id, roles] => (id, roles, None),
+        [id, roles, flag, t] if flag == "--tenant" => (id, roles, Some(t.as_str())),
+        _ => anyhow::bail!(
+            "usage: cairn-server keygen <id> <roles, comma-separated: read,write,takedown,admin> \
+             [--tenant <name>]"
+        ),
     };
     let roles: Vec<cairn_server::auth::Role> = roles
         .split(',')
         .map(cairn_server::auth::Role::parse)
         .collect::<anyhow::Result<_>>()?;
-    let (secret, key) = cairn_server::auth::generate(id, &roles)?;
+    let (secret, key) = cairn_server::auth::generate(id, &roles, tenant)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({ "key": secret, "entry": key.entry() }))?
@@ -156,7 +160,7 @@ fn http_keys(cli: &Cli) -> anyhow::Result<cairn_server::auth::ApiKeys> {
     let mut keys = match &cli.http_keys {
         Some(path) if path.exists() => ApiKeys::load(path)?,
         Some(path) if cli.http_generate_admin_key => {
-            let (secret, key) = generate("admin", &[Role::Admin])?;
+            let (secret, key) = generate("admin", &[Role::Admin], None)?;
             let json = serde_json::to_string_pretty(&serde_json::json!({ "keys": [key.entry()] }))?;
             std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
             eprintln!(

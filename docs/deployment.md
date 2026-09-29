@@ -86,6 +86,8 @@ only peers with a certificate from the same CA, for the name `node-<id>.cairn`.
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen rag-api read
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen ingest write,read
   docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen compliance takedown
+  # 0.2: a key that only ever reaches the tenant "acme" (see docs/api/http.md, Tenants)
+  docker run --rm --entrypoint cairn-server ghcr.io/cairn-db/cairn keygen acme-app read,write --tenant acme
   ```
   Each prints the key once and a `{"id","sha256","roles"}` entry. Collect the entries in a
   keys file (`{"keys":[...]}`), the same on every node, and point `CAIRN_HTTP_KEYS` at it. The

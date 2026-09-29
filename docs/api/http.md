@@ -26,6 +26,7 @@ A document is a flat JSON object: an `id` plus fields named as in the schema.
   `?id_type=text`, for example `GET /v1/documents/12345?id_type=text`. Encode other characters
   as usual (`%2F` for `/`).
 - Field names starting with `_` are reserved.
+- A text id cannot contain the character U+001F, which separates a tenant from its ids.
 
 JSON types by field kind:
 
@@ -85,6 +86,7 @@ Consistency levels (`consistency`, on reads and searches):
 | `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
 | `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}`, or `{"filter":{...}, "ids"?, "after"?}` | `{"count", "consistency_token"}`; with a filter, `{"deleted", "consistency_token"}` |
 | `POST /v1/search` | read | see below | `{"hits":[...]}` |
+| `DELETE /v1/tenants/{tenant}` | takedown, unscoped key | `?after=` | `{"deleted", "consistency_token"}`: erases the tenant |
 | `GET /v1/admin/merges` | admin | | `{"paused"}` for the node answering |
 | `POST /v1/admin/merges` | admin | `{"paused": true}` | `{"paused"}`: pauses or resumes merges on the node answering |
 
@@ -118,6 +120,44 @@ curl -s -H "Authorization: Bearer $KEY" localhost:7200/v1/documents/delete \
 - Each shard runs its part as one log entry. If a shard fails (no leader after retries), the
   call answers 503 and the other shards may already have deleted their part. Deletion is
   idempotent, so the call can simply be repeated.
+
+## Tenants
+
+A tenant is a customer, a user, or any unit whose data must stay apart (ADR 0031). A request
+acts for one tenant in two ways:
+- its key is **scoped** to that tenant (`cairn-server keygen app read,write,takedown --tenant
+  acme`). Hand such a key to code that must only ever see `acme`.
+- an **unscoped** key names the tenant in a `Cairn-Tenant: acme` header. This is how one
+  backend serves all its customers. A scoped key with a header naming another tenant gets 403.
+
+Tenant names have 1 to 128 letters, digits, `_`, `.` or `-`.
+
+Within a tenant:
+- **Ids belong to the tenant.** `doc-1` in `acme` and `doc-1` in `globex` are two documents,
+  and neither is the `doc-1` written without a tenant. Integer ids work the same way.
+- **Writes** are stored for the tenant.
+- **Reads, searches and deletions**, by id or by filter, only ever reach the tenant's
+  documents. The server adds the restriction itself, so an application that forgets a filter,
+  guesses an id or sends a hostile filter still cannot reach another tenant. Filters on
+  reserved fields (`_tenant`) are refused.
+- **Answers** show ids as written, without the tenant.
+
+Without a tenant, an unscoped key sees everything. Hits and documents that belong to a tenant
+carry a `_tenant` field. To read one by id, name its tenant in the header.
+
+**Erasing a tenant.** `DELETE /v1/tenants/acme` removes every document of `acme`, on every
+shard, and answers `{"deleted", "consistency_token"}`, as a deletion by filter does. It needs
+the `takedown` role on an unscoped key. It is audited (`tenant erased`, with the key, the
+tenant, the count and the token). Documents written for the tenant afterwards are not
+affected.
+
+```bash
+curl -s -X DELETE -H "Authorization: Bearer $KEY" localhost:7200/v1/tenants/acme
+# {"deleted": 1250, "consistency_token": "0.88,1.91,2.87,3.90"}
+```
+
+Scope: tenants are enforced by the HTTP API. The binary protocol between nodes and trusted
+clients (mutual TLS) is not tenant-aware.
 
 ## Search
 
@@ -169,8 +209,9 @@ Every request except `/health` carries an API key (ADR 0030):
 - `admin`: status and merge pause, and every other role.
 
 **Keys.**
-- `cairn-server keygen <id> <roles>` prints a new key once, with the entry to add to the
-  keys file (`--http-keys`). The file holds only SHA-256 digests.
+- `cairn-server keygen <id> <roles> [--tenant <name>]` prints a new key once, with the entry
+  to add to the keys file (`--http-keys`). The file holds only SHA-256 digests. A key with a
+  tenant reaches that tenant only (see Tenants); it cannot hold the `admin` role.
 - `CAIRN_HTTP_ADMIN_KEY` adds an admin key given in clear, for instance from a secret shared by
   every node.
 - On a first start, `--http-keys <file> --http-generate-admin-key` creates the file with one
@@ -183,5 +224,5 @@ Every request except `/health` carries an API key (ADR 0030):
 in clear and the node warns at startup: use TLS, or an HTTPS proxy in front. A node that runs
 mutual TLS between nodes refuses plain HTTP unless `--http-allow-plaintext` confirms it.
 
-**Audit.** Every takedown is logged with the key id, the document ids and the consistency
-token (log target `cairn_server::audit`, on by default). Secrets never reach the logs.
+**Audit.** Every takedown is logged with the key id, the tenant, the document ids (or the
+filter and the count) and the consistency token (log target `cairn_server::audit`, on by default). Secrets never reach the logs.

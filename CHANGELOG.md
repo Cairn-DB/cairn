@@ -17,7 +17,11 @@ wire protocol or the on-disk format; the notes say so.
   answer gives the number removed and a takedown token. Each shard resolves the filter when it
   applies the deletion, so every replica removes the same documents. Rust client:
   `Client::delete_where`.
-- Acceptance suite (`examples/acceptance/`): a realistic corpus and 83-87 checks against a
+- Tenants (ADR 0031): an API key can be scoped to one tenant (`keygen ... --tenant acme`), and
+  an unscoped key can act for one with the `Cairn-Tenant` header. Within a tenant, ids belong
+  to the tenant, and every read, search and deletion stays inside it, enforced by the server.
+  `DELETE /v1/tenants/{tenant}` erases a tenant.
+- Acceptance suite (`examples/acceptance/`): a realistic corpus and 91-95 checks against a
   running node or cluster, in Python with no dependency.
 
 ### Fixed
@@ -31,7 +35,8 @@ wire protocol or the on-disk format; the notes say so.
   refused in user schemas. Data written by 0.1 must be ingested again. Protocol version 6.
   Binary-protocol clients read the reserved fields at the end of each document, and may send
   documents with only their own fields.
-- The OpenAPI description now shows text ids and deletion by filter.
+- The OpenAPI description now shows text ids, deletion by filter and tenants.
+- Text ids cannot contain U+001F.
 
 ## [0.1.0] - 2026-09-28
 

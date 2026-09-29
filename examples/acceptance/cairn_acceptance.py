@@ -9,7 +9,7 @@ of the Docker image: embedding[384], text, source, tags, created, payload), then
 - every filter operator against a locally computed ground truth, and filtered recall;
 - updates;
 - takedowns, never read again through any node;
-- text ids and deletion by filter (0.2);
+- text ids, deletion by filter and tenants (0.2);
 - input errors;
 - administration.
 
@@ -132,7 +132,7 @@ class Api:
         self.ctx = ssl._create_unverified_context() if insecure else None
         self.n = 0
 
-    def call(self, method, path, body=None, key="default", node=None, raw=None):
+    def call(self, method, path, body=None, key="default", node=None, raw=None, tenant=None):
         url = self.urls[self.n % len(self.urls) if node is None else node] + path
         self.n += 1
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
@@ -141,6 +141,8 @@ class Api:
         k = self.key if key == "default" else key
         if k:
             req.add_header("Authorization", f"Bearer {k}")
+        if tenant:
+            req.add_header("Cairn-Tenant", tenant)
         try:
             with urllib.request.urlopen(req, timeout=60, context=self.ctx) as r:
                 text = r.read()
@@ -447,6 +449,60 @@ def run(api, n, rep):
     for body in [{"filter": {}}, {"filter": {"and": []}}]:
         st, _ = api.call("POST", "/v1/documents/delete", body)
         rep.check(f"filter: {json.dumps(body)} would delete everything -> 400", st == 400, f"status {st}")
+
+    # --- tenants (0.2): the same ids in two tenants, isolated; then each tenant erased.
+    # The admin key acts for a tenant through the Cairn-Tenant header.
+    tenants = ["acme-acceptance", "globex-acceptance"]
+    for t in tenants:
+        notes = []
+        for i in range(20):
+            text = f"ocelot note {i} for {t} " + rng.choice(docs)["text"]
+            notes.append({"id": f"note-{i}", "text": text, "embedding": embed(text), "source": "web",
+                          "created": 21000 + i})
+        notes.append({"id": 7, "text": f"ocelot integer id for {t}", "embedding": embed("ocelot"), "source": "web"})
+        st, ack = api.call("POST", "/v1/documents", {"documents": notes, "after": token}, node=0, tenant=t)
+        token = ack["consistency_token"] if st == 200 else token
+    rep.check("tenants: write 21 documents in each of two tenants, same ids", st == 200, f"status {st}")
+    ok = True
+    for node in nodes:
+        for t in tenants:
+            for path in ["note-0", "7"]:
+                st, d = api.call("GET", f"/v1/documents/{path}?after={token}", node=node, tenant=t)
+                ok &= st == 200 and t in d.get("text", "") and "_tenant" not in d
+    rep.check("tenants: each tenant reads its own document under a shared id, on every node", ok)
+    ok = True
+    for node in nodes:
+        for t in tenants:
+            st, res = api.call("POST", "/v1/search", {"k": 1000, "text": {"field": "text", "query": "ocelot"},
+                                                      "after": token}, node=node, tenant=t)
+            hits = res.get("hits", []) if st == 200 else []
+            ok &= len(hits) == 21 and all(t in h["document"]["text"] for h in hits)
+    rep.check("tenants: a search only returns the tenant's documents", ok)
+    st, res = api.call("POST", "/v1/search", {"k": 1000, "text": {"field": "text", "query": "ocelot"},
+                                              "with_documents": False, "after": token})
+    marked = [h.get("_tenant") for h in res.get("hits", [])] if st == 200 else []
+    rep.check("tenants: without a tenant, hits show their tenant",
+              len(marked) == 42 and sorted(set(marked)) == sorted(tenants), f"{len(marked)} hits")
+    st, ack = api.call("DELETE", f"/v1/documents/note-0?after={token}", tenant=tenants[0])
+    token = ack["consistency_token"] if st == 200 else token
+    st0, _ = api.call("GET", f"/v1/documents/note-0?after={token}", tenant=tenants[0])
+    st1, _ = api.call("GET", f"/v1/documents/note-0?after={token}", tenant=tenants[1])
+    rep.check("tenants: a takedown in one tenant leaves the other's document", (st0, st1) == (404, 200),
+              f"{st0} {st1}")
+    st, _ = api.call("GET", "/v1/documents/note-0", tenant="not a tenant!")
+    rep.check("tenants: an invalid tenant name -> 400", st == 400, f"status {st}")
+    counts = []
+    for t in tenants:
+        st, ack = api.call("DELETE", f"/v1/tenants/{t}?after={token}", node=len(api.urls) - 1)
+        counts.append(ack.get("deleted") if st == 200 else st)
+        token = ack["consistency_token"] if st == 200 else token
+    rep.check("tenants: erase each tenant", counts == [20, 21], str(counts))
+    ok = True
+    for node in nodes:
+        st, res = api.call("POST", "/v1/search", {"k": 1000, "text": {"field": "text", "query": "ocelot"},
+                                                  "with_documents": False, "after": token}, node=node)
+        ok &= st == 200 and res["hits"] == []
+    rep.check("tenants: an erased tenant's documents are gone on every node", ok)
 
     # --- consistency levels
     st, _ = api.call("POST", "/v1/search", {"k": 3, "text": {"field": "text", "query": "museum"},

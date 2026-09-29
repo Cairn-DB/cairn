@@ -5,6 +5,11 @@
 //! Documents are flat JSON objects keyed by field name, plus `id`. Writes return a
 //! `consistency_token`; passing it back as `after` gives read-your-writes, which is how an
 //! HTTP client that took a document down makes sure it never reads it again.
+//!
+//! Tenants (ADR 0031): a request acts for one tenant when its key is scoped to it, or when an
+//! unscoped key names one in the `Cairn-Tenant` header. Its documents are then stored under
+//! text ids prefixed with the tenant, carry the tenant in `_tenant`, and every read, search
+//! and deletion is restricted to that tenant.
 
 use axum::extract::{DefaultBodyLimit, Path, Query as UrlQuery, State};
 use axum::http::StatusCode;
@@ -177,14 +182,40 @@ async fn serve_tls(
 #[derive(Clone)]
 struct KeyId(String);
 
+/// The tenant a request acts for (ADR 0031), and whether its key imposes it.
+#[derive(Clone, Default)]
+struct Scope {
+    tenant: Option<String>,
+    from_key: bool,
+}
+
+/// Header through which an unscoped key acts for one tenant.
+const TENANT_HEADER: &str = "cairn-tenant";
+
+fn forbidden(msg: String) -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
+}
+
 /// Checks the `Authorization` header against the node's keys and the role the route needs
-/// (ADR 0030): 401 without a valid key, 403 without the role.
+/// (ADR 0030): 401 without a valid key, 403 without the role. Sets the request's tenant scope.
 async fn authorize(
     State(s): State<Arc<Shared>>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let named = match req.headers().get(TENANT_HEADER).map(|v| v.to_str()) {
+        None => None,
+        Some(Ok(t)) if crate::auth::valid_tenant(t) => Some(t.to_owned()),
+        Some(_) => {
+            return ApiError::bad("Cairn-Tenant: 1 to 128 letters, digits, '_', '.' or '-'")
+                .into_response();
+        }
+    };
     let Some(keys) = &s.cfg.auth else {
+        req.extensions_mut().insert(Scope {
+            tenant: named,
+            from_key: false,
+        });
         return next.run(req).await;
     };
     let Some(role) = crate::auth::required_role(req.method().as_str(), req.uri().path()) else {
@@ -203,23 +234,34 @@ async fn authorize(
             .into_response();
     };
     if !key.allows(role) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": format!("key {:?} lacks the {role:?} role", key.id) })),
-        )
-            .into_response();
+        return forbidden(format!("key {:?} lacks the {role:?} role", key.id));
     }
+    let scope = match (&key.tenant, named) {
+        (Some(own), Some(other)) if *own != other => {
+            return forbidden(format!("key {:?} cannot act for tenant {other:?}", key.id));
+        }
+        (Some(own), _) => Scope {
+            tenant: Some(own.clone()),
+            from_key: true,
+        },
+        (None, named) => Scope {
+            tenant: named,
+            from_key: false,
+        },
+    };
     req.extensions_mut().insert(KeyId(key.id.clone()));
+    req.extensions_mut().insert(scope);
     next.run(req).await
 }
 
 /// Records a takedown: which key asked, for which documents, and the token that proves it
 /// (target `cairn_server::audit`, on by default).
-fn audit_takedown(key: Option<&KeyId>, ids: &[ApiId], resp: &Json<Json_>) {
+fn audit_takedown(key: Option<&KeyId>, scope: &Scope, ids: &[ApiId], resp: &Json<Json_>) {
     let shown: Vec<String> = ids.iter().take(100).map(ApiId::to_string).collect();
     tracing::info!(
         target: "cairn_server::audit",
         key = key.map_or("-", |k| k.0.as_str()),
+        tenant = scope.tenant.as_deref().unwrap_or("-"),
         count = ids.len(),
         ids = %format!("[{}]", shown.join(", ")),
         token = resp.0["consistency_token"].as_str().unwrap_or(""),
@@ -242,6 +284,7 @@ pub fn router(cfg: HttpConfig) -> Router {
         .route("/v1/documents/delete", post(delete_many))
         .route("/v1/documents/{id}", get(get_doc).delete(delete_one))
         .route("/v1/search", post(search))
+        .route("/v1/tenants/{tenant}", axum::routing::delete(erase_tenant))
         .route("/v1/admin/merges", get(merges).post(set_merges))
         .layer(axum::middleware::from_fn_with_state(
             shared.clone(),
@@ -476,6 +519,9 @@ fn api_key(k: &str) -> ApiResult<ApiId> {
             "a text id has 1 to {MAX_KEY_BYTES} bytes"
         )));
     }
+    if k.contains(TENANT_SEP) {
+        return Err(ApiError::bad("a text id cannot contain U+001F"));
+    }
     Ok(ApiId::Key(k.to_owned()))
 }
 
@@ -509,14 +555,70 @@ fn path_id(p: &str, id_type: Option<&str>) -> ApiResult<ApiId> {
     }
 }
 
-fn doc_from_json(schema: &Schema, v: &Json_) -> ApiResult<(ApiId, Document)> {
+/// Separates a tenant from the id in a stored text id (ADR 0031). Client text ids cannot hold
+/// it, so a tenant's ids never meet ids written without a tenant.
+const TENANT_SEP: char = '\u{1f}';
+
+/// The id stored for `id` under `tenant`: a text id `<tenant>U+001F#<digits>` for an integer,
+/// `<tenant>U+001F$<text>` for a text id. Without a tenant, the id itself.
+fn stored_id(tenant: Option<&str>, id: &ApiId) -> ApiId {
+    match (tenant, id) {
+        (None, id) => id.clone(),
+        (Some(t), ApiId::Num(n)) => ApiId::Key(format!("{t}{TENANT_SEP}#{n}")),
+        (Some(t), ApiId::Key(k)) => ApiId::Key(format!("{t}{TENANT_SEP}${k}")),
+    }
+}
+
+/// The id a client wrote, and its tenant, from a stored text id.
+fn split_stored(k: &str) -> (Json_, Option<&str>) {
+    match k.split_once(TENANT_SEP) {
+        None => (json!(k), None),
+        Some((t, rest)) => {
+            let id = match (rest.strip_prefix('#'), rest.strip_prefix('$')) {
+                (Some(d), _) => d.parse::<u64>().map_or_else(|_| json!(d), |n| json!(n)),
+                (None, Some(text)) => json!(text),
+                (None, None) => json!(rest),
+            };
+            (id, Some(t))
+        }
+    }
+}
+
+/// The filter restricting a request to its tenant, if any.
+fn tenant_filter(schema: &Schema, tenant: Option<&str>) -> ApiResult<Option<Predicate>> {
+    let Some(t) = tenant else {
+        return Ok(None);
+    };
+    let field = schema
+        .index_of(cairn_core::schema::TENANT_FIELD)
+        .ok_or_else(|| ApiError::bad("this collection has no tenants"))?;
+    Ok(Some(Predicate::Eq {
+        field,
+        value: Value::Enum(t.to_owned()),
+    }))
+}
+
+/// `p`, restricted to the request's tenant.
+fn scoped(schema: &Schema, tenant: Option<&str>, p: Predicate) -> ApiResult<Predicate> {
+    Ok(match tenant_filter(schema, tenant)? {
+        None => p,
+        Some(t) if matches!(p, Predicate::True) => t,
+        Some(t) => Predicate::And(vec![p, t]),
+    })
+}
+
+/// A document from JSON, with the id it is stored under (see [`stored_id`]).
+fn doc_from_json(schema: &Schema, tenant: Option<&str>, v: &Json_) -> ApiResult<(ApiId, Document)> {
     let obj = v
         .as_object()
         .ok_or_else(|| ApiError::bad("a document is a JSON object"))?;
-    let id = api_id(
-        obj.get("id")
-            .ok_or_else(|| ApiError::bad("a document needs an \"id\""))?,
-    )?;
+    let id = stored_id(
+        tenant,
+        &api_id(
+            obj.get("id")
+                .ok_or_else(|| ApiError::bad("a document needs an \"id\""))?,
+        )?,
+    );
     let mut d = Document::new(
         match id {
             ApiId::Num(n) => DocId(n),
@@ -546,23 +648,47 @@ fn doc_from_json(schema: &Schema, v: &Json_) -> ApiResult<(ApiId, Document)> {
             .ok_or_else(|| ApiError::bad("this collection has no text ids: use integer ids"))?;
         d = d.set(i, Value::Blob(bytes::Bytes::from(k.clone().into_bytes())));
     }
+    if let Some(t) = tenant {
+        let i = schema
+            .index_of(cairn_core::schema::TENANT_FIELD)
+            .ok_or_else(|| ApiError::bad("this collection has no tenants"))?;
+        d = d.set(i, Value::Enum(t.to_owned()));
+    }
     Ok((id, d))
 }
 
-/// The id a client sees: the text id when the document has one, else the integer.
+/// The id a client sees: the id it wrote (without its tenant), else the integer.
 fn id_json(schema: &Schema, d: &Document) -> Json_ {
     if let Some(i) = schema.index_of(cairn_core::schema::KEY_FIELD)
         && let Some(Some(Value::Blob(b))) = d.values.get(i)
         && let Ok(k) = std::str::from_utf8(b)
     {
-        return json!(k);
+        return split_stored(k).0;
     }
     json!(d.id.get())
 }
 
-fn doc_json(schema: &Schema, d: &Document) -> Json_ {
+/// The tenant of a document, if it has one.
+fn tenant_of<'a>(schema: &Schema, d: &'a Document) -> Option<&'a str> {
+    match d
+        .values
+        .get(schema.index_of(cairn_core::schema::TENANT_FIELD)?)
+    {
+        Some(Some(Value::Enum(t))) => Some(t),
+        _ => None,
+    }
+}
+
+/// A document as JSON. Outside a tenant scope, a tenant's document shows its tenant as
+/// `_tenant`; inside one, the tenant is implied.
+fn doc_json(schema: &Schema, scope: &Scope, d: &Document) -> Json_ {
     let mut m = Map::new();
     m.insert("id".into(), id_json(schema, d));
+    if scope.tenant.is_none()
+        && let Some(t) = tenant_of(schema, d)
+    {
+        m.insert(cairn_core::schema::TENANT_FIELD.into(), json!(t));
+    }
     for (f, v) in schema.fields.iter().zip(&d.values) {
         if cairn_core::schema::is_reserved(&f.name) {
             continue;
@@ -685,14 +811,22 @@ fn ack(count: usize, written: &[Token], after: Option<&str>) -> ApiResult<Json<J
     })))
 }
 
+type ScopeExt = Option<axum::Extension<Scope>>;
+
+fn scope_of(e: ScopeExt) -> Scope {
+    e.map(|e| e.0).unwrap_or_default()
+}
+
 async fn upsert(
     State(s): State<Arc<Shared>>,
+    scope: ScopeExt,
     Json(body): Json<UpsertBody>,
 ) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
     let docs = body
         .documents
         .iter()
-        .map(|d| doc_from_json(&s.cfg.schema, d))
+        .map(|d| doc_from_json(&s.cfg.schema, scope.tenant.as_deref(), d))
         .collect::<ApiResult<Vec<_>>>()?;
     if docs.is_empty() {
         return Err(ApiError::bad("no documents"));
@@ -728,11 +862,51 @@ struct DeleteBody {
     after: Option<String>,
 }
 
+/// Splits stored ids into integer and text candidates of a deletion by filter.
+fn delete_scopes(ids: &[ApiId]) -> Vec<DeleteScope> {
+    let (mut nums, mut keys) = (Vec::new(), Vec::new());
+    for id in ids {
+        match id {
+            ApiId::Num(n) => nums.push(DocId(*n)),
+            ApiId::Key(k) => keys.push(k.clone()),
+        }
+    }
+    let mut v = Vec::new();
+    if !nums.is_empty() {
+        v.push(DeleteScope::Ids(nums));
+    }
+    if !keys.is_empty() {
+        v.push(DeleteScope::Keys(keys));
+    }
+    v
+}
+
+/// Runs deletions by filter over each scope: documents removed, and tokens.
+async fn delete_where(
+    s: &Arc<Shared>,
+    scopes: Vec<DeleteScope>,
+    filter: Predicate,
+) -> ApiResult<(u64, Vec<Token>)> {
+    with_client(s, move |c| {
+        let (mut count, mut tokens) = (0, Vec::new());
+        for scope in scopes {
+            let (n, t) = c.delete_where(scope, filter.clone())?;
+            count += n;
+            tokens.extend(t);
+        }
+        Ok((count, tokens))
+    })
+    .await
+}
+
 async fn delete_many(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
+    scope: ScopeExt,
     Json(body): Json<DeleteBody>,
 ) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
+    let tenant = scope.tenant.as_deref();
     let ids = body
         .ids
         .as_ref()
@@ -744,9 +918,9 @@ async fn delete_many(
             return Err(ApiError::bad("no ids"));
         }
         let n = ids.len();
-        let tokens = delete_ids(&s, ids.clone()).await?;
+        let tokens = delete_ids(&s, &scope, &ids).await?;
         let resp = ack(n, &tokens, body.after.as_deref())?;
-        audit_takedown(key.as_deref(), &ids, &resp);
+        audit_takedown(key.as_deref(), &scope, &ids, &resp);
         return Ok(resp);
     };
     let pred = filter(&s.cfg.schema, f)?;
@@ -760,35 +934,13 @@ async fn delete_many(
     let scopes = match &ids {
         None => vec![DeleteScope::All],
         Some(ids) if ids.is_empty() => return Err(ApiError::bad("no ids")),
-        Some(ids) => {
-            let (mut nums, mut keys) = (Vec::new(), Vec::new());
-            for id in ids {
-                match id {
-                    ApiId::Num(n) => nums.push(DocId(*n)),
-                    ApiId::Key(k) => keys.push(k.clone()),
-                }
-            }
-            let mut v = Vec::new();
-            if !nums.is_empty() {
-                v.push(DeleteScope::Ids(nums));
-            }
-            if !keys.is_empty() {
-                v.push(DeleteScope::Keys(keys));
-            }
-            v
-        }
+        Some(ids) => delete_scopes(
+            &ids.iter()
+                .map(|id| stored_id(tenant, id))
+                .collect::<Vec<_>>(),
+        ),
     };
-    let p2 = pred.clone();
-    let (count, tokens) = with_client(&s, move |c| {
-        let (mut count, mut tokens) = (0, Vec::new());
-        for scope in scopes {
-            let (n, t) = c.delete_where(scope, p2.clone())?;
-            count += n;
-            tokens.extend(t);
-        }
-        Ok((count, tokens))
-    })
-    .await?;
+    let (count, tokens) = delete_where(&s, scopes, scoped(&s.cfg.schema, tenant, pred)?).await?;
     let prior = body
         .after
         .as_deref()
@@ -802,6 +954,7 @@ async fn delete_many(
     tracing::info!(
         target: "cairn_server::audit",
         key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        tenant = tenant.unwrap_or("-"),
         filter = %f,
         ids = ids.as_ref().map_or(0, Vec::len),
         count,
@@ -811,14 +964,20 @@ async fn delete_many(
     Ok(resp)
 }
 
-/// Takes down integer and text ids.
-async fn delete_ids(s: &Arc<Shared>, ids: Vec<ApiId>) -> ApiResult<Vec<Token>> {
+/// Takes down integer and text ids. Under a tenant, only those of the tenant's documents: the
+/// ids are the tenant's own, and the deletion is also restricted by `_tenant`.
+async fn delete_ids(s: &Arc<Shared>, scope: &Scope, ids: &[ApiId]) -> ApiResult<Vec<Token>> {
+    let tenant = scope.tenant.as_deref();
+    if let Some(only) = tenant_filter(&s.cfg.schema, tenant)? {
+        let stored: Vec<ApiId> = ids.iter().map(|id| stored_id(tenant, id)).collect();
+        return Ok(delete_where(s, delete_scopes(&stored), only).await?.1);
+    }
     let mut nums = Vec::new();
     let mut keys = Vec::new();
     for id in ids {
         match id {
-            ApiId::Num(n) => nums.push(DocId(n)),
-            ApiId::Key(k) => keys.push(k),
+            ApiId::Num(n) => nums.push(DocId(*n)),
+            ApiId::Key(k) => keys.push(k.clone()),
         }
     }
     with_client(s, move |c| {
@@ -845,24 +1004,71 @@ struct ReadParams {
 async fn delete_one(
     State(s): State<Arc<Shared>>,
     key: Option<axum::Extension<KeyId>>,
+    scope: ScopeExt,
     Path(id): Path<String>,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
     let id = path_id(&id, p.id_type.as_deref())?;
-    let tokens = delete_ids(&s, vec![id.clone()]).await?;
+    let tokens = delete_ids(&s, &scope, std::slice::from_ref(&id)).await?;
     let resp = ack(1, &tokens, p.after.as_deref())?;
-    audit_takedown(key.as_deref(), &[id], &resp);
+    audit_takedown(key.as_deref(), &scope, &[id], &resp);
+    Ok(resp)
+}
+
+/// Erases a tenant: every document it holds (ADR 0031). Unscoped keys only.
+async fn erase_tenant(
+    State(s): State<Arc<Shared>>,
+    key: Option<axum::Extension<KeyId>>,
+    scope: ScopeExt,
+    Path(tenant): Path<String>,
+    UrlQuery(p): UrlQuery<ReadParams>,
+) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
+    if scope.from_key {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "a tenant-scoped key cannot erase a tenant".into(),
+        ));
+    }
+    if !crate::auth::valid_tenant(&tenant) {
+        return Err(ApiError::bad(
+            "a tenant is 1 to 128 letters, digits, '_', '.' or '-'",
+        ));
+    }
+    let only = tenant_filter(&s.cfg.schema, Some(&tenant))?.expect("a tenant");
+    let (count, tokens) = delete_where(&s, vec![DeleteScope::All], only).await?;
+    let prior = p
+        .after
+        .as_deref()
+        .map(parse_tokens)
+        .transpose()?
+        .unwrap_or_default();
+    let resp = Json(json!({
+        "deleted": count,
+        "consistency_token": merge_tokens(&prior, &tokens),
+    }));
+    tracing::info!(
+        target: "cairn_server::audit",
+        key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        tenant,
+        count,
+        token = resp.0["consistency_token"].as_str().unwrap_or(""),
+        "tenant erased"
+    );
     Ok(resp)
 }
 
 async fn get_doc(
     State(s): State<Arc<Shared>>,
+    scope: ScopeExt,
     Path(id): Path<String>,
     UrlQuery(p): UrlQuery<ReadParams>,
 ) -> ApiResult<Response> {
+    let scope = scope_of(scope);
     let id = path_id(&id, p.id_type.as_deref())?;
     let (consistency, tokens) = consistency(p.consistency.as_deref(), p.after.as_deref())?;
-    let req_id = id.clone();
+    let req_id = stored_id(scope.tenant.as_deref(), &id);
     let doc = with_client(&s, move |c| {
         let req = match req_id {
             ApiId::Num(n) => Request::Get {
@@ -885,8 +1091,15 @@ async fn get_doc(
         }
     })
     .await?;
+    // A tenant's ids cannot name another tenant's documents; checked again all the same.
+    let doc = doc.filter(|d| {
+        scope
+            .tenant
+            .as_deref()
+            .is_none_or(|t| tenant_of(&s.cfg.schema, d) == Some(t))
+    });
     Ok(match doc {
-        Some(d) => Json(doc_json(&s.cfg.schema, &d)).into_response(),
+        Some(d) => Json(doc_json(&s.cfg.schema, &scope, &d)).into_response(),
         None => ApiError(StatusCode::NOT_FOUND, format!("no document {id}")).into_response(),
     })
 }
@@ -946,14 +1159,19 @@ fn yes() -> bool {
     true
 }
 
-fn hit_json(schema: &Schema, h: &Hit) -> Json_ {
+fn hit_json(schema: &Schema, scope: &Scope, h: &Hit) -> Json_ {
     let mut m = Map::new();
-    let id = match (&h.key, &h.document) {
-        (Some(k), _) => json!(k),
-        (None, Some(d)) => id_json(schema, d),
-        (None, None) => json!(h.doc_id.get()),
+    let (id, tenant) = match (&h.key, &h.document) {
+        (Some(k), _) => split_stored(k),
+        (None, Some(d)) => (id_json(schema, d), tenant_of(schema, d)),
+        (None, None) => (json!(h.doc_id.get()), None),
     };
     m.insert("id".into(), id);
+    if scope.tenant.is_none()
+        && let Some(t) = tenant
+    {
+        m.insert(cairn_core::schema::TENANT_FIELD.into(), json!(t));
+    }
     m.insert("score".into(), json!(h.score));
     m.insert(
         "legs".into(),
@@ -965,15 +1183,17 @@ fn hit_json(schema: &Schema, h: &Hit) -> Json_ {
         ),
     );
     if let Some(d) = &h.document {
-        m.insert("document".into(), doc_json(schema, d));
+        m.insert("document".into(), doc_json(schema, scope, d));
     }
     Json_::Object(m)
 }
 
 async fn search(
     State(s): State<Arc<Shared>>,
+    scope: ScopeExt,
     Json(body): Json<SearchBody>,
 ) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
     let schema = &s.cfg.schema;
     if body.k == 0 || body.k > 10_000 {
         return Err(ApiError::bad("k must be between 1 and 10000"));
@@ -1018,7 +1238,11 @@ async fn search(
             all_terms: t.all_terms,
         });
     }
-    q.filter = filter(schema, &body.filter)?;
+    let user_filter = filter(schema, &body.filter)?;
+    user_filter
+        .validate(schema)
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+    q.filter = scoped(schema, scope.tenant.as_deref(), user_filter)?;
     if let Some(f) = body.fusion {
         q.fusion = match f {
             FusionBody::Rrf { k } => Fusion::Rrf { k },
@@ -1052,7 +1276,7 @@ async fn search(
     })
     .await?;
     Ok(Json(json!({
-        "hits": hits.iter().map(|h| hit_json(schema, h)).collect::<Vec<_>>()
+        "hits": hits.iter().map(|h| hit_json(schema, &scope, h)).collect::<Vec<_>>()
     })))
 }
 
@@ -1087,26 +1311,66 @@ mod tests {
     }
 
     #[test]
+    fn tenant_documents_are_namespaced() {
+        let sk = schema().with_reserved().unwrap();
+        let acme = Scope {
+            tenant: Some("acme".into()),
+            from_key: true,
+        };
+        for j in [
+            json!({ "id": 7, "n": 1 }),
+            json!({ "id": "doc-7", "n": 1 }),
+            json!({ "id": "12", "n": 1 }),
+        ] {
+            let (id, d) = doc_from_json(&sk, Some("acme"), &j).unwrap();
+            let ApiId::Key(stored) = &id else {
+                panic!("a tenant's ids are stored as text ids");
+            };
+            assert!(stored.starts_with("acme\u{1f}"));
+            assert_eq!(split_stored(stored), (j["id"].clone(), Some("acme")));
+            assert_eq!(tenant_of(&sk, &d), Some("acme"));
+            // Inside the tenant the document reads back as written; outside, with its tenant.
+            assert_eq!(doc_json(&sk, &acme, &d), j);
+            let mut open = j.clone();
+            open["_tenant"] = json!("acme");
+            assert_eq!(doc_json(&sk, &Scope::default(), &d), open);
+            // The same id in another tenant, or without one, is another document.
+            let (other, _) = doc_from_json(&sk, Some("globex"), &j).unwrap();
+            let (plain, _) = doc_from_json(&sk, None, &j).unwrap();
+            assert!(other != id && plain != id);
+        }
+        let only = tenant_filter(&sk, Some("acme")).unwrap().unwrap();
+        assert_eq!(scoped(&sk, Some("acme"), Predicate::True).unwrap(), only);
+        assert_eq!(scoped(&sk, None, Predicate::True).unwrap(), Predicate::True);
+        let p = Predicate::IsNull { field: 2 };
+        assert_eq!(
+            scoped(&sk, Some("acme"), p.clone()).unwrap(),
+            Predicate::And(vec![p, only])
+        );
+    }
+
+    #[test]
     fn documents_round_trip_through_json() {
         let s = schema();
         let j = json!({ "id": 7, "v": [1.0, 2.5], "tags": ["a", "b"], "n": -3, "b": "AAEC" });
-        let (id, d) = doc_from_json(&s, &j).unwrap();
+        let (id, d) = doc_from_json(&s, None, &j).unwrap();
         assert_eq!(id, ApiId::Num(7));
         assert_eq!(d.values[3], Some(Value::Blob(vec![0u8, 1, 2].into())));
-        assert_eq!(doc_json(&s, &d), j);
+        assert_eq!(doc_json(&s, &Scope::default(), &d), j);
         // Text ids (ADR 0031): held in `_key`, returned as the id, reserved names refused.
         let sk = s.with_reserved().unwrap();
         let j = json!({ "id": "doc-7", "n": 2 });
-        let (id, d) = doc_from_json(&sk, &j).unwrap();
+        let (id, d) = doc_from_json(&sk, None, &j).unwrap();
         assert_eq!(id, ApiId::Key("doc-7".into()));
-        assert_eq!(doc_json(&sk, &d), j);
+        assert_eq!(doc_json(&sk, &Scope::default(), &d), j);
         assert!(
-            doc_from_json(&s, &j).is_err(),
+            doc_from_json(&s, None, &j).is_err(),
             "no text ids without the reserved fields"
         );
-        assert!(doc_from_json(&sk, &json!({ "id": "a", "_tenant": "x" })).is_err());
-        assert!(doc_from_json(&sk, &json!({ "id": "" })).is_err());
-        assert!(doc_from_json(&sk, &json!({ "id": 1u64 << 63 })).is_err());
+        assert!(doc_from_json(&sk, None, &json!({ "id": "a", "_tenant": "x" })).is_err());
+        assert!(doc_from_json(&sk, None, &json!({ "id": "" })).is_err());
+        assert!(doc_from_json(&sk, None, &json!({ "id": "a\u{1f}b" })).is_err());
+        assert!(doc_from_json(&sk, None, &json!({ "id": 1u64 << 63 })).is_err());
         assert_eq!(path_id("42", None).unwrap(), ApiId::Num(42));
         assert_eq!(
             path_id("42", Some("text")).unwrap(),
@@ -1114,9 +1378,9 @@ mod tests {
         );
         assert_eq!(path_id("doc-1", None).unwrap(), ApiId::Key("doc-1".into()));
         assert!(path_id("doc-1", Some("int")).is_err());
-        assert!(doc_from_json(&s, &json!({ "id": 1, "v": [1.0] })).is_err());
-        assert!(doc_from_json(&s, &json!({ "id": 1, "nope": 1 })).is_err());
-        assert!(doc_from_json(&s, &json!({ "v": [1.0, 2.0] })).is_err());
+        assert!(doc_from_json(&s, None, &json!({ "id": 1, "v": [1.0] })).is_err());
+        assert!(doc_from_json(&s, None, &json!({ "id": 1, "nope": 1 })).is_err());
+        assert!(doc_from_json(&s, None, &json!({ "v": [1.0, 2.0] })).is_err());
     }
 
     #[test]

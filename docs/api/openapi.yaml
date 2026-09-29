@@ -95,6 +95,24 @@ paths:
                   deleted: { type: integer, description: Documents removed (deletion by filter) }
                   consistency_token: { $ref: "#/components/schemas/Token" }
         "400": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}:
+    delete:
+      summary: Erase a tenant (every document it holds; unscoped keys with the takedown role)
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { $ref: "#/components/schemas/Tenant" } }
+        - { $ref: "#/components/parameters/After" }
+      responses:
+        "200":
+          description: Erased
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: integer }
+                  consistency_token: { $ref: "#/components/schemas/Token" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /v1/documents/{id}:
     parameters:
       - name: id
@@ -178,6 +196,13 @@ components:
     Consistency:
       type: string
       enum: [linearizable, read_your_writes, stale]
+    Tenant:
+      type: string
+      pattern: "^[A-Za-z0-9_.-]{1,128}$"
+      description: >
+        A tenant (ADR 0031). A request acts for one when its key is scoped to it, or when an
+        unscoped key sends it in the `Cairn-Tenant` header; ids, reads, searches and
+        deletions then stay within it.
     Id:
       description: An integer below 2^63, or your own text id of 1 to 1024 bytes (ADR 0031).
       oneOf:
