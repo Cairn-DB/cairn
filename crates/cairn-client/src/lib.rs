@@ -163,6 +163,7 @@ impl Client {
                 | Request::DeleteKeys(_)
                 | Request::GetKey { .. }
                 | Request::DeleteWhere { .. }
+                | Request::DeletionCheck { .. }
                 | Request::Patch { .. },
             ) => Request::In {
                 collection: c.clone(),
@@ -289,6 +290,21 @@ impl Client {
                 Ok((count, tokens))
             }
             other => self.expect_ack(other).map(|t| (0, t)),
+        }
+    }
+
+    /// Proof of deletion (ADR 0031): what every replica of these documents' shards says about
+    /// them, once it has applied `tokens`. Returns the report (JSON).
+    pub fn deletion_check(
+        &mut self,
+        ids: Vec<DocId>,
+        keys: Vec<String>,
+        tokens: Vec<Token>,
+    ) -> Result<String> {
+        match self.call(&Request::DeletionCheck { ids, keys, tokens })? {
+            Response::Proof(json) => Ok(json),
+            Response::Error { message, .. } => Err(Error::Internal(message)),
+            other => Err(Error::Internal(format!("unexpected response {other:?}"))),
         }
     }
 

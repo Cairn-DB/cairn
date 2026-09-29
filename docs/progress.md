@@ -576,8 +576,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   document (seed-100 masks). Chosen: leader resolves in log order (barrier), proposes whole
   documents. Chaos with patches: 3,000 seeds OK (285,094 reads); positive control (no
   barrier) fails at seed 24. Process tests, clients live.
-  - Next: C.3 Kafka ingestion (ADR 0024, proposed): needs a broker to test and a client
-    library; decide the dependency first.
+- 0.3 step C.4, proof of deletion (2026-09-29): signed report from every replica
+  (`/v1/deletions/proof`, `verify-proof`); ADR 0031 "step C.4". Tested (unit + 3 processes incl.
+  a node down).
+- C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
+  first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 
 ## Next step
 Proposed (not scheduled before the public release): ADR 0024, Kafka ingestion with

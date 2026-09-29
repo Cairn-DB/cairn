@@ -95,6 +95,10 @@ struct Cli {
     /// once, and deleted by the shard leaders.
     #[arg(long)]
     expires_field: Option<String>,
+    /// Ed25519 key signing proofs of deletion (ADR 0031); created on first start. Default:
+    /// `<data>/proof-key.pk8`.
+    #[arg(long)]
+    proof_key: Option<PathBuf>,
     /// How often shard leaders delete expired documents (milliseconds; 0: never).
     #[arg(long, default_value_t = 10_000)]
     retention_interval_ms: u64,
@@ -134,6 +138,28 @@ struct Cli {
     /// Drop this fraction of node messages (tests).
     #[arg(long, default_value_t = 0.0)]
     drop_prob: f64,
+}
+
+/// `cairn-server verify-proof <proof.json> [--public-key <base64>]`: checks a proof of deletion
+/// (ADR 0031) and prints its verdict. Exit status 0 only if the signature holds.
+fn verify_proof(args: &[String]) -> anyhow::Result<()> {
+    let (path, key) = match args {
+        [p] => (p, None),
+        [p, flag, k] if flag == "--public-key" => (p, Some(k.as_str())),
+        _ => anyhow::bail!("usage: cairn-server verify-proof <proof.json> [--public-key <base64>]"),
+    };
+    let proof: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let report = cairn_server::proof::verify(&proof, key)?;
+    println!(
+        "signature OK ({}); verdict: {}",
+        if key.is_some() {
+            "with the given public key"
+        } else {
+            "with the key in the proof: pin the node's key with --public-key"
+        },
+        report["verdict"].as_str().unwrap_or("?")
+    );
+    Ok(())
 }
 
 /// `cairn-server keygen <id> <roles> [--tenant <name>]`: prints a new API key and its
@@ -201,6 +227,9 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("keygen") {
         return keygen(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("verify-proof") {
+        return verify_proof(&args[2..]);
     }
     let cli = Cli::parse();
     if let Err(e) = cairn_runtime::raise_open_files_limit() {
@@ -283,7 +312,7 @@ fn main() -> anyhow::Result<()> {
         id: NodeId(cli.node_id),
         listen: cli.listen,
         peers,
-        data_dir: cli.data,
+        data_dir: cli.data.clone(),
         shards: cli.shards,
         replication: cli.replication,
         cores: cli.cores,
@@ -322,6 +351,13 @@ fn main() -> anyhow::Result<()> {
             job_slots: node.job_slots(),
             auth: (!cli.http_insecure_dev).then(|| std::sync::Arc::new(auth)),
             https,
+            proof_key: Some(std::sync::Arc::new(
+                cairn_server::proof::load_or_create_key(
+                    &cli.proof_key
+                        .clone()
+                        .unwrap_or_else(|| cli.data.join("proof-key.pk8")),
+                )?,
+            )),
         })?;
         eprintln!("cairn-server node {} serving HTTP on {addr}", node.id());
     }

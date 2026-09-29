@@ -147,6 +147,8 @@ Consistency levels (`consistency`, on reads and searches):
 | `DELETE /v1/documents/{id}` | takedown | `?after=` | `{"count":1, "consistency_token"}` |
 | `PATCH /v1/documents/{id}` | write | `{"set": {...}, "after"?}` | `{"patched", "consistency_token"}` |
 | `POST /v1/documents/patch` | write | `{"patches": [{"id", "set"}], "after"?}` | `{"patched", "consistency_token"}` |
+| `POST /v1/deletions/proof` | takedown | `{"ids":[...], "after"}` | a signed report (see Proof of deletion) |
+| `GET /v1/deletions/key` | read | | `{"public_key", "algorithm"}` |
 | `POST /v1/documents/delete` | takedown | `{"ids":[...], "after"?}`, or `{"filter":{...}, "ids"?, "after"?}` | `{"count", "consistency_token"}`; with a filter, `{"deleted", "consistency_token"}` |
 | `POST /v1/search` | read | see below | `{"hits":[...]}` |
 | `…/v1/collections/…` | | see Collections | |
@@ -158,6 +160,38 @@ Merge pause (ADR 0028): a paused node starts no new merge. Merges already runnin
 committed in a shard's log, still complete; `merges_running` and `merges_pending` in
 `/v1/status` show when none is left. The call applies to one node: call it on every node to
 pause the cluster. It is an administrative endpoint with no authentication (see Security).
+
+## Proof of deletion
+
+After a takedown, `POST /v1/deletions/proof` asks **every replica** of the documents' shards
+whether it has applied the takedown and still holds them. It answers with a report signed by
+the node (ADR 0031):
+
+```bash
+T=$(curl -s -X DELETE -H "Authorization: Bearer $KEY" localhost:7200/v1/documents/user-42 | jq -r .consistency_token)
+curl -s -H "Authorization: Bearer $KEY" localhost:7200/v1/deletions/proof \
+  -H content-type:application/json -d "{\"ids\": [\"user-42\"], \"after\": \"$T\"}" > proof.json
+cairn-server verify-proof proof.json --public-key "$(curl -s -H "Authorization: Bearer $KEY" localhost:7200/v1/deletions/key | jq -r .public_key)"
+# signature OK (with the given public key); verdict: deleted everywhere
+```
+
+- The report lists, for each document, its shard and its `verdict`. It is `deleted` only if
+  every replica answered, had applied the token, and does not hold the document. Otherwise it
+  is `not proven`, with the reasons: a node that did not answer, a replica not caught up, a
+  replica that still holds the document. For each shard, it lists every replica with its
+  applied index.
+- The report's `verdict` is `deleted everywhere` only if every document is.
+- The signature is Ed25519, over the report serialized as compact JSON with sorted keys.
+  Each node has its own key, created on first start (`--proof-key`, by default
+  `<data>/proof-key.pk8`), and `GET /v1/deletions/key` gives it. Record a node's public key
+  beforehand, and check proofs against it. The key embedded in a proof only shows that the
+  report was not changed after signing.
+- It needs the `takedown` role. Under a tenant, the ids are the tenant's. It is audited
+  (`deletion proof`).
+- What it proves: at the time of the check, no replica serves the document. It does not
+  prove anything about copies outside Cairn (backups, exports, logs). Segment files may keep
+  the deleted bytes until a merge rewrites them: a masked row is never returned, but it is
+  not wiped from disk at once.
 
 ## Partial updates
 

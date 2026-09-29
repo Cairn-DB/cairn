@@ -154,6 +154,36 @@ paths:
                   consistency_token: { $ref: "#/components/schemas/Token" }
         "400": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
+  /v1/deletions/proof:
+    post:
+      summary: Ask every replica whether it applied the takedown and still holds the documents; a report signed by this node (Ed25519)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, minItems: 1, maxItems: 10000, items: { $ref: "#/components/schemas/Id" } }
+                after: { $ref: "#/components/schemas/Token" }
+      responses:
+        "200":
+          description: Signed report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report: { type: object, description: "kind, collection, tenant, token, generated_at_ms, checked_by_node, documents [{id, shard, verdict, reasons}], shards [{shard, min_index, replicas}], verdict" }
+                  signature: { type: string }
+                  public_key: { type: string }
+                  algorithm: { type: string, enum: [Ed25519] }
+  /v1/deletions/key:
+    get:
+      summary: This node's public key for proofs of deletion
+      responses:
+        "200": { description: Key, content: { application/json: { schema: { type: object, properties: { public_key: { type: string }, algorithm: { type: string } } } } } }
   /v1/documents/patch:
     post:
       summary: Change fields of several documents (null clears a field); never creates

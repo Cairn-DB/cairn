@@ -7,5 +7,6 @@ pub mod auth;
 pub mod catalog;
 pub mod http;
 pub mod node;
+pub mod proof;
 
 pub use node::{Node, NodeConfig};

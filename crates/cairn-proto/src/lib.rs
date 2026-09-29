@@ -103,6 +103,29 @@ pub enum Request {
     },
     /// Live collections: answered with their definitions.
     ListCollections,
+    /// Proof of deletion (ADR 0031): ask every replica of the documents' shards whether it has
+    /// applied `tokens` and no longer holds them. Answered with `Proof` (a JSON report).
+    DeletionCheck {
+        /// Integer and internal ids.
+        ids: Vec<DocId>,
+        /// Text ids.
+        keys: Vec<String>,
+        /// The takedown's tokens (per shard).
+        tokens: Vec<Token>,
+    },
+    /// Internal: this node's replica of `shard`, once applied up to `min_index` (or after a
+    /// few seconds), says which of the documents it holds. Answered with `Checked`; never
+    /// forwarded.
+    ReplicaCheck {
+        /// Shard.
+        shard: ShardId,
+        /// Ids.
+        ids: Vec<DocId>,
+        /// Text ids.
+        keys: Vec<String>,
+        /// Index the replica should have applied.
+        min_index: LogIndex,
+    },
     /// Change fields of existing documents (ADR 0031), routed to their shards: answered with
     /// `Patched`. With `shard`, one shard's part (forwarded).
     Patch {
@@ -128,6 +151,16 @@ pub enum Response {
     Legs(Vec<LegList>),
     /// Collection definitions, as JSON.
     Collections(Vec<String>),
+    /// A replica's answer to `ReplicaCheck`: its applied index, and for each id then each text
+    /// id whether it holds the document.
+    Checked {
+        /// Applied index.
+        applied: LogIndex,
+        /// Presence, ids first.
+        present: Vec<bool>,
+    },
+    /// A deletion check's report (JSON).
+    Proof(String),
     /// Patch acknowledged: documents changed, and one token per shard touched.
     Patched {
         /// Documents changed.
@@ -530,6 +563,38 @@ impl Request {
             Request::ListCollections => {
                 w.u8(16);
             }
+            Request::DeletionCheck { ids, keys, tokens } => {
+                w.u8(18).u32(ids.len() as u32);
+                for id in ids {
+                    w.u64(id.get());
+                }
+                w.u32(keys.len() as u32);
+                for k in keys {
+                    w.str(k);
+                }
+                w.u32(tokens.len() as u32);
+                for t in tokens {
+                    enc_token(&mut w, t);
+                }
+            }
+            Request::ReplicaCheck {
+                shard,
+                ids,
+                keys,
+                min_index,
+            } => {
+                w.u8(19)
+                    .u32(shard.get())
+                    .u64(min_index.get())
+                    .u32(ids.len() as u32);
+                for id in ids {
+                    w.u64(id.get());
+                }
+                w.u32(keys.len() as u32);
+                for k in keys {
+                    w.str(k);
+                }
+            }
             Request::Patch { shard, ops } => {
                 w.u8(17)
                     .u32(shard.map_or(u32::MAX, |s| s.get()))
@@ -557,7 +622,8 @@ impl Request {
     /// Decodes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Request> {
         let mut r = Reader::new(bytes);
-        let req = match r.u8()? {
+        let tag = r.u8()?;
+        let req = match tag {
             1 => {
                 let n = r.u32()? as usize;
                 if n > 1 << 20 {
@@ -673,6 +739,45 @@ impl Request {
                 name: r.str()?.to_owned(),
             },
             16 => Request::ListCollections,
+            18 | 19 => {
+                let head = (r.u32()?, 0u64);
+                let (shard, min_index, n) = if tag == 19 {
+                    let min = r.u64()?;
+                    (head.0, min, r.u32()? as usize)
+                } else {
+                    (0, 0, head.0 as usize)
+                };
+                if n > 1 << 20 {
+                    return Err(Error::corruption("check too large"));
+                }
+                let mut ids = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    ids.push(DocId(r.u64()?));
+                }
+                let n = r.u32()? as usize;
+                if n > 1 << 20 {
+                    return Err(Error::corruption("check too large"));
+                }
+                let mut keys = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    keys.push(r.str()?.to_owned());
+                }
+                if tag == 19 {
+                    Request::ReplicaCheck {
+                        shard: ShardId(shard),
+                        ids,
+                        keys,
+                        min_index: LogIndex(min_index),
+                    }
+                } else {
+                    let n = r.u32()? as usize;
+                    let mut tokens = Vec::with_capacity(n.min(1 << 12));
+                    for _ in 0..n {
+                        tokens.push(dec_token(&mut r)?);
+                    }
+                    Request::DeletionCheck { ids, keys, tokens }
+                }
+            }
             17 => {
                 let shard = match r.u32()? {
                     u32::MAX => None,
@@ -759,6 +864,15 @@ impl Response {
                     }
                 }
             }
+            Response::Checked { applied, present } => {
+                w.u8(10).u64(applied.get()).u32(present.len() as u32);
+                for p in present {
+                    w.u8(u8::from(*p));
+                }
+            }
+            Response::Proof(json) => {
+                w.u8(11).str(json);
+            }
             Response::Patched { count, tokens } => {
                 w.u8(9).u64(*count).u32(tokens.len() as u32);
                 for t in tokens {
@@ -843,6 +957,16 @@ impl Response {
                 }
                 Response::Legs(lists)
             }
+            10 => {
+                let applied = LogIndex(r.u64()?);
+                let n = r.u32()? as usize;
+                let mut present = Vec::with_capacity(n.min(1 << 20));
+                for _ in 0..n {
+                    present.push(r.u8()? != 0);
+                }
+                Response::Checked { applied, present }
+            }
+            11 => Response::Proof(r.str()?.to_owned()),
             9 => {
                 let count = r.u64()?;
                 let n = r.u32()? as usize;
@@ -981,6 +1105,17 @@ mod tests {
                 name: "docs".into(),
             },
             Request::ListCollections,
+            Request::DeletionCheck {
+                ids: vec![DocId(1), DocId(9)],
+                keys: vec!["a".into()],
+                tokens: vec![token],
+            },
+            Request::ReplicaCheck {
+                shard: ShardId(4),
+                ids: vec![DocId(2)],
+                keys: vec![],
+                min_index: LogIndex(17),
+            },
             Request::Patch {
                 shard: Some(ShardId(2)),
                 ops: vec![
@@ -1049,6 +1184,11 @@ mod tests {
                 count: 3,
                 tokens: vec![token],
             },
+            Response::Checked {
+                applied: LogIndex(9),
+                present: vec![true, false],
+            },
+            Response::Proof("{}".into()),
             Response::Doc(None),
             Response::Hits(vec![hit]),
             Response::Status(vec![status]),

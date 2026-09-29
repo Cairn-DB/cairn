@@ -375,8 +375,102 @@ fn collections_are_created_used_and_dropped_across_the_cluster() {
     assert_eq!((st, &ack["deleted"]), (200, &json!(4)), "{ack}");
     let after = ack["consistency_token"].as_str().unwrap().to_owned();
 
+    // Proof of deletion (ADR 0031): every replica is asked; signed by the answering node.
+    let proof_body = |ids: Value| json!({ "ids": ids, "after": after });
+    let (st, proof) = http(
+        web[1],
+        "POST",
+        "/v1/collections/notes/deletions/proof",
+        Some(&proof_body(json!(["n0", "n3", "n1"]))),
+    );
+    assert_eq!(st, 200, "{proof}");
+    let report = &proof["report"];
+    assert_eq!(report["verdict"], "not proven", "{report}");
+    assert_eq!(report["collection"], "notes");
+    let docs = report["documents"].as_array().unwrap();
+    assert_eq!(
+        docs.iter().map(|d| d["id"].clone()).collect::<Vec<_>>(),
+        vec![json!("n0"), json!("n3"), json!("n1")]
+    );
+    assert_eq!(docs[0]["verdict"], "deleted");
+    assert_eq!(docs[1]["verdict"], "deleted");
+    assert_eq!(docs[2]["verdict"], "not proven");
+    assert_eq!(
+        docs[2]["reasons"].as_array().unwrap().len(),
+        3,
+        "held on all 3 replicas: {}",
+        docs[2]
+    );
+    for sh in report["shards"].as_array().unwrap() {
+        assert_eq!(sh["replicas"].as_array().unwrap().len(), 3, "{sh}");
+    }
+    let (st, proof) = http(
+        web[1],
+        "POST",
+        "/v1/collections/notes/deletions/proof",
+        Some(&proof_body(json!(["n0", "n3"]))),
+    );
+    assert_eq!(
+        (st, &proof["report"]["verdict"]),
+        (200, &json!("deleted everywhere")),
+        "{proof}"
+    );
+    // The signature checks with the answering node's key, and fails once the report is changed.
+    let (_, key) = http(web[1], "GET", "/v1/deletions/key", None);
+    let key = key["public_key"].as_str().unwrap().to_owned();
+    let file = dir.join("proof.json");
+    std::fs::write(&file, serde_json::to_string_pretty(&proof).unwrap()).unwrap();
+    let verify = |path: &Path, key: &str| {
+        Command::new(env!("CARGO_BIN_EXE_cairn-server"))
+            .arg("verify-proof")
+            .arg(path)
+            .args(["--public-key", key])
+            .output()
+            .unwrap()
+    };
+    let out = verify(&file, &key);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("verdict: deleted everywhere"));
+    let (_, other_key) = http(web[0], "GET", "/v1/deletions/key", None);
+    assert!(
+        !verify(&file, other_key["public_key"].as_str().unwrap())
+            .status
+            .success(),
+        "another node's key"
+    );
+    let mut altered = proof.clone();
+    altered["report"]["documents"][0]["verdict"] = json!("deleted");
+    altered["report"]["collection"] = json!("other");
+    std::fs::write(&file, altered.to_string()).unwrap();
+    assert!(
+        !verify(&file, &key).status.success(),
+        "an altered report verified"
+    );
+
     // Node 3 restarts alone: it starts its replicas of `notes` again from its catalog replica.
+    // While it is down, a proof cannot be complete.
     procs[2] = None;
+    let (st, proof) = http(
+        web[0],
+        "POST",
+        "/v1/collections/notes/deletions/proof",
+        Some(&proof_body(json!(["n0"]))),
+    );
+    assert_eq!(
+        (st, &proof["report"]["verdict"]),
+        (200, &json!("not proven")),
+        "{proof}"
+    );
+    assert!(
+        proof["report"]["documents"][0]["reasons"]
+            .to_string()
+            .contains("node 3 did not answer"),
+        "{proof}"
+    );
     procs[2] = Some(start(2));
     let res = until(
         "restarted node serves notes",

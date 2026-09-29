@@ -20,6 +20,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+/// A deletion check's documents on one shard: ids, text ids, and their positions in the
+/// request.
+type CheckGroup = (Vec<DocId>, Vec<String>, Vec<usize>);
+
 /// Serializes catalog changes on this node (the catalog leader).
 struct CatalogLock;
 
@@ -137,6 +141,13 @@ enum CoreRequest {
         shard: ShardId,
         def: Arc<CollectionDef>,
         reply: CrossSender<bool>,
+    },
+    /// Which of these documents this node's replica holds, once applied up to `min_index`.
+    Check {
+        shard: ShardId,
+        targets: Vec<ReadTarget>,
+        min_index: cairn_core::LogIndex,
+        reply: CrossSender<Result<(cairn_core::LogIndex, Vec<bool>)>>,
     },
     /// Patches documents of a shard this node leads (ADR 0031).
     Patch {
@@ -513,6 +524,7 @@ impl Node {
             | CoreRequest::Status { shard, .. }
             | CoreRequest::Start { shard, .. }
             | CoreRequest::Patch { shard, .. }
+            | CoreRequest::Check { shard, .. }
             | CoreRequest::Stop { shard, .. } => *shard,
             CoreRequest::CatalogRead { .. } => CATALOG_SHARD,
         };
@@ -576,6 +588,7 @@ impl Node {
                 CoreRequest::Status { reply, .. } => reply.send(None),
                 CoreRequest::CatalogRead { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Patch { reply, .. } => reply.send(Err(e())),
+                CoreRequest::Check { reply, .. } => reply.send(Err(e())),
                 CoreRequest::Net { .. } | CoreRequest::Start { .. } | CoreRequest::Stop { .. } => {}
             }
             return;
@@ -624,6 +637,43 @@ impl Node {
             CoreRequest::Patch {
                 ops, guard, reply, ..
             } => rt.spawn(async move { reply.send(h.patch(ops, guard).await) }),
+            CoreRequest::Check {
+                targets,
+                min_index,
+                reply,
+                ..
+            } => {
+                let rt2 = rt.clone();
+                rt.spawn(async move {
+                    let r = async {
+                        // Wait (a few seconds at most) for the takedown to reach this replica.
+                        let t0 = rt2.now();
+                        let mut applied = cairn_core::LogIndex(0);
+                        loop {
+                            if let Some(st) = h.status().await {
+                                applied = st.applied;
+                            }
+                            if applied >= min_index
+                                || rt2.now() - t0 > cairn_core::Duration::from_secs(5)
+                            {
+                                break;
+                            }
+                            rt2.sleep(cairn_core::Duration::from_millis(20)).await;
+                        }
+                        let mut present = Vec::with_capacity(targets.len());
+                        for t in targets {
+                            let d = match t {
+                                ReadTarget::Id(id) => h.get(id, Consistency::Stale).await?,
+                                ReadTarget::Key(k) => h.get_key(k, Consistency::Stale).await?,
+                            };
+                            present.push(d.is_some());
+                        }
+                        Ok((applied, present))
+                    }
+                    .await;
+                    reply.send(r)
+                })
+            }
             CoreRequest::Start { .. } | CoreRequest::Stop { .. } => unreachable!("handled above"),
         }
     }
@@ -944,6 +994,33 @@ impl Node {
             };
         }
         match req {
+            Request::ReplicaCheck {
+                shard,
+                ids,
+                keys,
+                min_index,
+            } => {
+                let targets: Vec<ReadTarget> = ids
+                    .into_iter()
+                    .map(ReadTarget::Id)
+                    .chain(keys.into_iter().map(ReadTarget::Key))
+                    .collect();
+                match Self::send(queues, cores, shard, |reply| CoreRequest::Check {
+                    shard,
+                    targets,
+                    min_index,
+                    reply,
+                })
+                .await
+                {
+                    Some(Ok((applied, present))) => Response::Checked { applied, present },
+                    Some(Err(e)) => Response::from_error(&e),
+                    None => Response::from_error(&Error::Internal("core stopped".into())),
+                }
+            }
+            Request::DeletionCheck { ids, keys, tokens } => {
+                Self::deletion_check(rt, queues, cfg, coll, ids, keys, tokens).await
+            }
             Request::Patch { shard, ops } => {
                 if let Err(e) = check_patch(&coll.schema, &ops) {
                     return Response::from_error(&e);
@@ -1754,6 +1831,131 @@ impl Node {
             }
             Err(e) => Response::from_error(&e),
         }
+    }
+
+    /// Proof of deletion (ADR 0031): every replica of each document's shard says, once it has
+    /// applied the takedown's token, whether it still holds the document. The report lists
+    /// each replica's answer; a document is `deleted` only if every replica answered, had
+    /// applied the token, and does not hold it.
+    #[allow(clippy::too_many_arguments)]
+    async fn deletion_check(
+        rt: &Runtime,
+        queues: &Queues,
+        cfg: &NodeConfig,
+        coll: &CollectionDef,
+        ids: Vec<DocId>,
+        keys: Vec<String>,
+        tokens: Vec<Token>,
+    ) -> Response {
+        let cores = cfg.cores.max(1);
+        // Documents in request order (ids, then text ids), grouped by shard.
+        let mut groups: std::collections::BTreeMap<ShardId, CheckGroup> = Default::default();
+        for (i, id) in ids.iter().enumerate() {
+            let s = match coll.route(*id) {
+                Ok(s) => s,
+                Err(e) => return Response::from_error(&e),
+            };
+            let g = groups.entry(s).or_default();
+            g.0.push(*id);
+            g.2.push(i);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let g = groups.entry(coll.route_key(k)).or_default();
+            g.1.push(k.clone());
+            g.2.push(ids.len() + i);
+        }
+        let total = ids.len() + keys.len();
+        let mut docs: Vec<serde_json::Value> = vec![serde_json::Value::Null; total];
+        let mut shards_out = Vec::new();
+        for (shard, (gids, gkeys, positions)) in groups {
+            let min_index = tokens
+                .iter()
+                .filter(|t| t.shard == shard)
+                .map(|t| t.index)
+                .max()
+                .unwrap_or(cairn_core::LogIndex(0));
+            let mut replicas = Vec::new();
+            // Per document: reasons it is not proven deleted.
+            let mut reasons: Vec<Vec<String>> = vec![Vec::new(); positions.len()];
+            for node in placement(cfg, shard) {
+                let answer = if node == cfg.id {
+                    let targets: Vec<ReadTarget> = gids
+                        .iter()
+                        .copied()
+                        .map(ReadTarget::Id)
+                        .chain(gkeys.iter().cloned().map(ReadTarget::Key))
+                        .collect();
+                    match Self::send(queues, cores, shard, |reply| CoreRequest::Check {
+                        shard,
+                        targets,
+                        min_index,
+                        reply,
+                    })
+                    .await
+                    {
+                        Some(Ok(r)) => Ok(r),
+                        Some(Err(e)) => Err(e.to_string()),
+                        None => Err("core stopped".into()),
+                    }
+                } else {
+                    let req = Request::ReplicaCheck {
+                        shard,
+                        ids: gids.clone(),
+                        keys: gkeys.clone(),
+                        min_index,
+                    };
+                    match Self::forward_once(rt, cfg, node, req).await {
+                        Ok(Response::Checked { applied, present }) => Ok((applied, present)),
+                        Ok(Response::Error { message, .. }) => Err(message),
+                        Ok(other) => Err(format!("unexpected answer {other:?}")),
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                match answer {
+                    Ok((applied, present)) => {
+                        for (j, p) in present.iter().enumerate().take(positions.len()) {
+                            if applied < min_index {
+                                reasons[j].push(format!(
+                                    "node {} has applied {} < {}",
+                                    node.get(),
+                                    applied.get(),
+                                    min_index.get()
+                                ));
+                            } else if *p {
+                                reasons[j].push(format!("node {} still holds it", node.get()));
+                            }
+                        }
+                        replicas.push(serde_json::json!({
+                            "node": node.get(),
+                            "applied": applied.get(),
+                            "holds": positions.iter().zip(&present).filter(|(_, p)| **p).map(|(i, _)| *i).collect::<Vec<_>>(),
+                        }));
+                    }
+                    Err(e) => {
+                        for r in reasons.iter_mut() {
+                            r.push(format!("node {} did not answer: {e}", node.get()));
+                        }
+                        replicas.push(serde_json::json!({ "node": node.get(), "error": e }));
+                    }
+                }
+            }
+            for (j, pos) in positions.iter().enumerate() {
+                docs[*pos] = serde_json::json!({
+                    "shard": shard.get(),
+                    "verdict": if reasons[j].is_empty() { "deleted" } else { "not proven" },
+                    "reasons": reasons[j],
+                });
+            }
+            shards_out.push(serde_json::json!({
+                "shard": shard.get(),
+                "min_index": min_index.get(),
+                "replicas": replicas,
+            }));
+        }
+        Response::Proof(
+            serde_json::json!({ "documents": docs, "shards": shards_out, "checked_by": cfg.id.get() })
+                .to_string(),
+        )
     }
 
     /// Consistency for one shard: read-your-writes uses that shard's token, or no bound.

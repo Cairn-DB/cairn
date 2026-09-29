@@ -392,6 +392,40 @@ and its files. Existing data becomes the `default` collection without migration.
   - retention: an expired document is not patched;
   - both clients' live tests.
 
+### As implemented: step C.4, proof of deletion (2026-09-29)
+
+- **What it proves.** A proof is evidence gathered from the replicas, not an audit log.
+  - The answering node asks every host of each document's shard (`ReplicaCheck`, answered
+    from the local replica, never forwarded). Each host waits a few seconds for its replica
+    to apply the takedown's token, then reports its applied index and which documents it
+    still holds.
+  - A document is `deleted` only if every replica answered, had applied the token, and does
+    not hold it. Otherwise it is `not proven`, with the reason for each replica.
+- **Signature.**
+  - Each node signs the report with its own Ed25519 key (ring, already a dependency), created
+    on first start with owner-only permissions. The public key is at `GET /v1/deletions/key`.
+  - The signature covers the compact JSON of the report with sorted keys, so it can be
+    checked after pretty-printing. `cairn-server verify-proof` checks it.
+  - A verifier should pin the node's key: the key embedded in a proof only shows the report
+    was not changed.
+- **Limits, stated in the API docs:**
+  - it covers Cairn's replicas at the time of the check, not copies elsewhere;
+  - masked rows can remain in segment files until a merge rewrites them;
+  - there is no key rotation or hash chaining of successive proofs yet.
+- **Tested:**
+  - unit: the signature survives re-serialization, and fails on an altered report or
+    another key;
+  - three processes: a mix of deleted and live documents (live ones are reported as held on
+    all 3 replicas), `deleted everywhere` for deleted ones, verification by the CLI with the
+    node's key, a failure with another node's key or an altered report, and `not proven`
+    with a node down.
+
+### Kafka ingestion (step C.3): not started
+
+ADR 0024 is still proposed, and records the owner's plan to build it after the public release
+with the first contributors. It also needs librdkafka (a C dependency) and a broker in CI.
+Left for the owner to decide (2026-09-29).
+
 ## Validation
 
 - **Property tests**: the dictionary assigns the same ids on every replica whatever the order

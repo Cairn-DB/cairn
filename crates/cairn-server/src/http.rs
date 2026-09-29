@@ -49,6 +49,8 @@ pub struct HttpConfig {
     pub auth: Option<Arc<crate::auth::ApiKeys>>,
     /// TLS for the HTTP port itself; `None` serves plain HTTP.
     pub https: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    /// Key signing proofs of deletion (ADR 0031); `None`: the proof route is off.
+    pub proof_key: Option<Arc<ring::signature::Ed25519KeyPair>>,
 }
 
 struct Shared {
@@ -310,6 +312,9 @@ pub fn router(cfg: HttpConfig) -> Router {
         )
         .route("/v1/search", post(search))
         .route("/v1/tenants/{tenant}", axum::routing::delete(erase_tenant))
+        .route("/v1/deletions/proof", post(deletion_proof))
+        .route("/v1/deletions/key", get(proof_key))
+        .route("/v1/collections/{c}/deletions/proof", post(deletion_proof))
         .route(
             "/v1/collections",
             get(list_collections).post(create_collection),
@@ -1241,6 +1246,112 @@ async fn run_patch(
         "patched": count,
         "consistency_token": merge_tokens(&prior, &tokens),
     })))
+}
+
+#[derive(Deserialize)]
+struct ProofBody {
+    ids: Vec<Json_>,
+    /// The takedown's consistency token: each replica must have applied it.
+    #[serde(default)]
+    after: Option<String>,
+}
+
+/// The node's public key for proofs of deletion.
+async fn proof_key(State(s): State<Arc<Shared>>) -> ApiResult<Json<Json_>> {
+    let key = s
+        .cfg
+        .proof_key
+        .as_ref()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no proof key".into()))?;
+    Ok(Json(json!({
+        "public_key": crate::proof::public_key(key),
+        "algorithm": "Ed25519",
+    })))
+}
+
+/// Proof of deletion (ADR 0031): asks every replica of the documents' shards whether it has
+/// applied the takedown (`after`) and still holds them, and returns the report signed by this
+/// node. `verdict` is `deleted everywhere` only if every document is proven deleted.
+async fn deletion_proof(
+    State(s): State<Arc<Shared>>,
+    key: Option<axum::Extension<KeyId>>,
+    scope: ScopeExt,
+    params: Params,
+    Json(body): Json<ProofBody>,
+) -> ApiResult<Json<Json_>> {
+    let scope = scope_of(scope);
+    let coll = collection(&s, &params).await?;
+    let signer = s
+        .cfg
+        .proof_key
+        .clone()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no proof key".into()))?;
+    if body.ids.is_empty() || body.ids.len() > 10_000 {
+        return Err(ApiError::bad("between 1 and 10000 ids"));
+    }
+    let asked = body.ids.iter().map(api_id).collect::<ApiResult<Vec<_>>>()?;
+    let tokens = body
+        .after
+        .as_deref()
+        .map(parse_tokens)
+        .transpose()?
+        .unwrap_or_default();
+    // The node reports ids first, then text ids: remember where each asked id went.
+    let (mut nums, mut keys, mut slots) = (Vec::new(), Vec::new(), Vec::new());
+    for id in &asked {
+        match stored_id(scope.tenant.as_deref(), id) {
+            ApiId::Num(n) => {
+                slots.push((false, nums.len()));
+                nums.push(DocId(n));
+            }
+            ApiId::Key(k) => {
+                slots.push((true, keys.len()));
+                keys.push(k);
+            }
+        }
+    }
+    let n_nums = nums.len();
+    let raw = with_client_in(&s, &coll.name, move |c| {
+        c.deletion_check(nums, keys, tokens)
+    })
+    .await?;
+    let raw: Json_ = serde_json::from_str(&raw)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let checked = raw["documents"].as_array().cloned().unwrap_or_default();
+    let mut documents = Vec::new();
+    let mut all = true;
+    for (id, (is_key, i)) in asked.iter().zip(slots) {
+        let mut d = checked
+            .get(if is_key { n_nums + i } else { i })
+            .cloned()
+            .unwrap_or(Json_::Null);
+        all &= d["verdict"] == "deleted";
+        d["id"] = match id {
+            ApiId::Num(n) => json!(n),
+            ApiId::Key(k) => json!(k),
+        };
+        documents.push(d);
+    }
+    let report = json!({
+        "kind": "cairn-deletion-proof/1",
+        "collection": coll.name,
+        "tenant": scope.tenant,
+        "token": body.after,
+        "generated_at_ms": now_ms(),
+        "checked_by_node": raw["checked_by"],
+        "documents": documents,
+        "shards": raw["shards"],
+        "verdict": if all { "deleted everywhere" } else { "not proven" },
+    });
+    tracing::info!(
+        target: "cairn_server::audit",
+        key = key.as_deref().map_or("-", |k| k.0.as_str()),
+        collection = %coll.name,
+        ids = asked.len(),
+        verdict = report["verdict"].as_str().unwrap_or(""),
+        "deletion proof"
+    );
+    Ok(Json(crate::proof::sign(&signer, report)))
 }
 
 #[derive(Deserialize)]

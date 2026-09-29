@@ -37,6 +37,11 @@ wire protocol or the on-disk format; the notes say so.
   documents. The shard leader resolves each patch in log order into a whole document, so a
   patch is atomic with respect to other writes. Clients: `patch`, `patchMany` / `patch_many`.
 
+- Proof of deletion (ADR 0031): `POST /v1/deletions/proof` asks every replica whether it has
+  applied a takedown and still holds the documents. It returns a report signed with the
+  node's Ed25519 key (`GET /v1/deletions/key`), which `cairn-server verify-proof` checks. A
+  document is proven deleted only if every replica answered and none holds it.
+
 ### Fixed
 - A node forwarding a request to a peer that had restarted waited 10 s on the dead connection
   before retrying. Calls on a connection closed by the peer now fail at once, and the caller

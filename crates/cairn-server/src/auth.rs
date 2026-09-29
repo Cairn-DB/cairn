@@ -299,6 +299,8 @@ pub fn required_role(method: &str, path: &str) -> Option<Role> {
         ("POST", "/v1/documents/patch") => Some(Role::Write),
         ("PATCH", p) if p.starts_with("/v1/documents/") => Some(Role::Write),
         ("POST", "/v1/documents/delete") => Some(Role::Takedown),
+        ("POST", "/v1/deletions/proof") => Some(Role::Takedown),
+        ("GET", "/v1/deletions/key") => Some(Role::Read),
         ("GET", p) if p.starts_with("/v1/documents/") => Some(Role::Read),
         ("DELETE", p) if p.starts_with("/v1/documents/") => Some(Role::Takedown),
         ("DELETE", p) if p.starts_with("/v1/tenants/") => Some(Role::Takedown),
@@ -430,6 +432,15 @@ mod tests {
             required_role("DELETE", "/v1/tenants/acme"),
             Some(Role::Takedown)
         );
+        assert_eq!(
+            required_role("POST", "/v1/deletions/proof"),
+            Some(Role::Takedown)
+        );
+        assert_eq!(
+            required_role("POST", "/v1/collections/c/deletions/proof"),
+            Some(Role::Takedown)
+        );
+        assert_eq!(required_role("GET", "/v1/deletions/key"), Some(Role::Read));
         assert_eq!(required_role("GET", "/v1/status"), Some(Role::Admin));
         assert_eq!(required_role("GET", "/v1/collections"), Some(Role::Read));
         assert_eq!(required_role("POST", "/v1/collections"), Some(Role::Admin));
