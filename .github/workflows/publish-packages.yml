@@ -1,0 +1,73 @@
+# Publishes the clients and integrations to PyPI and npm, from a release tag, by hand
+# (Actions -> publish-packages -> Run workflow, choosing the tag).
+#
+# One-time setup, by the owner (docs/releasing.md, "Packages"):
+# - PyPI: a trusted publisher for each project (cairn-db, langchain-cairn,
+#   llama-index-vector-stores-cairn): repository Cairn-DB/cairn, workflow
+#   publish-packages.yml, environment "pypi". No token is stored.
+# - npm: the organization "cairn-db", and a granular automation token with publish rights on
+#   @cairn-db/*, stored as the repository secret NPM_TOKEN. Packages are published with
+#   provenance.
+name: publish-packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.3.0"
+        required: true
+permissions:
+  contents: read
+jobs:
+  versions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag }}" }
+      - name: Package versions match the tag
+        run: |
+          v="${{ inputs.tag }}"; v="${v#v}"
+          grep -q "^version = \"$v\"" clients/python/pyproject.toml
+          grep -q "^version = \"$v\"" integrations/langchain-cairn/pyproject.toml
+          grep -q "^version = \"$v\"" integrations/llama-index-vector-stores-cairn/pyproject.toml
+          grep -q "\"version\": \"$v\"" clients/typescript/package.json
+          grep -q "\"version\": \"$v\"" integrations/langchain-js/package.json
+  pypi:
+    needs: versions
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install build
+      - run: |
+          for p in clients/python integrations/langchain-cairn integrations/llama-index-vector-stores-cairn; do
+            python -m build "$p" --outdir dist/
+          done
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with: { packages-dir: dist/ }
+  npm:
+    needs: versions
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.tag }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
+      - name: "@cairn-db/client"
+        working-directory: clients/typescript
+        run: npm ci && npm run build && npm publish --access public --provenance
+        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }
+      - name: "@cairn-db/langchain"
+        working-directory: integrations/langchain-js
+        # Depends on the client just published, not on the local path.
+        run: |
+          v=$(node -p 'require("./package.json").version')
+          npm pkg set "devDependencies.@cairn-db/client=$v"
+          npm install --no-audit --no-fund && npm run build && npm publish --access public --provenance
+        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

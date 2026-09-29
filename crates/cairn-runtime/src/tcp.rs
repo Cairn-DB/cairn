@@ -39,10 +39,12 @@ const MAX_FRAME: usize = 64 << 20;
 /// message (ADR 0020); version 4 adds the `CompactCommit` command and the builder in
 /// `FlushCommit` (ADR 0021), which older nodes cannot decode; version 5 adds merge counts and
 /// the pause flag to replica status and the `SetMergesPaused` request; version 6 adds text ids
-/// (ADR 0031): keyed commands and requests, and keys in hits and leg lists.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// (ADR 0031): keyed commands and requests, and keys in hits and leg lists; version 7 adds
+/// deletion by filter, collections, patches and deletion checks (ADR 0031), which 0.2 nodes
+/// cannot decode.
+pub const PROTOCOL_VERSION: u32 = 7;
 /// Oldest protocol version this build still accepts from peers and clients.
-pub const PROTOCOL_MIN: u32 = 6;
+pub const PROTOCOL_MIN: u32 = 7;
 
 /// Writes one frame (one write call: one TLS record for small frames).
 pub fn write_frame(w: &mut impl Write, kind: u8, req: u64, payload: &[u8]) -> std::io::Result<()> {

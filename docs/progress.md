@@ -470,7 +470,7 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
      visibility.
 
 - Release 0.1.0, developer preview (2026-09-28, owner: "go avec la v0.1"): history rewritten
-  by the owner (data/rewrite-consultant.sh, filter-repo) to remove personal details; old -> new
+  by the owner (a filter-repo script, not kept in the repository) to remove personal details; old -> new
   commit ids in docs/history-rewrite-map.txt. Tag v0.1.0 at f0da9f9: release pipeline green
   (verify, signed amd64+arm64 images ghcr.io/cairn-db/cairn:0.1.0 and :0.1, GitHub
   pre-release). Everything is still private. Pending: contact@cairn-db.com reception (an OVH
@@ -579,6 +579,13 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
 - 0.3 step C.4, proof of deletion (2026-09-29): signed report from every replica
   (`/v1/deletions/proof`, `verify-proof`); ADR 0031 "step C.4". Tested (unit + 3 processes incl.
   a node down).
+- 0.3.0 public release (2026-09-29, owner: "ok lance la v 0.3 publique", Kafka left for after):
+  - A/B 0.1.0 vs 0.3.0 on 1M SIFT local (bench-results/release-0.3-ab.md): no regression beyond
+    noise; p99 tails noisy on both. 50M not re-run on 0.3 (would need a GCP go).
+  - 0.2 data opens in 0.3 without migration (checked with a real 0.2.0 node). Protocol 7.
+  - Audit before going public: no secrets or personal data in tree or history (one journal line
+    reworded; the old diff keeps a script name).
+  - publish-packages.yml (PyPI trusted publishing, npm token): needs the owner's accounts.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 

@@ -38,8 +38,27 @@ The `verify` job must pass before anything is published:
    ```bash
    docker pull ghcr.io/cairn-db/cairn:x.y.z
    cosign verify ghcr.io/cairn-db/cairn:x.y.z \
-     --certificate-identity-regexp 'https://github.com/cairn-db/cairn/.github/workflows/release.yml@.*' \
+     --certificate-identity-regexp '(?i)https://github.com/cairn-db/cairn/.github/workflows/release.yml@.*' \
      --certificate-oidc-issuer https://token.actions.githubusercontent.com
    ```
 6. The first time only: make the GHCR package public (package settings → visibility), once the
    repository is public.
+
+## Packages (clients and integrations)
+
+`.github/workflows/publish-packages.yml` publishes, from a release tag, by hand:
+- to PyPI: `cairn-db`, `langchain-cairn` and `llama-index-vector-stores-cairn`;
+- to npm: `@cairn-db/client` and `@cairn-db/langchain`.
+
+Their versions must equal the tag's (the workflow checks).
+
+One-time setup:
+- **PyPI**: for each of the three projects, add a trusted publisher (pypi.org, Publishing →
+  Add a pending publisher): owner `Cairn-DB`, repository `cairn`, workflow
+  `publish-packages.yml`, environment `pypi`. Create the environment `pypi` in the
+  repository settings, ideally with a required reviewer.
+- **npm**: create the organization `cairn-db`, then a granular access token that can publish
+  `@cairn-db/*`, stored as the repository secret `NPM_TOKEN`.
+
+Then: Actions → publish-packages → Run workflow, with the tag (`v0.3.0`). A version cannot be
+published twice on either registry: fix forward with a new version.

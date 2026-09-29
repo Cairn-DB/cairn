@@ -1,8 +1,15 @@
 # Roadmap
 
-Cairn is pre-release. This page lists what comes next, in rough order, and what is known to be
+Cairn is a developer preview (0.3). This page lists what comes next, in rough order, and what is known to be
 missing. Nothing here has a date. An item moves only when its evidence is in
 (`bench-results/`, an ADR, tests). Ideas and objections are welcome in issues.
+
+## Done in 0.2 and 0.3
+
+Text ids, deletion by filter and by parent, tenants enforced by the API key, collections
+created through the API, retention, partial updates, one hit per document, signed proofs of
+deletion, TypeScript and Python clients, LangChain and LlamaIndex vector stores
+([ADR 0031](docs/adr/0031-natural-wiring.md), [CHANGELOG](CHANGELOG.md)).
 
 ## Next
 
@@ -27,13 +34,14 @@ missing. Nothing here has a date. An item moves only when its evidence is in
   asks for it.
 - **Rolling upgrades** across protocol versions, instead of a full-cluster restart.
 - **Operational metrics** (Prometheus) and a small admin console.
-- **Client libraries**: Python and TypeScript over the HTTP API.
+- **Deletion propagation beyond Cairn** ([ADR 0024](docs/adr/0024-kafka-ingestion-and-deletion-propagation.md),
+  proposed, open for discussion): Kafka ingestion with end-to-end read-your-takedown, and a
+  monitor that checks that deletions reached every downstream copy.
+- **Collections**: replication per collection, document counts, adding fields to a schema.
+- **Proofs of deletion**: key rotation, and chaining successive proofs.
 
 ## Later
 
-- **Deletion propagation beyond Cairn** ([ADR 0024](docs/adr/0024-kafka-ingestion-and-deletion-propagation.md),
-  proposed): Kafka ingestion with end-to-end read-your-takedown, and a monitor that checks that
-  deletions reached every downstream copy.
 - **Multi-region** deployments.
 - **Disk-resident indexes by default** for collections larger than memory (DiskANN-style,
   prototyped in ADR 0013).

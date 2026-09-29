@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-index-vector-stores-cairn"
-version = "0.3.0.dev0"
+version = "0.3.0"
 description = "LlamaIndex vector store for Cairn, the hybrid search database where a deletion is final"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["cairn-db>=0.2", "llama-index-core>=0.12"]
+dependencies = ["cairn-db>=0.3", "llama-index-core>=0.12"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

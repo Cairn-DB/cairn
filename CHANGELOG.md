@@ -7,6 +7,14 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-29
+
+First public release, as a developer preview: collections, retention, partial updates, proofs
+of deletion, and LangChain and LlamaIndex integrations (ADR 0031, steps B and C).
+
+**Upgrading from 0.2:** protocol version 7. Stop every node and start them all on 0.3. Data
+written by 0.2 is kept: it becomes the `default` collection, with no migration.
+
 ### Added
 - Collections (ADR 0031): `POST /v1/collections` creates a collection with its own schema and
   shards, and `DELETE /v1/collections/{c}` drops it and deletes its data on every node. Every

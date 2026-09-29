@@ -10,9 +10,11 @@ every replica, and a client holding its consistency token will never read it aga
 any node. Cairn is built for systems that must be able to prove that property, such as RAG
 over regulated data, rights management and permission changes.
 
-> **Status: pre-release.** The engine, replication, HTTP API and Docker image work and are
-> measured at 50 million vectors on a 3-machine cluster (below). It is not production-ready yet:
-> see [Known limits](#known-limits) and the [roadmap](ROADMAP.md). Interfaces may still change.
+> **Status: 0.3, developer preview.** The engine, replication, HTTP API, clients and Docker
+> image work, and the engine is measured at 50 million vectors on a 3-machine cluster (below).
+> It is not production-ready yet: see [Known limits](#known-limits) and the
+> [roadmap](ROADMAP.md). Before 1.0, a minor version may change the API or the on-disk format
+> ([CHANGELOG](CHANGELOG.md)).
 
 ## Why
 
@@ -31,11 +33,36 @@ has dropped it. Cairn replaces that with:
   injected crashes, partitions, slow disks and message loss. 60,000 seeds pass with zero
   safety violations.
 
+## Wiring it into an application
+
+- **Your own ids**: a UUID or `"article/2024-17"`, returned as written.
+- **Collections**, created through the API, each with its schema and shards.
+- **Deletion by filter**: everything of one customer, one source, or one parent document and
+  all its chunks, in one call.
+- **Tenants**: an API key scoped to one tenant only ever reads, searches and deletes that
+  tenant's documents. Erasing a tenant is one call.
+- **Retention**: documents expire at a time you set. They are hidden at once, then deleted.
+- **Partial updates**, atomic with respect to other writes.
+- **One hit per document** in searches over chunks.
+- **Proof of deletion**: every replica is asked whether it still holds a document, and the
+  node signs the report.
+- **Clients and integrations**: TypeScript ([`clients/typescript`](clients/typescript)),
+  Python ([`clients/python`](clients/python)), LangChain for Python and JavaScript, and
+  LlamaIndex ([`integrations/`](integrations)).
+
+```python
+from cairn_db import Client, eq
+db = Client("http://localhost:7200", api_key=KEY)
+db.upsert([{"id": "report-9#0", "parent": "report-9", "text": "...", "embedding": [...]}])
+db.search(text="nuclear", text_field="text", filter=eq("lang", "en"), group_by="parent")
+db.delete(parent="report-9")          # the document and all its chunks, gone on every node
+```
+
 ## Quick start (Docker)
 
 ```bash
-docker build -f docker/Dockerfile -t cairn:dev .                # or podman
-docker run -d --name cairn -p 7200:7200 -v cairn-data:/data cairn:dev
+docker run -d --name cairn -p 7200:7200 -v cairn-data:/data ghcr.io/cairn-db/cairn:0.3
+# or build it: docker build -f docker/Dockerfile -t cairn:dev .   (or podman)
 export KEY=$(docker logs cairn 2>&1 | grep -o 'cairn_[A-Za-z0-9_-]*' | head -1)   # admin key, printed once
 ```
 
@@ -77,6 +104,10 @@ restart: 1,000 per kind from 8 client threads, k = 10
 | takedown visible on all 3 machines, p99 | 102 ms | < 1 s |
 | ingest, 50M rows through Raft | 20,667 docs/s (2,419 s) | |
 
+These figures were measured with 0.1. A local A/B of 0.1 against 0.3 shows no regression
+beyond noise ([bench-results/release-0.3-ab.md](bench-results/release-0.3-ab.md)). A 50M run on
+0.3 has not been done yet.
+
 Other evidence: [Big-ANN filtered track at 10M](bench-results/phase2-yfcc10m.md) (recall@10
 0.9994, p99 ≤ 16.5 ms, one node); [simulation campaigns](bench-results/phase3-campaign.md). Every
 report lists the commands, the hardware and the misses: for instance, run 8 missed the latency
@@ -111,21 +142,20 @@ To check a running node or cluster end to end with realistic data (authenticatio
 field type, search, filters, takedowns on every node), run the
 [acceptance suite](examples/acceptance/README.md).
 
-Clients (not published to npm or PyPI yet):
+Clients:
 - TypeScript and JavaScript: [`clients/typescript`](clients/typescript) (`@cairn-db/client`,
   on `fetch`, no runtime dependency);
 - Python: [`clients/python`](clients/python) (`cairn-db`, sync and async, on `httpx`);
 - Rust: `cairn-client`, over the binary protocol (`Client::new(addrs)`, `upsert`, `delete`,
   `delete_where`, `get`, `query`).
 
-Integrations (0.3, not published yet):
+Integrations:
 - LangChain for Python: [`integrations/langchain-cairn`](integrations/langchain-cairn);
 - LangChain.js: [`integrations/langchain-js`](integrations/langchain-js);
 - LlamaIndex: [`integrations/llama-index-vector-stores-cairn`](integrations/llama-index-vector-stores-cairn).
 
 `clients/test-live.sh` runs the clients' and the integrations' tests against a fresh local
-node. The HTTP API
-works from any language.
+node. The HTTP API works from any language.
 
 ## Design
 
