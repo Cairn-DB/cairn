@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Cairn HTTP API
-  version: "0.2-dev"
+  version: "0.2"
   description: >
     Hybrid search (vectors, BM25, filters) with a deletion guarantee: a takedown is final for
     any read that passes its consistency token as `after`. See docs/api/http.md, ADR 0023 and,

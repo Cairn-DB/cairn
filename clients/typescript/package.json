@@ -1,6 +1,6 @@
 {
   "name": "@cairn-db/client",
-  "version": "0.2.0-dev",
+  "version": "0.2.0",
   "description": "Client for Cairn, the hybrid search database where a deletion is final",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/cairn-db/cairn.git", "directory": "clients/typescript" },

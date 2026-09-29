@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cairn-db"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "Client for Cairn, the hybrid search database where a deletion is final"
 readme = "README.md"
 license = "Apache-2.0"

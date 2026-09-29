@@ -7,6 +7,14 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
+Natural wiring (ADR 0031, step A): your own ids, deletion by filter and by parent, tenants,
+and TypeScript and Python clients.
+
+**Upgrading from 0.1:** the on-disk schema and the protocol changed. Stop every node, start
+0.2 on empty data directories, and ingest again (the server says so if it finds 0.1 data).
+
 ### Added
 - Text ids (ADR 0031): a document's `id` can be your own string. It is returned as written by
   reads and searches, and takedowns accept it, alone or mixed with integer ids. Each shard maps
