@@ -83,4 +83,4 @@ gh label create deletion-guarantee --color b60205 --description "A takedown not 
   needs a login.
 - **npm and PyPI**: accounts and publishers (`docs/releasing.md`, "Packages"), then the
   `publish-packages` workflow with `v0.3.0`.
-- **Announcement**: where and when (a draft is in the journal of 2026-09-29).
+- **Announcement**: where and when (draft: `announcement.md`).
