@@ -532,8 +532,8 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     live), Python 6/6 (4 unit + 2 live, sync and async). CI job `clients` on Node 18 +
     Python 3.9 and Node 22 + Python 3.13.
   - Not run locally: Python 3.9 and Node 18 (uv Python downloads are set to manual on this
-    machine; not changed). The CI matrix is the check, and it has not run yet (nothing
-    pushed since).
+    machine; not changed). The CI matrix is the check: run 36582347306 (commit 2a85ba9),
+    both entries green, live tests run (TypeScript 6/6, Python 6/6, 0 skipped).
   - Not published to npm/PyPI (public release, owner's go).
   - Next: acceptance/CI wrap-up of 0.2 step A, then the 0.2 release decision (owner), then
     step B (collections).
