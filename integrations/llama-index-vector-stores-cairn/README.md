@@ -1,7 +1,11 @@
 # llama-index-vector-stores-cairn
 
-LlamaIndex vector store for [Cairn](https://github.com/cairn-db/cairn), the hybrid search
-database where a deletion is final. Not published to PyPI yet.
+LlamaIndex vector store for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid search
+database where a deletion is final.
+
+```bash
+pip install llama-index-vector-stores-cairn
+```
 
 ```python
 from cairn_db import Client

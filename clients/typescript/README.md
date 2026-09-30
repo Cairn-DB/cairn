@@ -1,11 +1,13 @@
 # @cairn-db/client
 
-TypeScript and JavaScript client for [Cairn](https://github.com/cairn-db/cairn), the hybrid
+TypeScript and JavaScript client for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid
 search database where a deletion is final. It is built on `fetch`, with no runtime
 dependency, and runs on Node 18+, Deno, Bun and browsers. It ships as ESM and CommonJS, with
 types.
 
-Not published to npm yet. Build it from this directory with `npm install && npm run build`.
+```bash
+npm install @cairn-db/client
+```
 
 ```ts
 import { Cairn, eq, range, and_ } from "@cairn-db/client";

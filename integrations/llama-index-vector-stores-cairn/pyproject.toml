@@ -4,12 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-index-vector-stores-cairn"
-version = "0.3.0"
+version = "0.3.1"
 description = "LlamaIndex vector store for Cairn, the hybrid search database where a deletion is final"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["cairn-db>=0.3", "llama-index-core>=0.12"]
+dependencies = ["cairn-db>=0.3.1", "llama-index-core>=0.12"]
+
+keywords = ["cairn", "vector-search", "hybrid-search", "rag", "database", "llama-index"]
+
+[project.urls]
+Homepage = "https://github.com/Cairn-DB/cairn"
+Repository = "https://github.com/Cairn-DB/cairn"
+Issues = "https://github.com/Cairn-DB/cairn/issues"
+Changelog = "https://github.com/Cairn-DB/cairn/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

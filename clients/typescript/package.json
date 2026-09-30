@@ -1,21 +1,36 @@
 {
   "name": "@cairn-db/client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Client for Cairn, the hybrid search database where a deletion is final",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/cairn-db/cairn.git", "directory": "clients/typescript" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cairn-DB/cairn.git",
+    "directory": "clients/typescript"
+  },
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/esm/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/esm/index.d.ts", "default": "./dist/esm/index.js" },
-      "require": { "types": "./dist/cjs/index.d.ts", "default": "./dist/cjs/index.js" }
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
     }
   },
-  "files": ["dist", "README.md"],
-  "engines": { "node": ">=18" },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "sideEffects": false,
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
@@ -23,5 +38,17 @@
   },
   "devDependencies": {
     "typescript": "~5.9.0"
-  }
+  },
+  "homepage": "https://github.com/Cairn-DB/cairn/tree/main/clients/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/Cairn-DB/cairn/issues"
+  },
+  "keywords": [
+    "cairn",
+    "vector-search",
+    "hybrid-search",
+    "rag",
+    "database",
+    "right-to-be-forgotten"
+  ]
 }

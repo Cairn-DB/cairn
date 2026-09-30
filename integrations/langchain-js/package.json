@@ -1,11 +1,11 @@
 {
   "name": "@cairn-db/langchain",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "LangChain.js vector store for Cairn, the hybrid search database where a deletion is final",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cairn-db/cairn.git",
+    "url": "git+https://github.com/Cairn-DB/cairn.git",
     "directory": "integrations/langchain-js"
   },
   "type": "module",
@@ -29,12 +29,26 @@
     "test": "npm run build && node --test test/live.test.mjs"
   },
   "peerDependencies": {
-    "@cairn-db/client": ">=0.3.0",
+    "@cairn-db/client": ">=0.3.1",
     "@langchain/core": ">=0.3.0"
   },
   "devDependencies": {
     "@cairn-db/client": "file:../../clients/typescript",
     "@langchain/core": "^1.0.0",
     "typescript": "~5.9.0"
-  }
+  },
+  "homepage": "https://github.com/Cairn-DB/cairn/tree/main/integrations/langchain-js#readme",
+  "bugs": {
+    "url": "https://github.com/Cairn-DB/cairn/issues"
+  },
+  "keywords": [
+    "cairn",
+    "vector-search",
+    "hybrid-search",
+    "rag",
+    "database",
+    "right-to-be-forgotten",
+    "langchain",
+    "vectorstore"
+  ]
 }

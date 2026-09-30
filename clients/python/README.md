@@ -1,10 +1,12 @@
 # cairn-db
 
-Python client for [Cairn](https://github.com/cairn-db/cairn), the hybrid search database
+Python client for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid search database
 where a deletion is final. It comes in two flavours, sync (`Client`) and async
 (`AsyncClient`), and is typed. Its only dependency is `httpx`.
 
-Not published to PyPI yet. Install it from this directory with `pip install .`.
+```bash
+pip install cairn-db
+```
 
 ```python
 from cairn_db import Client, eq, range_, and_

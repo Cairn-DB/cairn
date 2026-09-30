@@ -1,7 +1,11 @@
 # langchain-cairn
 
-LangChain vector store for [Cairn](https://github.com/cairn-db/cairn), the hybrid search
-database where a deletion is final. Not published to PyPI yet.
+LangChain vector store for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid search
+database where a deletion is final.
+
+```bash
+pip install langchain-cairn
+```
 
 ```python
 from cairn_db import Client

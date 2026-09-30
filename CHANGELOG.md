@@ -7,6 +7,16 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-30
+
+Packaging only: the engine is the same as 0.3.0.
+
+### Changed
+- First versions published to PyPI (`cairn-db`, `langchain-cairn`,
+  `llama-index-vector-stores-cairn`) and npm (`@cairn-db/client`, `@cairn-db/langchain`). Their
+  READMEs give the install commands, and their metadata links to the repository under its
+  current name, `Cairn-DB/cairn`, which npm provenance checks.
+
 ## [0.3.0] - 2026-09-29
 
 First public release, as a developer preview: collections, retention, partial updates, proofs

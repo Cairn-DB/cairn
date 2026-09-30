@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cairn-db"
-version = "0.3.0"
+version = "0.3.1"
 description = "Client for Cairn, the hybrid search database where a deletion is final"
 readme = "README.md"
 license = "Apache-2.0"
@@ -12,8 +12,13 @@ requires-python = ">=3.9"
 dependencies = ["httpx>=0.24"]
 classifiers = ["Typing :: Typed", "Programming Language :: Python :: 3"]
 
+keywords = ["cairn", "vector-search", "hybrid-search", "rag", "database"]
+
 [project.urls]
-Repository = "https://github.com/cairn-db/cairn"
+Homepage = "https://github.com/Cairn-DB/cairn"
+Repository = "https://github.com/Cairn-DB/cairn"
+Issues = "https://github.com/Cairn-DB/cairn/issues"
+Changelog = "https://github.com/Cairn-DB/cairn/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

@@ -4,12 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-cairn"
-version = "0.3.0"
+version = "0.3.1"
 description = "LangChain vector store for Cairn, the hybrid search database where a deletion is final"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["cairn-db>=0.3", "langchain-core>=0.3"]
+dependencies = ["cairn-db>=0.3.1", "langchain-core>=0.3"]
+
+keywords = ["cairn", "vector-search", "hybrid-search", "rag", "database", "langchain"]
+
+[project.urls]
+Homepage = "https://github.com/Cairn-DB/cairn"
+Repository = "https://github.com/Cairn-DB/cairn"
+Issues = "https://github.com/Cairn-DB/cairn/issues"
+Changelog = "https://github.com/Cairn-DB/cairn/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

@@ -197,7 +197,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cairn-bench"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-bench-gen"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cairn-core",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-index"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-query"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-raft"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-runtime"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-sim"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "cairn-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "cairn-core",

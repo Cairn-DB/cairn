@@ -68,6 +68,7 @@ jobs:
         # Depends on the client just published, not on the local path.
         run: |
           v=$(node -p 'require("./package.json").version')
+          for i in $(seq 30); do npm view "@cairn-db/client@$v" version && break; sleep 10; done
           npm pkg set "devDependencies.@cairn-db/client=$v"
           npm install --no-audit --no-fund && npm run build && npm publish --access public --provenance
         env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

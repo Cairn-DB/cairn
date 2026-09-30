@@ -1,7 +1,11 @@
 # @cairn-db/langchain
 
-LangChain.js vector store for [Cairn](https://github.com/cairn-db/cairn), the hybrid search
-database where a deletion is final. ESM, Node 20+. Not published to npm yet.
+LangChain.js vector store for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid search
+database where a deletion is final. ESM, Node 20+.
+
+```bash
+npm install @cairn-db/langchain @cairn-db/client @langchain/core
+```
 
 ```ts
 import { Cairn } from "@cairn-db/client";
