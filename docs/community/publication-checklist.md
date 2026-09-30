@@ -81,6 +81,7 @@ gh label create deletion-guarantee --color b60205 --description "A takedown not 
 - **GHCR package visibility**: github.com/orgs/Cairn-DB/packages → `cairn` → Package
   settings → Change visibility → Public. Until then, `docker run ghcr.io/cairn-db/cairn:0.3`
   needs a login.
-- **npm and PyPI**: accounts and publishers (`docs/releasing.md`, "Packages"), then the
-  `publish-packages` workflow with `v0.3.0`.
+- ~~npm and PyPI~~: done on 2026-09-30, from `v0.3.2`. On PyPI, `cairn-db` was refused (see
+  CHANGELOG 0.3.2), and the client is `cairn-db-client`. Next, optionally: npm trusted
+  publishing, which would remove the `NPM_TOKEN` secret.
 - **Announcement**: where and when (draft: `announcement.md`).

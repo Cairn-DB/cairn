@@ -596,6 +596,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   exists, an unrelated serverless DB by Quadratic-Labs); Python client renamed
   `cairn-db-client` (import `cairn_db`) in 0.3.2, the first version for PyPI/npm. 0.3.1 never
   published to registries.
+- Packages published 2026-09-30 (publish-packages run 36698669795, tag v0.3.2): PyPI
+  cairn-db-client, langchain-cairn, llama-index-vector-stores-cairn (trusted publishing, one
+  environment each); npm @cairn-db/client, @cairn-db/langchain (token + provenance; npm took
+  ~4.5 min to serve a new org's package). Verified from the registries: fresh pip/npm installs,
+  signatures and attestations verified, PyPI client end to end against a local node.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 
