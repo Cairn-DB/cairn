@@ -129,6 +129,18 @@ export interface Collection {
   schema: { fields: { name: string; kind: unknown }[] };
 }
 
+/** A signed proof of deletion (see `proveDeletion`). */
+export interface DeletionProof {
+  report: {
+    verdict: "deleted everywhere" | "not proven";
+    documents: { id: Id; shard: number; verdict: "deleted" | "not proven"; reasons: string[] }[];
+    [key: string]: unknown;
+  };
+  signature: string;
+  public_key: string;
+  algorithm: "Ed25519";
+}
+
 export interface CairnOptions {
   /** One node's address, or several: requests rotate among them on failure. */
   url: string | string[];
@@ -368,6 +380,14 @@ export class Cairn {
     };
     this.observe(r.consistency_token);
     return { count: r.count, deleted: r.deleted, token: r.consistency_token };
+  }
+
+  /** Asks every replica whether it still holds these documents, once it has applied this
+   * client's takedowns, and returns the node's signed report. `report.verdict` is
+   * `"deleted everywhere"` only if every document is gone from every replica. Needs the
+   * takedown role. */
+  async proveDeletion(ids: Id[]): Promise<DeletionProof> {
+    return (await this.call("POST", `${this.base}/deletions/proof`, this.after({ ids }))) as DeletionProof;
   }
 
   /** Erases a tenant: every document it holds (unscoped keys with the takedown role). */

@@ -55,6 +55,8 @@ def test_client_against_a_live_node():
     assert db.get("007") is None and db.get(42)["n"] == 43
     assert db.delete(ids=[42]).count == 1
     assert db.get(42) is None
+    proof = db.prove_deletion(["doc-1#0", 42])
+    assert proof["report"]["verdict"] == "deleted everywhere" and proof["algorithm"] == "Ed25519"
 
     with pytest.raises(c.InvalidInputError):
         db.upsert([{"id": 1, "nope": 1}])

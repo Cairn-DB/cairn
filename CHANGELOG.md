@@ -7,6 +7,15 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+### Added
+- Clients: `prove_deletion(ids)` (Python) and `proveDeletion(ids)` (TypeScript) request a
+  signed proof of deletion.
+
+### Fixed
+- Python client: `with_tenant()` and `collection()` created a new connection pool on each call,
+  so a web server making one view per request opened one pool per request. Views now share
+  their parent's pool.
+
 ## [0.3.2] - 2026-09-30
 
 Packaging only: the engine is the same as 0.3.0.

@@ -107,3 +107,13 @@ def test_async_client():
         assert json.loads(calls[2].content)["after"] == "2.3"
         await db.aclose()
     asyncio.run(run())
+
+
+def test_views_share_the_connection_pool():
+    root = c.Client("http://a")
+    view = root.with_tenant("acme").collection("notes")
+    assert view._http is root._http
+    view.close()
+    assert not root._http.is_closed, "closing a view keeps the shared pool"
+    root.close()
+    assert root._http.is_closed

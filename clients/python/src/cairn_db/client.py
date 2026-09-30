@@ -121,11 +121,18 @@ class Client(_Base):
     """
 
     def __init__(self, url: Union[str, Sequence[str]], api_key: Optional[str] = None, **kw: Any) -> None:
+        shared = kw.pop("_http", None)
         super().__init__(url, api_key, **kw)
-        self._http = httpx.Client(timeout=self._timeout)
+        # Views (`with_tenant`, `collection`) share their parent's connection pool: making one
+        # per request in a web server costs nothing. Only the client that created the pool
+        # closes it.
+        self._owns_http = shared is None
+        self._http = shared or httpx.Client(timeout=self._timeout)
 
     def close(self) -> None:
-        self._http.close()
+        """Closes the connection pool (a view leaves its parent's pool open)."""
+        if self._owns_http:
+            self._http.close()
 
     def __enter__(self) -> "Client":
         return self
@@ -135,11 +142,11 @@ class Client(_Base):
 
     def with_tenant(self, tenant: str) -> "Client":
         """A view acting for ``tenant`` (unscoped keys), sharing this client's token."""
-        return Client(**self._view_args(tenant=tenant))
+        return Client(**self._view_args(tenant=tenant), _http=self._http)
 
     def collection(self, name: str) -> "Client":
         """A view acting on collection ``name``, sharing this client's token and tenant."""
-        return Client(**self._view_args(collection=name))
+        return Client(**self._view_args(collection=name), _http=self._http)
 
     def create_collection(
         self,
@@ -256,6 +263,16 @@ class Client(_Base):
         self.observe(r["consistency_token"])
         return delete_result(r)
 
+    def prove_deletion(self, ids: Sequence[Id]) -> dict[str, Any]:
+        """Asks every replica whether it still holds these documents, once it has applied this
+        client's takedowns, and returns the node's signed report: ``{"report", "signature",
+        "public_key", "algorithm"}``. ``report["verdict"]`` is ``"deleted everywhere"`` only if
+        every document is gone from every replica. Needs the takedown role."""
+        body: dict[str, Any] = {"ids": list(ids)}
+        if self.token:
+            body["after"] = self.token
+        return self._call("POST", f"{self._base}/deletions/proof", body)
+
     def forget_tenant(self, tenant: str) -> DeleteResult:
         """Erases a tenant: every document it holds (unscoped keys with the takedown role)."""
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""
@@ -272,11 +289,18 @@ class AsyncClient(_Base):
     """The same API as :class:`Client`, with ``async`` methods."""
 
     def __init__(self, url: Union[str, Sequence[str]], api_key: Optional[str] = None, **kw: Any) -> None:
+        shared = kw.pop("_http", None)
         super().__init__(url, api_key, **kw)
-        self._http = httpx.AsyncClient(timeout=self._timeout)
+        # Views (`with_tenant`, `collection`) share their parent's connection pool: making one
+        # per request in a web server costs nothing. Only the client that created the pool
+        # closes it.
+        self._owns_http = shared is None
+        self._http = shared or httpx.AsyncClient(timeout=self._timeout)
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        """Closes the connection pool (a view leaves its parent's pool open)."""
+        if self._owns_http:
+            await self._http.aclose()
 
     async def __aenter__(self) -> "AsyncClient":
         return self
@@ -286,11 +310,11 @@ class AsyncClient(_Base):
 
     def with_tenant(self, tenant: str) -> "AsyncClient":
         """A view acting for ``tenant`` (unscoped keys), sharing this client's token."""
-        return AsyncClient(**self._view_args(tenant=tenant))
+        return AsyncClient(**self._view_args(tenant=tenant), _http=self._http)
 
     def collection(self, name: str) -> "AsyncClient":
         """A view acting on collection ``name``, sharing this client's token and tenant."""
-        return AsyncClient(**self._view_args(collection=name))
+        return AsyncClient(**self._view_args(collection=name), _http=self._http)
 
     async def create_collection(
         self,
@@ -392,6 +416,12 @@ class AsyncClient(_Base):
         r = await self._call("POST", f"{self._base}/documents/delete", body)
         self.observe(r["consistency_token"])
         return delete_result(r)
+
+    async def prove_deletion(self, ids: Sequence[Id]) -> dict[str, Any]:
+        body: dict[str, Any] = {"ids": list(ids)}
+        if self.token:
+            body["after"] = self.token
+        return await self._call("POST", f"{self._base}/deletions/proof", body)
 
     async def forget_tenant(self, tenant: str) -> DeleteResult:
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""
