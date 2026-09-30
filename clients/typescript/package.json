@@ -1,6 +1,6 @@
 {
   "name": "@cairn-db/client",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Client for Cairn, the hybrid search database where a deletion is final",
   "license": "Apache-2.0",
   "repository": {

@@ -1,4 +1,4 @@
-"""``cairn-db``: the Cairn HTTP API from Python, sync and async (ADR 0031)."""
+"""``cairn-db-client`` (imported as ``cairn_db``): the Cairn HTTP API from Python, sync and async (ADR 0031)."""
 
 from ._core import (
     AuthenticationError,
@@ -27,7 +27,7 @@ from ._core import (
 )
 from .client import AsyncClient, Client
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = [
     "AsyncClient", "AuthenticationError", "CairnError", "Client", "Consistency", "DeleteResult",

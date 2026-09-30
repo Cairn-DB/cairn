@@ -7,6 +7,16 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-30
+
+Packaging only: the engine is the same as 0.3.0.
+
+### Changed
+- The Python client is published on PyPI as `cairn-db-client`, and imported as `cairn_db` as
+  before. PyPI refuses `cairn-db` because `cairndb`, an unrelated project, already exists and
+  PyPI treats the two names as the same. 0.3.1 was never published to PyPI or npm; 0.3.2 is
+  the first version there.
+
 ## [0.3.1] - 2026-09-30
 
 Packaging only: the engine is the same as 0.3.0.

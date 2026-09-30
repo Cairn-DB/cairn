@@ -1,11 +1,11 @@
-# cairn-db
+# cairn-db-client
 
 Python client for [Cairn](https://github.com/Cairn-DB/cairn), the hybrid search database
 where a deletion is final. It comes in two flavours, sync (`Client`) and async
 (`AsyncClient`), and is typed. Its only dependency is `httpx`.
 
 ```bash
-pip install cairn-db
+pip install cairn-db-client
 ```
 
 ```python

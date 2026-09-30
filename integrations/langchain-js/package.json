@@ -1,6 +1,6 @@
 {
   "name": "@cairn-db/langchain",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "LangChain.js vector store for Cairn, the hybrid search database where a deletion is final",
   "license": "Apache-2.0",
   "repository": {
@@ -29,7 +29,7 @@
     "test": "npm run build && node --test test/live.test.mjs"
   },
   "peerDependencies": {
-    "@cairn-db/client": ">=0.3.1",
+    "@cairn-db/client": ">=0.3.2",
     "@langchain/core": ">=0.3.0"
   },
   "devDependencies": {

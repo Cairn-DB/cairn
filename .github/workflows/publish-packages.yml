@@ -2,7 +2,7 @@
 # (Actions -> publish-packages -> Run workflow, choosing the tag).
 #
 # One-time setup, by the owner (docs/releasing.md, "Packages"):
-# - PyPI: a trusted publisher for each project (cairn-db, langchain-cairn,
+# - PyPI: a trusted publisher for each project (cairn-db-client, langchain-cairn,
 #   llama-index-vector-stores-cairn): repository Cairn-DB/cairn, workflow
 #   publish-packages.yml, environment "pypi". No token is stored.
 # - npm: the organization "cairn-db", and a granular automation token with publish rights on

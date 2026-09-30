@@ -47,7 +47,7 @@ The `verify` job must pass before anything is published:
 ## Packages (clients and integrations)
 
 `.github/workflows/publish-packages.yml` publishes, from a release tag, by hand:
-- to PyPI: `cairn-db`, `langchain-cairn` and `llama-index-vector-stores-cairn`;
+- to PyPI: `cairn-db-client`, `langchain-cairn` and `llama-index-vector-stores-cairn`;
 - to npm: `@cairn-db/client` and `@cairn-db/langchain`.
 
 Their versions must equal the tag's (the workflow checks).

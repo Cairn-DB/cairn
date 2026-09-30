@@ -591,6 +591,11 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     force-push/deletion), 13 labels, issues #1-#11, org profile repo Cairn-DB/.github, org
     description. Left to the owner: GHCR package visibility (UI only; anonymous pull 401 until
     then), npm/PyPI accounts + publish-packages run, announcement.
+- 0.3.1 / 0.3.2 (2026-09-30), packaging only: package metadata fixed for first publication
+  (READMEs, Cairn-DB URLs for npm provenance). PyPI refused `cairn-db` ("too similar": `cairndb`
+  exists, an unrelated serverless DB by Quadratic-Labs); Python client renamed
+  `cairn-db-client` (import `cairn_db`) in 0.3.2, the first version for PyPI/npm. 0.3.1 never
+  published to registries.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 

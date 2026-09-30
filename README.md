@@ -145,7 +145,7 @@ field type, search, filters, takedowns on every node), run the
 Clients:
 - TypeScript and JavaScript: [`clients/typescript`](clients/typescript) (`@cairn-db/client`,
   on `fetch`, no runtime dependency);
-- Python: [`clients/python`](clients/python) (`cairn-db`, sync and async, on `httpx`);
+- Python: [`clients/python`](clients/python) (`pip install cairn-db-client`, sync and async, on `httpx`);
 - Rust: `cairn-client`, over the binary protocol (`Client::new(addrs)`, `upsert`, `delete`,
   `delete_where`, `get`, `query`).
 

@@ -252,7 +252,7 @@ Both clients share one design and live in this repository, tested in CI against 
   - built on `fetch`, with no runtime dependency, for Node 18+, Deno and Bun;
   - types generated from the OpenAPI description, under a hand-written ergonomic layer;
   - ESM and CommonJS.
-- **Python** `cairn-db` (PyPI):
+- **Python** `cairn-db-client` (PyPI; `cairndb`, another project, makes `cairn-db` unavailable):
   - built on `httpx`, sync and async, typed (dataclasses and `TypedDict`);
   - `httpx` is the only dependency.
 - **Shared behaviour**:
