@@ -7,14 +7,24 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-30
+
+Clients and documentation: the engine is the same as 0.3.0.
+
 ### Added
+- A developer guide, `docs/guide/`, from `docker run` to a multi-customer RAG backend that
+  proves its deletions. Every sample runs against a live node in the tests
+  (`examples/guide/walkthrough.py`). FastAPI and Express recipes are in `examples/`.
 - Clients: `prove_deletion(ids)` (Python) and `proveDeletion(ids)` (TypeScript) request a
-  signed proof of deletion.
+  signed proof of deletion, and `deletion_key()` / `deletionKey()` fetch the node's public
+  key.
 
 ### Fixed
 - Python client: `with_tenant()` and `collection()` created a new connection pool on each call,
   so a web server making one view per request opened one pool per request. Views now share
   their parent's pool.
+- Python client: tokens merged by threads writing at the same time could be lost, and a later
+  read could then miss a write. The merge is now locked.
 
 ## [0.3.2] - 2026-09-30
 

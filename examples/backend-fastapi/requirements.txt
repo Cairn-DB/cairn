@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn>=0.29
+cairn-db-client>=0.3.3
+fastembed>=0.3

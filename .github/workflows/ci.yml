@@ -42,7 +42,7 @@ jobs:
       - run: pip install "httpx>=0.24" pytest
       # LangChain and LlamaIndex adapters: Python 3.10+ and Node 20+.
       - if: matrix.adapters
-        run: pip install langchain-core llama-index-core
+        run: pip install langchain-core llama-index-core fastapi
       - run: cd clients/typescript && npm ci --no-audit --no-fund && npm run build
       - run: clients/test-live.sh
   # Deterministic simulation: replicas, crashes, partitions, snapshots, takedowns.

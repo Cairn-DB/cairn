@@ -390,6 +390,12 @@ export class Cairn {
     return (await this.call("POST", `${this.base}/deletions/proof`, this.after({ ids }))) as DeletionProof;
   }
 
+  /** The answering node's public key (base64 Ed25519) for its proofs of deletion. Fetch it
+   * once from each node and keep it: check proofs against it. */
+  async deletionKey(): Promise<string> {
+    return ((await this.call("GET", "/v1/deletions/key")) as { public_key: string }).public_key;
+  }
+
   /** Erases a tenant: every document it holds (unscoped keys with the takedown role). */
   async forgetTenant(tenant: string): Promise<DeleteResult> {
     const q = this.box.value ? `?after=${encodeURIComponent(this.box.value)}` : "";

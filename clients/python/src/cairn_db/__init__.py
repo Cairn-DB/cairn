@@ -27,7 +27,7 @@ from ._core import (
 )
 from .client import AsyncClient, Client
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 __all__ = [
     "AsyncClient", "AuthenticationError", "CairnError", "Client", "Consistency", "DeleteResult",

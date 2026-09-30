@@ -109,6 +109,18 @@ def test_async_client():
     asyncio.run(run())
 
 
+def test_token_merges_from_threads_are_not_lost():
+    import threading as th
+
+    box = c._core.TokenBox()
+    threads = [th.Thread(target=lambda s=s: [box.observe(f"{s}.{i}") for i in range(1, 2001)]) for s in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert box.value == ",".join(f"{s}.2000" for s in range(8))
+
+
 def test_views_share_the_connection_pool():
     root = c.Client("http://a")
     view = root.with_tenant("acme").collection("notes")

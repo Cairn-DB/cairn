@@ -50,6 +50,7 @@ test("the client against a live node", { skip }, async () => {
   assert.equal(await db.get(42), null);
   const proof = await db.proveDeletion(["doc-1#0", 42]);
   assert.equal(proof.report.verdict, "deleted everywhere");
+  assert.equal(await db.deletionKey(), proof.public_key);
 
   // Typed errors.
   await assert.rejects(db.upsert([{ id: 1, nope: 1 }]), InvalidInputError);

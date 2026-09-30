@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Optional, Sequence, TypedDict, Union
@@ -178,13 +179,17 @@ def merge_tokens(*tokens: Optional[str]) -> str:
 
 
 class TokenBox:
-    """Token state shared by a client and its tenant views."""
+    """Token state shared by a client and its tenant views. The merge is locked: threads that
+    write at the same time must not lose each other's tokens, or a later read could miss a
+    write."""
 
     def __init__(self, value: str = "") -> None:
         self.value = value
+        self._lock = threading.Lock()
 
     def observe(self, token: str) -> None:
-        self.value = merge_tokens(self.value, token)
+        with self._lock:
+            self.value = merge_tokens(self.value, token)
 
 
 def collection_base(collection: Optional[str]) -> str:

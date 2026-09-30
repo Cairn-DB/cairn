@@ -273,6 +273,12 @@ class Client(_Base):
             body["after"] = self.token
         return self._call("POST", f"{self._base}/deletions/proof", body)
 
+    def deletion_key(self) -> str:
+        """The answering node's public key (base64 Ed25519) for its proofs of deletion. Fetch it
+        once from each node and keep it: check proofs against it, not against the key a
+        proof carries."""
+        return self._call("GET", "/v1/deletions/key")["public_key"]
+
     def forget_tenant(self, tenant: str) -> DeleteResult:
         """Erases a tenant: every document it holds (unscoped keys with the takedown role)."""
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""
@@ -422,6 +428,9 @@ class AsyncClient(_Base):
         if self.token:
             body["after"] = self.token
         return await self._call("POST", f"{self._base}/deletions/proof", body)
+
+    async def deletion_key(self) -> str:
+        return (await self._call("GET", "/v1/deletions/key"))["public_key"]
 
     async def forget_tenant(self, tenant: str) -> DeleteResult:
         q = f"?after={urllib.parse.quote(self.token)}" if self.token else ""

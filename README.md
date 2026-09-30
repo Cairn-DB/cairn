@@ -58,6 +58,9 @@ db.search(text="nuclear", text_field="text", filter=eq("lang", "en"), group_by="
 db.delete(parent="report-9")          # the document and all its chunks, gone on every node
 ```
 
+**New to Cairn?** The [developer guide](docs/guide/README.md) goes from `docker run` to a
+multi-customer RAG backend that proves its deletions, with FastAPI and Express recipes.
+
 ## Quick start (Docker)
 
 ```bash

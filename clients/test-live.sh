@@ -58,5 +58,18 @@ if "$py" -c "import langchain_core, llama_index.core, httpx, pytest" 2>/dev/null
 else
   echo "== adapters skipped: $py lacks langchain-core or llama-index-core (set CAIRN_PY)" >&2
 fi
+# The developer guide's samples and its recipes (docs/guide/).
+echo "== Guide walkthrough" >&2
+(cd "$root" && CAIRN_ADMIN_KEY="$admin" PYTHONPATH=clients/python/src python3 examples/guide/walkthrough.py) || status=1
+if "$py" -c "import fastapi" 2>/dev/null; then
+  echo "== FastAPI recipe" >&2
+  (cd "$root/examples/backend-fastapi" && CAIRN_ADMIN_KEY="$admin" PYTHONPATH="$root/clients/python/src" \
+    "$py" -m pytest -q -p no:cacheprovider test_app.py) || status=1
+else
+  echo "== FastAPI recipe skipped: $py lacks fastapi" >&2
+fi
+echo "== Express recipe" >&2
+(cd "$root/examples/backend-express" && { [[ -d node_modules ]] || npm install --no-audit --no-fund; } \
+  && CAIRN_ADMIN_KEY="$admin" npm test) || status=1
 [[ $status == 0 ]] || { echo "== node log" >&2; tail -50 "$work/node.log" >&2; }
 exit $status
