@@ -609,6 +609,18 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   from the published packages only.
   - Next (owner): the external-developer test in ~/dev/ai-infra/cairn-dogfood (brief + rules
     ready; the guide is among its allowed sources).
+- External-developer test #1 (2026-09-30, subagent in ~/dev/ai-infra/cairn-dogfood, public
+  artifacts only): all 9 items built, 10 tests green, ~30 min wall clock. Frictions:
+  - F2 BLOCKER, fixed in 0.3.4: collection creation hung with >= 4 cores (idle cores stopped:
+    Executor::run returns when nothing is scheduled). Every local test used 2 cores. Node cores
+    now use run_serving(); runtime regression test (fails with run()); collections test on 4
+    cores; verified in the public 0.3.4 image on 16 cores.
+  - F4 major, open: proof after forget_tenant only covers ids listed beforehand; listings skip
+    expired-but-unswept docs (20 of 29 tickets covered). Needs a proof by scope/filter.
+  - F5 minor, open: update pattern needs the takedown role and floods the audit log (340/354
+    lines count=0). Idea: upsert(replace_parent=...) with the write role.
+  - F7 minor, open: no patch by filter/parent. F1 minor, open: adding a key = edit file +
+    restart. F3 minor: client `.count` vs HTTP `patched` (docs). F6 fixed in 0.3.4.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 
