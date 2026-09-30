@@ -601,6 +601,14 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
   environment each); npm @cairn-db/client, @cairn-db/langchain (token + provenance; npm took
   ~4.5 min to serve a new org's package). Verified from the registries: fresh pip/npm installs,
   signatures and attestations verified, PyPI client end to end against a local node.
+- 0.3.3 (2026-09-30): developer guide docs/guide/ (7 chapters) whose samples run against a live
+  node (examples/guide/walkthrough.py), FastAPI and Express recipes (examples/backend-*), all in
+  clients/test-live.sh and CI. Writing it found 2 Python client bugs (a connection pool per view;
+  token merges lost across threads, test fails 3/3 without the lock). Clients gain
+  prove_deletion / deletion_key. Published to PyPI and npm (run 36711032401); recipes verified
+  from the published packages only.
+  - Next (owner): the external-developer test in ~/dev/ai-infra/cairn-dogfood (brief + rules
+    ready; the guide is among its allowed sources).
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 

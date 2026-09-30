@@ -2,10 +2,15 @@
   "name": "cairn-example-backend-express",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.mjs", "test": "node --test server.test.mjs" },
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@cairn-db/client": "file:../../clients/typescript",
+    "@cairn-db/client": "^0.3.3",
     "express": "^4.21.0"
   }
 }
