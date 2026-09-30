@@ -148,7 +148,11 @@ fn verify_proof(args: &[String]) -> anyhow::Result<()> {
         [p, flag, k] if flag == "--public-key" => (p, Some(k.as_str())),
         _ => anyhow::bail!("usage: cairn-server verify-proof <proof.json> [--public-key <base64>]"),
     };
-    let proof: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let bytes = std::fs::read(path).with_context(|| {
+        format!("reading {path} (in a container, the file must be readable by its non-root user)")
+    })?;
+    let proof: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("{path} is not a JSON proof"))?;
     let report = cairn_server::proof::verify(&proof, key)?;
     println!(
         "signature OK ({}); verdict: {}",

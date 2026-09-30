@@ -364,6 +364,35 @@ impl<R: Reactor> Executor<R> {
         }
     }
 
+    /// Like [`Executor::run`], for a server core that must keep serving work pushed from other
+    /// threads (a [`crate::CrossQueue`]): with no timer and no I/O pending, it parks until the
+    /// reactor is woken, instead of returning `Stalled`. A core with nothing to do at startup
+    /// (no replica, so no timer) would otherwise exit, and requests later routed to it would
+    /// wait forever. Needs a reactor with an unpark hook (the thread reactor has one).
+    pub fn run_serving(&mut self) -> RunOutcome {
+        loop {
+            self.admit_new_tasks();
+            self.fire_due_timers();
+            if self.poll_one() {
+                continue;
+            }
+            if self.tasks.is_empty() && self.shared.new_tasks.borrow().is_empty() {
+                return RunOutcome::Finished;
+            }
+            let deadline = self.handle().next_timer();
+            if deadline.is_none()
+                && !self.reactor.has_pending()
+                && self.reactor.unpark_hook().is_none()
+            {
+                return RunOutcome::Stalled;
+            }
+            let now = self.shared.now.get();
+            let new_now = self.reactor.park(now, deadline);
+            assert!(new_now >= now, "reactor moved time backwards");
+            self.shared.now.set(new_now);
+        }
+    }
+
     /// Runs `future` to completion alongside existing tasks.
     ///
     /// # Panics

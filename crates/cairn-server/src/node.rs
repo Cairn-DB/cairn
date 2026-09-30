@@ -441,7 +441,9 @@ impl Node {
             Self::spawn_retention(&rt, queues.clone(), cfg.clone());
             Self::spawn_coordinator(&rt, queues, cfg);
         }
-        let _ = ex.run();
+        // A core may host no replica (more cores than shards): it must still serve the
+        // requests other cores route to it, such as starting a new collection's replicas.
+        let _ = ex.run_serving();
     }
 
     /// Replica settings for one shard, stored under `dir`.

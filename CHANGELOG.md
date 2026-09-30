@@ -7,6 +7,16 @@ wire protocol or the on-disk format; the notes say so.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-30
+
+### Fixed
+- Creating a collection hung on nodes with more cores than replicas at startup: with the Docker
+  image, any machine with 4 cores or more. A core that hosted no replica stopped right after
+  startup, and the new collection's replicas routed to it were never started. Found by the
+  first external-developer test. Cores now wait for work instead of stopping, and the
+  collections test runs with more cores than replicas.
+- `cairn-server verify-proof` names the file it cannot read.
+
 ## [0.3.3] - 2026-09-30
 
 Clients and documentation: the engine is the same as 0.3.0.

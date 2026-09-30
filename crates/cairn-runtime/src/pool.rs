@@ -533,3 +533,36 @@ mod search_pool_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod serving_tests {
+    use super::*;
+    use crate::cross::CrossQueue;
+    use crate::executor::Executor;
+
+    /// A core with nothing scheduled (no timer, no I/O) still serves work pushed later from
+    /// another thread. `run` returns at once in that state; before `run_serving`, a node core
+    /// that hosted no replica stopped for good, and requests routed to it hung (the dogfooding
+    /// test's blocker).
+    #[test]
+    fn an_idle_core_keeps_serving_its_queue() {
+        let queue: CrossQueue<u32> = CrossQueue::new();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let q = queue.clone();
+        std::thread::spawn(move || {
+            let mut ex = Executor::new(ThreadReactor::new());
+            let q2 = q.clone();
+            ex.handle().spawn(async move {
+                while let Some(v) = q2.pop().await {
+                    done_tx.send(v).unwrap();
+                }
+            });
+            ex.run_serving();
+        });
+        // Long enough for the core to reach its idle state before the push.
+        std::thread::sleep(StdDuration::from_millis(200));
+        queue.push(7);
+        assert_eq!(done_rx.recv_timeout(StdDuration::from_secs(5)), Ok(7));
+        queue.close();
+    }
+}

@@ -108,7 +108,9 @@ fn collections_are_created_used_and_dropped_across_the_cluster() {
             .arg(dir.join(format!("node{}", i + 1)))
             .arg("--schema")
             .arg(&schema_path)
-            .args(["--shards", "2", "--cores", "2", "--tick-ms", "20"])
+            // More cores than replicas at startup: some cores host nothing until a collection
+            // is created, and must still serve (dogfooding friction F2).
+            .args(["--shards", "2", "--cores", "4", "--tick-ms", "20"])
             .args(["--memtable-bytes", "4000"])
             .env("CAIRN_HTTP_ADMIN_KEY", ADMIN)
             .env("RUST_LOG", "warn,cairn_server=info");
