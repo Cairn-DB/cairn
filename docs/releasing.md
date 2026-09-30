@@ -55,8 +55,11 @@ Their versions must equal the tag's (the workflow checks).
 One-time setup:
 - **PyPI**: for each of the three projects, add a trusted publisher (pypi.org, Publishing →
   Add a pending publisher): owner `Cairn-DB`, repository `cairn`, workflow
-  `publish-packages.yml`, environment `pypi`. Create the environment `pypi` in the
-  repository settings, ideally with a required reviewer.
+  `publish-packages.yml`, and one environment per project: `pypi` for `cairn-db-client`,
+  `pypi-langchain` for `langchain-cairn`, `pypi-llamaindex` for
+  `llama-index-vector-stores-cairn`. PyPI refuses two pending publishers with the same
+  repository, workflow and environment. The environments exist in the repository settings;
+  a required reviewer can be added to them.
 - **npm**: create the organization `cairn-db`, then a granular access token that can publish
   `@cairn-db/*`, stored as the repository secret `NPM_TOKEN`.
 

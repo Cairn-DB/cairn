@@ -2,9 +2,9 @@
 # (Actions -> publish-packages -> Run workflow, choosing the tag).
 #
 # One-time setup, by the owner (docs/releasing.md, "Packages"):
-# - PyPI: a trusted publisher for each project (cairn-db-client, langchain-cairn,
-#   llama-index-vector-stores-cairn): repository Cairn-DB/cairn, workflow
-#   publish-packages.yml, environment "pypi". No token is stored.
+# - PyPI: a trusted publisher for each project: repository Cairn-DB/cairn, workflow
+#   publish-packages.yml, and environment "pypi" (cairn-db-client), "pypi-langchain"
+#   (langchain-cairn) or "pypi-llamaindex" (llama-index-vector-stores-cairn). No token is stored.
 # - npm: the organization "cairn-db", and a granular automation token with publish rights on
 #   @cairn-db/*, stored as the repository secret NPM_TOKEN. Packages are published with
 #   provenance.
@@ -31,10 +31,19 @@ jobs:
           grep -q "^version = \"$v\"" integrations/llama-index-vector-stores-cairn/pyproject.toml
           grep -q "\"version\": \"$v\"" clients/typescript/package.json
           grep -q "\"version\": \"$v\"" integrations/langchain-js/package.json
+  # One job and one GitHub environment per project: PyPI refuses two pending publishers with
+  # the same repository, workflow and environment, whatever the project name.
   pypi:
     needs: versions
     runs-on: ubuntu-24.04
-    environment: pypi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dir: clients/python, env: pypi }
+          - { dir: integrations/langchain-cairn, env: pypi-langchain }
+          - { dir: integrations/llama-index-vector-stores-cairn, env: pypi-llamaindex }
+    environment: ${{ matrix.env }}
     permissions:
       id-token: write
     steps:
@@ -42,11 +51,7 @@ jobs:
         with: { ref: "${{ inputs.tag }}" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.13" }
-      - run: pip install build
-      - run: |
-          for p in clients/python integrations/langchain-cairn integrations/llama-index-vector-stores-cairn; do
-            python -m build "$p" --outdir dist/
-          done
+      - run: pip install build && python -m build "${{ matrix.dir }}" --outdir dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with: { packages-dir: dist/ }
   npm:
