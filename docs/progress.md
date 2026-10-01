@@ -621,6 +621,10 @@ delivery mode". Milestones: `docs/roadmap.md`. Evidence per phase: `docs/reports
     lines count=0). Idea: upsert(replace_parent=...) with the write role.
   - F7 minor, open: no patch by filter/parent. F1 minor, open: adding a key = edit file +
     restart. F3 minor: client `.count` vs HTTP `patched` (docs). F6 fixed in 0.3.4.
+  - Re-run on 2026-10-01 against the public image `ghcr.io/cairn-db/cairn:0.3` (0.3.4), following
+    the project's own README (start-cairn.sh, setup, seed, pytest): 10 passed in 27.8 s. F2 checked
+    separately without the CAIRN_CORES=4 workaround (all 16 cores): collection created in 1.8 s,
+    HTTP 201. Containers and volume removed afterwards.
 - C.3 Kafka: NOT started. ADR 0024 is proposed and says "after the public release, with the
   first contributors"; librdkafka is a heavy C dependency. Asked the owner (2026-09-29).
 
